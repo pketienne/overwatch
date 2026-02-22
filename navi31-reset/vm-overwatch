@@ -1,0 +1,212 @@
+#!/bin/bash
+# Overwatch VM lifecycle manager
+# Runs as a systemd transient service (systemd-run) to survive GDM stop/restart
+# Log: journalctl -u vm-overwatch
+#
+# GPU reset method: MODE1 via navi31_reset kernel module (~500ms)
+# Replaces the old suspend/resume approach (~20s + 35s network recovery)
+
+set -uo pipefail
+
+GPU="0000:03:00.0"
+GPU_AUDIO="0000:03:00.1"
+RESET_DEV="/dev/navi31-reset"
+RESET_MODULE="/home/myuser/navi31-reset/navi31_reset.ko"
+
+log() { echo "$(date '+%H:%M:%S') $*"; }
+
+gpu_driver() {
+    basename "$(readlink "/sys/bus/pci/devices/$1/driver" 2>/dev/null)" 2>/dev/null || echo "unbound"
+}
+
+gpu_reset() {
+    log "MODE1 resetting GPU..."
+    local start end elapsed
+    start=$(date +%s%N)
+    echo mode1 > "$RESET_DEV"
+    end=$(date +%s%N)
+    elapsed=$(( (end - start) / 1000000 ))
+    log "GPU reset complete (${elapsed}ms)"
+    log "Post-reset: $(cat $RESET_DEV)"
+}
+
+log "=== Starting Overwatch VM ==="
+
+# 0. Ensure navi31_reset module is loaded
+if [ ! -e "$RESET_DEV" ]; then
+    log "Loading navi31_reset module..."
+    if [ -f "$RESET_MODULE" ]; then
+        insmod "$RESET_MODULE"
+        sleep 1
+    else
+        modprobe navi31_reset 2>/dev/null || true
+    fi
+    if [ ! -e "$RESET_DEV" ]; then
+        log "ERROR: $RESET_DEV not available — cannot reset GPU"
+        exit 1
+    fi
+fi
+log "GPU status: $(cat $RESET_DEV)"
+
+# 1. Stop services using the dGPU
+log "Stopping ollama..."
+systemctl stop ollama 2>/dev/null || true
+
+log "Stopping openrgb..."
+systemctl stop openrgb 2>/dev/null || true
+sleep 1
+
+# 2. Stop GDM — GNOME Shell opens all DRM cards for multi-GPU
+log "Stopping GDM..."
+systemctl stop gdm 2>/dev/null || true
+sleep 3
+
+# 3. Kill any remaining processes holding dGPU i2c or DRM devices
+log "Releasing device holders..."
+fuser -k /dev/dri/card1 /dev/dri/renderD128 2>/dev/null || true
+fuser -k /dev/i2c-4 /dev/i2c-5 /dev/i2c-6 /dev/i2c-7 /dev/i2c-8 /dev/i2c-9 /dev/i2c-10 2>/dev/null || true
+sleep 2
+
+# 4. Verify no processes hold dGPU i2c devices
+remaining=$(fuser /dev/i2c-4 /dev/i2c-5 /dev/i2c-6 /dev/i2c-7 /dev/i2c-8 /dev/i2c-9 /dev/i2c-10 2>/dev/null || true)
+if [ -n "$remaining" ]; then
+    log "WARNING: Processes still holding i2c devices: $remaining — killing"
+    fuser -k /dev/i2c-4 /dev/i2c-5 /dev/i2c-6 /dev/i2c-7 /dev/i2c-8 /dev/i2c-9 /dev/i2c-10 2>/dev/null || true
+    sleep 2
+fi
+
+# 5. Unbind VT consoles from fbcon
+log "Unbinding VT consoles..."
+for vtcon in /sys/class/vtconsole/vtcon*/bind; do
+    echo 0 > "$vtcon" 2>/dev/null || true
+done
+sleep 1
+
+# 6. Unbind dGPU from amdgpu
+log "Current GPU driver: $(gpu_driver $GPU)"
+if [ "$(gpu_driver $GPU)" = "amdgpu" ]; then
+    log "Unbinding GPU audio..."
+    echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/unbind 2>/dev/null || true
+    sleep 1
+
+    log "Unbinding GPU from amdgpu..."
+    echo "$GPU" > /sys/bus/pci/drivers/amdgpu/unbind
+    sleep 2
+    log "Unbind completed. GPU driver: $(gpu_driver $GPU)"
+fi
+
+# 7. Pre-VM GPU reset: MODE1 reset so VM VBIOS can POST cleanly
+gpu_reset
+
+# 8. Bind to vfio-pci
+log "Binding GPU to vfio-pci..."
+modprobe vfio-pci 2>/dev/null || true
+echo "vfio-pci" > /sys/bus/pci/devices/$GPU/driver_override
+echo "$GPU" > /sys/bus/pci/drivers/vfio-pci/bind
+echo "vfio-pci" > /sys/bus/pci/devices/$GPU_AUDIO/driver_override
+echo "$GPU_AUDIO" > /sys/bus/pci/drivers/vfio-pci/bind
+sleep 1
+log "GPU driver: $(gpu_driver $GPU)"
+if [ "$(gpu_driver $GPU)" != "vfio-pci" ]; then
+    log "ERROR: GPU not on vfio-pci! Aborting."
+    echo "" > /sys/bus/pci/devices/$GPU/driver_override 2>/dev/null || true
+    echo "" > /sys/bus/pci/devices/$GPU_AUDIO/driver_override 2>/dev/null || true
+    echo "$GPU" > /sys/bus/pci/drivers/amdgpu/bind 2>/dev/null || true
+    for vtcon in /sys/class/vtconsole/vtcon*/bind; do
+        echo 1 > "$vtcon" 2>/dev/null || true
+    done
+    systemctl start openrgb 2>/dev/null || true
+    systemctl start ollama 2>/dev/null || true
+    systemctl start gdm
+    exit 1
+fi
+
+# 9. Start VM (no need to wait for br0 — we didn't suspend)
+log "Starting VM..."
+if ! virsh start overwatch; then
+    log "ERROR: Failed to start VM! Restoring GPU..."
+    echo "" > /sys/bus/pci/devices/$GPU/driver_override 2>/dev/null || true
+    echo "" > /sys/bus/pci/devices/$GPU_AUDIO/driver_override 2>/dev/null || true
+    echo "$GPU" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
+    echo "$GPU_AUDIO" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
+    echo "$GPU" > /sys/bus/pci/drivers/amdgpu/bind 2>/dev/null || true
+    for vtcon in /sys/class/vtconsole/vtcon*/bind; do
+        echo 1 > "$vtcon" 2>/dev/null || true
+    done
+    systemctl start openrgb 2>/dev/null || true
+    systemctl start ollama 2>/dev/null || true
+    systemctl start gdm
+    exit 1
+fi
+log "VM started successfully."
+
+# 10. Fix Tartarus USB (background — detach/reattach cycle)
+(
+    sleep 30
+    log "Tartarus fix: detaching..."
+    virsh detach-device overwatch /dev/stdin --live <<'XMLEOF' || log "Tartarus detach failed"
+<hostdev mode="subsystem" type="usb" managed="yes">
+  <source><vendor id="0x1532"/><product id="0x022b"/></source>
+</hostdev>
+XMLEOF
+    sleep 3
+    log "Tartarus fix: reattaching..."
+    virsh attach-device overwatch /dev/stdin --live <<'XMLEOF' || log "Tartarus attach failed"
+<hostdev mode="subsystem" type="usb" managed="yes">
+  <source><vendor id="0x1532"/><product id="0x022b"/></source>
+</hostdev>
+XMLEOF
+    log "Tartarus fix: done."
+) &
+
+log "VM running. Waiting for shutdown..."
+
+# 11. Wait for VM to shut down
+while virsh domstate overwatch 2>/dev/null | grep -q "running"; do
+    sleep 5
+done
+log "VM shut down detected."
+
+# 12. Post-VM: Unbind vfio-pci and reset GPU for host use
+log "Unbinding vfio-pci..."
+echo "$GPU" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
+echo "$GPU_AUDIO" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
+echo "" > /sys/bus/pci/devices/$GPU/driver_override 2>/dev/null || true
+echo "" > /sys/bus/pci/devices/$GPU_AUDIO/driver_override 2>/dev/null || true
+sleep 1
+
+# 13. Post-VM GPU reset: MODE1 reset to clean up after VM
+gpu_reset
+
+# 14. Bind to amdgpu
+log "Binding to amdgpu..."
+echo "$GPU" > /sys/bus/pci/drivers/amdgpu/bind 2>/dev/null || true
+sleep 3
+echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/bind 2>/dev/null || true
+log "GPU driver: $(gpu_driver $GPU)"
+
+# 15. Rebind VT consoles
+log "Rebinding VT consoles..."
+for vtcon in /sys/class/vtconsole/vtcon*/bind; do
+    echo 1 > "$vtcon" 2>/dev/null || true
+done
+
+# 16. Restart services
+log "Starting openrgb..."
+systemctl start openrgb 2>/dev/null || true
+
+log "Starting ollama..."
+systemctl start ollama 2>/dev/null || true
+
+# 17. Start GDM
+log "Starting GDM..."
+systemctl start gdm
+sleep 2
+
+# 18. Ensure GDM monitors.xml is correct
+if [ -f /home/myuser/.config/monitors.xml ]; then
+    cp /home/myuser/.config/monitors.xml /var/lib/gdm3/.config/monitors.xml
+    chown gdm:gdm /var/lib/gdm3/.config/monitors.xml
+fi
+
+log "=== Done. GPU: $(gpu_driver $GPU), ollama: $(systemctl is-active ollama) ==="
