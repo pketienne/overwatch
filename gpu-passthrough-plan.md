@@ -323,6 +323,7 @@ cat /dev/navi31-reset            # GPU health (SOL + bootloader)
 | GDM wrong aspect ratio (dual GPU) | Both dGPU DP-1 and iGPU HDMI-3 connected to same monitor; monitors.xml lists only one output so config doesn't match and GDM falls back to auto (3840x2160) | Add `<disabled>` section for DP-1 in monitors.xml |
 | GNOME Shell crashes when GPU unbinds | dGPU used for GPU-accelerated rendering | Stop GDM before unbinding amdgpu; run wrapper via `systemd-run` |
 | Wrapper script dies when GDM stops | Script runs in GNOME terminal session | Use `systemd-run --unit=vm-overwatch` transient service |
+| Audio volume much lower in VM than native Windows | Windows volume slider shows 100% but internal state out of sync after USB passthrough | Move volume slider to 0% then back to 100% to force Windows to re-apply the level. Also check: SteelSeries GG EQ/gain settings, Volume Mixer per-app levels, Loudness Equalization (if accessible via device properties). Note: `mmsys.cpl` may freeze the VM — use Settings → System → Sound instead |
 
 ---
 
