@@ -1,0 +1,25 @@
+#!/bin/bash
+# Launcher for vm-overwatch — runs the main script as a systemd transient unit
+# so it survives GDM stop/restart. Shows log output in the terminal.
+
+echo "Starting Overwatch VM session..."
+echo "Note: Your desktop session will end briefly while the GPU is switched."
+echo ""
+
+# Stop any previous stuck instance
+sudo systemctl stop vm-overwatch 2>/dev/null || true
+
+# Run the main script as a transient systemd service
+sudo systemd-run \
+    --unit=vm-overwatch \
+    --collect \
+    --description="Overwatch VM lifecycle" \
+    /usr/local/bin/vm-overwatch start
+
+echo ""
+echo "VM session launched as systemd unit 'vm-overwatch'."
+echo "Your desktop will close now. Switch to DisplayPort for the VM."
+echo "After VM shutdown, your desktop will restart automatically."
+echo ""
+echo "To monitor: journalctl -u vm-overwatch -f"
+sleep 3

@@ -26,7 +26,7 @@ These must be set before the OS install (or at least before Phase 2).
 
 ```bash
 sudo apt install qemu-kvm libvirt-daemon-system libvirt-clients \
-  virtinst virt-manager ovmf swtpm swtpm-tools bridge-utils
+  virtinst virt-manager ovmf swtpm swtpm-tools bridge-utils irqbalance
 sudo usermod -aG libvirt,kvm myuser
 ```
 
@@ -186,12 +186,8 @@ sudo chmod +x /usr/local/bin/vm-overwatch
 
 ### 7.2 Launcher (for desktop shortcut)
 
-Create `/usr/local/bin/vm-overwatch-launch`:
 ```bash
-#!/bin/bash
-exec systemd-run --unit=vm-overwatch /usr/local/bin/vm-overwatch
-```
-```bash
+sudo cp navi31-reset/vm-overwatch-launch /usr/local/bin/vm-overwatch-launch
 sudo chmod +x /usr/local/bin/vm-overwatch-launch
 ```
 
@@ -338,18 +334,19 @@ All matched by vendor/product ID only — **no hardcoded bus/device addresses**:
 
 ## Phase 10: Desktop Shortcut
 
-Create `~/.local/share/applications/overwatch.desktop`:
+Create `~/Desktop/start-vm.desktop`:
 ```ini
 [Desktop Entry]
 Type=Application
 Name=Overwatch
-Exec=pkexec /usr/local/bin/vm-overwatch-launch
-Icon=applications-games
+Comment=Start the Overwatch Windows VM with GPU passthrough
+Exec=gnome-terminal -- /usr/local/bin/vm-overwatch-launch
+Icon=computer
 Terminal=false
-Categories=Game;
+Categories=System;
 ```
 
-The script needs root (it stops/starts system services, binds/unbinds PCI drivers). `pkexec` provides a graphical authentication prompt.
+The launcher opens a terminal showing status messages, then runs `vm-overwatch start` as a systemd transient unit (survives GDM stop). The script uses `sudo` internally for root operations.
 
 ---
 
