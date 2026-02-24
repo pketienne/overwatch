@@ -663,6 +663,28 @@ powercfg /setdcvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 94
 powercfg /setactive SCHEME_CURRENT
 ```
 
+### AMD Driver Internal Power Management
+
+The AMD GPU driver has its own power management independent of the Windows power
+plan. These must be disabled to prevent 0x9F BSODs during shutdown. The GPU is at
+registry index `0001` (index `0000` is Microsoft Basic Display Adapter).
+
+| Registry Value | Set To | Effect |
+|---|---|---|
+| `EnableUlps` | 0 | Disables Ultra Low Power State transitions |
+| `PP_SclkDeepSleepDisable` | 1 | Prevents GPU clock deep sleep |
+| `DisableDrmdmaPowerOff` | 1 | Prevents DRM DMA power-off |
+
+```powershell
+$regpath = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\0001"
+Set-ItemProperty -Path $regpath -Name EnableUlps -Value 0
+Set-ItemProperty -Path $regpath -Name PP_SclkDeepSleepDisable -Value 1
+Set-ItemProperty -Path $regpath -Name DisableDrmdmaPowerOff -Value 1
+```
+
+> **Note:** If Windows Update reinstalls the AMD driver, these values may be
+> reset. Verify after any driver update.
+
 ---
 
 ## Troubleshooting Reference
@@ -691,6 +713,7 @@ powercfg /setactive SCHEME_CURRENT
 | Concurrent vm-overwatch instances cause dirty state | Second instance finds GPU in unexpected driver state | Lock file via `flock /run/vm-overwatch.lock` prevents concurrent instances |
 | Windows BSOD 0x9F DRIVER_POWER_STATE_FAILURE | Windows "Balanced" power plan sends power IRPs to passthrough GPU/USB devices; vfio-pci owns the hardware so guest driver can't complete power transitions | Switch to **High Performance** power plan; disable PCI Express ASPM, USB selective suspend, display timeout, sleep, hybrid sleep (see Windows VM Power Settings section) |
 | Frequent 0x9F BSODs after Windows Update | Windows Update pushed AMD driver 31.0.14000.58004 (Feb 2026) which corrupts GPU state every 2-5 min during gameplay | Roll back via Device Manager -> Display adapters -> Roll Back Driver. Block reinstall: Settings -> Windows Update -> Pause updates, or `wushowhide.diagcab` to hide the driver update. Known-good driver: Radeon Software 32.0.23017.1001 (2026-01-08) |
+| Windows BSOD 0x9F during shutdown specifically | AMD driver ULPS and internal power management try power state transitions during shutdown; power IRP times out after ~2 min causing 0x9F bugcheck | Disable AMD driver power features via registry (see Power Settings section): `EnableUlps=0`, `PP_SclkDeepSleepDisable=1`, `DisableDrmdmaPowerOff=1`. QEMU `-no-shutdown` keeps process alive after BSOD, masking the crash — check `virsh domstate` to distinguish hung shutdown from BSOD |
 | Monitor doesn't auto-switch to DP when VM starts | iGPU HDMI stays active, monitor doesn't detect DP | Blank iGPU framebuffer (`echo 4 > /sys/class/graphics/fbN/blank`) when VM starts; monitor auto-detects to DP. fb matched by PCI device path, not hardcoded number. vm-overwatch handles this |
 
 ---
