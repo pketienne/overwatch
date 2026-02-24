@@ -8,9 +8,7 @@
 #   status  Print current system state across all dimensions
 #
 # Runs as a systemd transient service (systemd-run) to survive GDM stop/restart
-# Log: journalctl -u vm-overwatch | /var/log/vm-overwatch/<run>.log
-#
-# GPU reset: MODE1 only (fallback chain removed — healthy driver doesn't need it).
+# Log: journalctl -u vm-overwatch
 #
 # Usage: vm-overwatch [--verbose] start|stop|status
 
@@ -19,12 +17,8 @@ set -uo pipefail
 GPU="0000:03:00.0"
 GPU_AUDIO="0000:03:00.1"
 IGPU="0000:74:00.0"
-RESET_DEV="/dev/navi31-reset"
-RESET_MODULE="/home/myuser/navi31-reset/navi31_reset.ko"
 HOST_CPU=0          # CPU reserved for host tasks
 LOCK_FILE="/run/vm-overwatch.lock"
-LOG_DIR="/var/log/vm-overwatch"
-BIND_LOG="/var/log/vm-overwatch/bind-history.tsv"
 
 # USB devices that need detach/reattach after VM start to clear ghost entries
 USB_DEVICES=(
@@ -55,16 +49,6 @@ gpu_driver() {
     fi
 }
 
-# Check if GPU registers are responsive (not returning all 0xffffffff)
-gpu_healthy() {
-    local status
-    status=$(cat "$RESET_DEV" 2>/dev/null) || return 1
-    if echo "$status" | grep -q "0xffffffff"; then
-        return 1
-    fi
-    return 0
-}
-
 # Find the iGPU framebuffer by PCI device path (not hardcoded fb number)
 igpu_fb() {
     for fb in /sys/class/graphics/fb*/; do
@@ -82,7 +66,7 @@ igpu_fb() {
 # ============================================================
 
 do_status() {
-    local gpu_drv audio_drv vm_state gpu_power gpu_health
+    local gpu_drv audio_drv vm_state gpu_power
     local fb blank_val igpu_state
     local gdm_state ollama_state openrgb_state
     local gov irqbalance_state
@@ -93,16 +77,6 @@ do_status() {
     audio_drv=$(gpu_driver "$GPU_AUDIO")
     gpu_power=$(cat "/sys/bus/pci/devices/$GPU/power_state" 2>/dev/null) || true
     gpu_power=${gpu_power:-unknown}
-
-    if [ -e "$RESET_DEV" ]; then
-        if gpu_healthy; then
-            gpu_health="healthy"
-        else
-            gpu_health="UNRESPONSIVE"
-        fi
-    else
-        gpu_health="unknown (reset module not loaded)"
-    fi
 
     vm_state=$(virsh domstate overwatch 2>/dev/null) || true
     vm_state=$(echo "$vm_state" | xargs)
@@ -139,18 +113,14 @@ do_status() {
     if [ "$vm_state" = "running" ] && [ "$gpu_drv" = "vfio-pci" ]; then
         state="vm-running"
     elif [ "$vm_state" = "shut off" ] && [ "$gpu_drv" = "amdgpu" ] && [ "$gdm_state" = "active" ]; then
-        if [ "$gpu_health" = "healthy" ] || [ ! -e "$RESET_DEV" ]; then
-            state="host-ready"
-        else
-            state="degraded"
-        fi
+        state="host-ready"
     elif [ "$vm_state" = "shut off" ] && [ "$gpu_drv" = "amdgpu" ]; then
         state="host-ready (services pending)"
     else
         state="transitioning"
     fi
 
-    echo "GPU:       $gpu_drv ($gpu_power, $gpu_health)"
+    echo "GPU:       $gpu_drv ($gpu_power)"
     echo "Audio:     $audio_drv"
     echo "VM:        $vm_state"
     echo "iGPU:      $igpu_state"
@@ -178,12 +148,6 @@ fi
 
 # --- Logging setup (start/stop only) ---
 
-mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/$(date '+%Y-%m-%d_%H-%M-%S').log"
-
-# Tee all stdout/stderr to both journald (via systemd) and the log file
-exec > >(tee -a "$LOG_FILE") 2>&1
-
 log() { echo "$(date '+%H:%M:%S') $*"; }
 
 # ERR trap — log exact line number and command on any failure
@@ -200,62 +164,18 @@ if [ "$VERBOSE" = true ]; then
     log "Verbose mode enabled"
 fi
 
-# Prune old logs (keep last 20)
-ls -t "$LOG_DIR"/*.log 2>/dev/null | tail -n +21 | xargs rm -f 2>/dev/null || true
-
 # --- State snapshot ---
 
-# Dump GPU driver, health, VM state, and driver_override at a named checkpoint
+# Dump GPU driver, VM state, and driver_override at a named checkpoint
 log_state() {
     local checkpoint="${1:-unknown}"
-    local gpu_drv gpu_audio_drv gpu_status vm_state gpu_override gpu_audio_override
+    local gpu_drv gpu_audio_drv vm_state gpu_override gpu_audio_override
     gpu_drv=$(gpu_driver "$GPU")
     gpu_audio_drv=$(gpu_driver "$GPU_AUDIO")
-    gpu_status=$(cat "$RESET_DEV" 2>/dev/null || echo "unavailable")
     vm_state=$(virsh domstate overwatch 2>/dev/null || echo "unknown")
     gpu_override=$(cat "/sys/bus/pci/devices/$GPU/driver_override" 2>/dev/null || echo "none")
     gpu_audio_override=$(cat "/sys/bus/pci/devices/$GPU_AUDIO/driver_override" 2>/dev/null || echo "none")
-    log "STATE [$checkpoint] gpu=$gpu_drv audio=$gpu_audio_drv override=$gpu_override/$gpu_audio_override registers=[$gpu_status] vm=$vm_state"
-}
-
-# --- Bind history ---
-
-# VM lifecycle tracking (set by _do_start, read by log_bind_result)
-VM_START_TIME=""
-VM_SHUTDOWN_METHOD=""  # clean_acpi | stop_acpi | stop_destroy | not_running | external
-
-# Append a structured TSV line to bind-history.tsv for post-hoc analysis
-# Columns: timestamp, vm_duration_s, shutdown_method, gpu_power, audio_power,
-#           link_speed, d3cold_allowed, reset_regs, was_reset, outcome
-log_bind_result() {
-    local outcome="$1"
-    local now vm_duration gpu_power audio_power gpu_link d3cold gpu_regs was_reset
-    now=$(date '+%Y-%m-%d %H:%M:%S')
-    if [ -n "$VM_START_TIME" ]; then
-        vm_duration=$(( $(date +%s) - VM_START_TIME ))
-    else
-        vm_duration="?"
-    fi
-    gpu_power=$(cat "/sys/bus/pci/devices/$GPU/power_state" 2>/dev/null || echo "?")
-    audio_power=$(cat "/sys/bus/pci/devices/$GPU_AUDIO/power_state" 2>/dev/null || echo "?")
-    gpu_link=$(cat "/sys/bus/pci/devices/$GPU/current_link_speed" 2>/dev/null || echo "?")
-    d3cold=$(cat "/sys/bus/pci/devices/$GPU/d3cold_allowed" 2>/dev/null || echo "?")
-    gpu_regs=$(cat "$RESET_DEV" 2>/dev/null || echo "?")
-    # Check if gpu_reset was called this run (set by ensure_gpu_reset)
-    was_reset="${GPU_WAS_RESET:-no}"
-
-    # Write header if file doesn't exist
-    if [ ! -f "$BIND_LOG" ]; then
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "timestamp" "vm_duration_s" "shutdown_method" "gpu_power" "audio_power" \
-            "link_speed" "d3cold_allowed" "registers" "was_reset" "outcome" \
-            >> "$BIND_LOG"
-    fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$now" "$vm_duration" "${VM_SHUTDOWN_METHOD:-?}" "$gpu_power" "$audio_power" \
-        "$gpu_link" "$d3cold" "$gpu_regs" "$was_reset" "$outcome" \
-        >> "$BIND_LOG"
-    log "BIND_RESULT: outcome=$outcome vm_duration=${vm_duration}s shutdown=$VM_SHUTDOWN_METHOD was_reset=$was_reset"
+    log "STATE [$checkpoint] gpu=$gpu_drv audio=$gpu_audio_drv override=$gpu_override/$gpu_audio_override vm=$vm_state"
 }
 
 # --- Lock ---
@@ -270,76 +190,12 @@ acquire_lock() {
     trap 'flock -u 9; rm -f "$LOCK_FILE"' EXIT
 }
 
-# --- GPU reset primitives ---
-
-# Try MODE1 reset. Returns 0 on success.
-try_mode1() {
-    log "Trying MODE1 reset..."
-    local start end elapsed
-    start=$(date +%s%N)
-    if echo mode1 > "$RESET_DEV" 2>/dev/null; then
-        end=$(date +%s%N)
-        elapsed=$(( (end - start) / 1000000 ))
-        log "MODE1 reset complete (${elapsed}ms)"
-        log "Post-reset: $(cat $RESET_DEV)"
-        if gpu_healthy; then
-            return 0
-        fi
-        log "WARNING: GPU unhealthy after MODE1"
-    else
-        end=$(date +%s%N)
-        elapsed=$(( (end - start) / 1000000 ))
-        log "MODE1 reset FAILED (${elapsed}ms)"
-    fi
-    return 1
-}
-
-# GPU reset via MODE1 only.
-# Returns 0 if GPU is healthy after reset, 1 on failure.
-gpu_reset() {
-    if ! gpu_healthy; then
-        log "WARNING: GPU unresponsive before reset (0xffffffff)"
-    fi
-
-    if try_mode1; then
-        return 0
-    fi
-
-    log "ERROR: MODE1 reset failed — GPU may need manual intervention"
-    return 1
-}
-
 # ============================================================
 # Idempotent ensure_* functions
 # Each checks current state and only acts if transition needed
 # ============================================================
 
 # --- Host preparation (used by start) ---
-
-ensure_reset_module() {
-    if [ -e "$RESET_DEV" ]; then
-        log "Reset module already loaded"
-        return 0
-    fi
-    log "Loading navi31_reset module..."
-    if [ -f "$RESET_MODULE" ]; then
-        insmod "$RESET_MODULE"
-        sleep 1
-    else
-        modprobe navi31_reset 2>/dev/null || true
-    fi
-    if [ ! -e "$RESET_DEV" ]; then
-        log "ERROR: $RESET_DEV not available — cannot reset GPU"
-        return 1
-    fi
-    log "GPU status: $(cat $RESET_DEV)"
-}
-
-ensure_runtime_pm_disabled() {
-    log "Ensuring GPU runtime PM disabled (forcing D0)..."
-    echo on > "/sys/bus/pci/devices/$GPU/power/control" 2>/dev/null || true
-    echo on > "/sys/bus/pci/devices/$GPU_AUDIO/power/control" 2>/dev/null || true
-}
 
 ensure_services_stopped() {
     local svc changed=false
@@ -368,14 +224,6 @@ ensure_device_fds_released() {
     fuser -k /dev/dri/card1 /dev/dri/renderD128 2>/dev/null || true
     fuser -k /dev/i2c-4 /dev/i2c-5 /dev/i2c-6 /dev/i2c-7 /dev/i2c-8 /dev/i2c-9 /dev/i2c-10 2>/dev/null || true
     sleep 2
-
-    local remaining
-    remaining=$(fuser /dev/i2c-4 /dev/i2c-5 /dev/i2c-6 /dev/i2c-7 /dev/i2c-8 /dev/i2c-9 /dev/i2c-10 2>/dev/null || true)
-    if [ -n "$remaining" ]; then
-        log "WARNING: Processes still holding i2c devices: $remaining — killing"
-        fuser -k /dev/i2c-4 /dev/i2c-5 /dev/i2c-6 /dev/i2c-7 /dev/i2c-8 /dev/i2c-9 /dev/i2c-10 2>/dev/null || true
-        sleep 2
-    fi
 }
 
 ensure_vt_unbound() {
@@ -396,8 +244,6 @@ ensure_gpu_unbound_from_host() {
         return 0
     fi
 
-    log_state "pre_unbind"
-
     if [ "$audio_drv" = "snd_hda_intel" ]; then
         log "Unbinding GPU audio..."
         echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/unbind 2>/dev/null || true
@@ -412,39 +258,6 @@ ensure_gpu_unbound_from_host() {
     fi
 
     log_state "post_unbind"
-}
-
-ensure_gpu_reset() {
-    local drv
-    drv=$(gpu_driver "$GPU")
-
-    if [ "$drv" != "unbound" ]; then
-        log "GPU bound to $drv — skipping reset (only reset when unbound)"
-        return 0
-    fi
-
-    # Need reset device to check health and perform reset
-    if [ ! -e "$RESET_DEV" ]; then
-        if [ -f "$RESET_MODULE" ]; then
-            insmod "$RESET_MODULE" 2>/dev/null || true
-            sleep 1
-        else
-            modprobe navi31_reset 2>/dev/null || true
-        fi
-    fi
-    if [ ! -e "$RESET_DEV" ]; then
-        log "WARNING: Reset device unavailable — cannot check GPU health or reset"
-        return 1
-    fi
-
-    if gpu_healthy; then
-        log "GPU healthy and unbound — skipping reset"
-        return 0
-    fi
-
-    log "GPU unhealthy while unbound — running reset chain"
-    GPU_WAS_RESET="yes"
-    gpu_reset
 }
 
 ensure_gpu_on_vfio() {
@@ -472,7 +285,6 @@ ensure_gpu_on_vfio() {
         log_state "vfio_bind_failed"
         return 1
     fi
-    log_state "vfio_bound"
 }
 
 ensure_vm_running() {
@@ -554,10 +366,8 @@ ensure_vm_stopped() {
     vm_check=$(virsh domstate overwatch 2>/dev/null) || true
     if [ -z "$vm_check" ] || ! echo "$vm_check" | grep -q "running"; then
         log "VM not running"
-        [ -z "$VM_SHUTDOWN_METHOD" ] && VM_SHUTDOWN_METHOD="not_running"
         return 0
     fi
-    [ -z "$VM_SHUTDOWN_METHOD" ] && VM_SHUTDOWN_METHOD="stop_acpi"
     log "Shutting down VM (graceful)..."
     virsh shutdown overwatch 2>/dev/null || true
     local waited=0
@@ -572,7 +382,6 @@ ensure_vm_stopped() {
         if [ $waited -ge 60 ]; then
             log "WARNING: VM still running after ${waited}s — forcing destroy"
             virsh destroy overwatch 2>/dev/null || true
-            VM_SHUTDOWN_METHOD="stop_destroy"
             sleep 2
             break
         fi
@@ -643,13 +452,12 @@ ensure_gpu_on_host() {
     fi
 
     # Pre-bind diagnostic snapshot
-    local gpu_power gpu_link gpu_d_state gpu_regs audio_power
+    local gpu_power gpu_link gpu_d_state audio_power
     gpu_power=$(cat "/sys/bus/pci/devices/$GPU/power_state" 2>/dev/null || echo "?")
     gpu_link=$(cat "/sys/bus/pci/devices/$GPU/current_link_speed" 2>/dev/null || echo "?")
     gpu_d_state=$(cat "/sys/bus/pci/devices/$GPU/d3cold_allowed" 2>/dev/null || echo "?")
-    gpu_regs=$(cat "$RESET_DEV" 2>/dev/null || echo "?")
     audio_power=$(cat "/sys/bus/pci/devices/$GPU_AUDIO/power_state" 2>/dev/null || echo "?")
-    log "PRE-BIND gpu_power=$gpu_power link=$gpu_link d3cold_allowed=$gpu_d_state audio_power=$audio_power regs=[$gpu_regs]"
+    log "PRE-BIND gpu_power=$gpu_power link=$gpu_link d3cold_allowed=$gpu_d_state audio_power=$audio_power"
 
     # Bind GPU to amdgpu — this powers up the entire GPU die
     log "Binding to amdgpu..."
@@ -689,8 +497,6 @@ ensure_gpu_on_host() {
     fi
 
     log "Runtime PM disabled for GPU and audio"
-
-    log_bind_result "success"
 }
 
 ensure_igpu_unblanked() {
@@ -738,23 +544,19 @@ ensure_services_running() {
 
 _do_stop() {
     log "=== Restoring host state ==="
-    log_state "stop_start"
 
     ensure_vm_stopped
     ensure_cpu_defaults
     ensure_gpu_unbound_from_vfio
-    ensure_gpu_reset || log "WARNING: GPU reset failed — amdgpu bind may fail"
     ensure_gpu_on_host || log "WARNING: Could not restore GPU to host — iGPU only"
     ensure_igpu_unblanked || true
     ensure_services_running
 
-    log_state "stop_done"
     log "=== Host restored ==="
 }
 
 _do_start() {
     log "=== Starting Overwatch VM ==="
-    log_state "startup"
 
     # Refuse if VM already running
     if virsh domstate overwatch 2>/dev/null | grep -q "running"; then
@@ -763,15 +565,12 @@ _do_start() {
     fi
 
     # Pre-VM preparation (critical failures abort with cleanup)
-    ensure_reset_module || log "WARNING: Reset module unavailable — GPU health checks disabled"
-    ensure_runtime_pm_disabled
     ensure_services_stopped
     ensure_device_fds_released
     ensure_vt_unbound
     ensure_gpu_unbound_from_host
     ensure_gpu_on_vfio || { log "ERROR: VFIO bind failed"; _do_stop; exit 1; }
     ensure_vm_running || { log "ERROR: VM start failed"; _do_stop; exit 1; }
-    VM_START_TIME=$(date +%s)
 
     # Post-VM-start setup (non-critical, continue on failure)
     ensure_usb_reattached
@@ -810,7 +609,6 @@ _do_start() {
         sleep 5
     done
     log "VM shut down detected."
-    VM_SHUTDOWN_METHOD="${VM_SHUTDOWN_METHOD:-clean_acpi}"
     log_state "vm_shutdown"
 
     # Restore host
