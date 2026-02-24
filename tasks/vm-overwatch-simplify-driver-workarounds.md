@@ -144,11 +144,21 @@ Remaining code kept as safety nets:
 - Audio D3cold workaround (PCI remove+rescan) — still fires every cycle, adds
   ~3s. Test removing separately.
 
-## Open issue: GPU crashes during desktop use
+## Open issue: GPU crashes during desktop use [FIXED]
 
-The amdgpu driver's runtime PM is killing the GPU between VM cycles. Seen twice
+The amdgpu driver's runtime PM was killing the GPU between VM cycles. Seen twice
 this session: GPU enters D3, runtime PM resume finds device unresponsive
 (`0xffffffff` registers), `device lost from bus`, soft lockup. This is NOT
 related to VFIO passthrough — it happens during normal GDM desktop operation.
 `ensure_runtime_pm_disabled()` only protects during the vm-overwatch startup
-window. Potential fix: permanently disable runtime PM for this GPU via udev rule.
+window.
+
+**Fix**: Added udev rules to `myhost:/etc/udev/rules.d/99-gpu-passthrough.rules`
+to permanently disable runtime PM for both GPU functions (video + audio):
+```
+ACTION=="add", KERNEL=="0000:03:00.0", SUBSYSTEM=="pci", ATTR{power/control}="on"
+ACTION=="add", KERNEL=="0000:03:00.1", SUBSYSTEM=="pci", ATTR{power/control}="on"
+```
+This forces the GPU to stay in D0 (fully powered) at all times. Tradeoff is
+~10-20W higher idle power, but the GPU never enters the D3 state that crashes it.
+Applied manually for current session; udev rule takes effect automatically on boot.
