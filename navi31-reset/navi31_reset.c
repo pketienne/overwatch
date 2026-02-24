@@ -159,6 +159,14 @@ static int smu_send_msg(u32 msg, u32 param)
  * fire-and-forget operation: the GPU resets and MMIO goes dark for ~500ms.
  * After the wait, we restore PCI config and verify the PSP came back.
  */
+static bool gpu_responsive(void)
+{
+	u32 sol = rreg32(MP0_C2PMSG_81);
+	u32 boot = rreg32(MP0_C2PMSG_35);
+
+	return sol != 0xffffffff || boot != 0xffffffff;
+}
+
 static int navi31_mode1_reset(void)
 {
 	unsigned long deadline;
@@ -169,6 +177,16 @@ static int navi31_mode1_reset(void)
 	/* Sanity: log pre-reset state */
 	val = rreg32(MP0_C2PMSG_81);
 	pr_info("%s: pre-reset SOL=0x%08x\n", DRIVER_NAME, val);
+
+	/* Fail fast if GPU is completely unresponsive (PCIe link down, D3cold, etc.)
+	 * Writing MODE1 to a dead device won't help — caller should try SBR. */
+	if (!gpu_responsive()) {
+		pr_err("%s: GPU not responding (all regs 0xffffffff) — MODE1 aborted\n",
+		       DRIVER_NAME);
+		pr_err("%s: try PCI bus reset: echo 1 > /sys/bus/pci/devices/%s/reset\n",
+		       DRIVER_NAME, pci_name(gpu_pdev));
+		return -ENODEV;
+	}
 
 	/* Save PCI config space (will be wiped by MODE1) */
 	pci_save_state(gpu_pdev);
@@ -236,6 +254,13 @@ static int navi31_baco_reset(void)
 	int ret;
 
 	pr_info("%s: BACO reset starting\n", DRIVER_NAME);
+
+	/* Fail fast if GPU is completely unresponsive */
+	if (!gpu_responsive()) {
+		pr_err("%s: GPU not responding (all regs 0xffffffff) — BACO aborted\n",
+		       DRIVER_NAME);
+		return -ENODEV;
+	}
 
 	/* Enter BACO */
 	ret = smu_send_msg(PPSMC_MSG_EnterBaco, BACO_SEQ_BACO);

@@ -23,11 +23,14 @@ Run Overwatch 2 in a Windows 11 VM with the RX 7900 XTX passed through for nativ
 - **Full GPU passthrough lifecycle without rebooting** — unlimited VM cycles via MODE1 software reset (~509ms per reset, no suspend/resume)
 - Overwatch runs at 3440x1440 fullscreen with no anti-cheat issues
 - iGPU display on Wayland at 3440x1440@85Hz on HDMI1
+- **Automatic display switching** — iGPU blanked when VM starts (monitor auto-detects to DP), unblanked on restore
 - All USB devices passed through (keyboard, mouse, keypad, mousepad, headset)
 - Windows 11 VM with UEFI, TPM 2.0, anti-cheat tweaks
 - Bridged networking (VM gets own IP on LAN)
 - IVRS ACPI table override to fix VFIO container setup
 - One-click desktop shortcut: click → play → shut down Windows → back to desktop
+- **Comprehensive error logging** — ERR trap with line numbers, state snapshots at transitions, persistent log files in `/var/log/vm-overwatch/`, `--verbose` flag
+- **Lock file** prevents concurrent vm-overwatch instances
 
 ### What Doesn't Work (Yet)
 - Nothing critical remaining. All major issues resolved.
@@ -45,7 +48,7 @@ GRUB_EARLY_INITRD_LINUX_CUSTOM="acpi-ivrs-override.img"
 | `/boot/acpi-ivrs-override.img` | Patched IVRS ACPI table (zeroed exclusion flags, OEM rev 2) |
 | `/usr/share/qemu/gpu-rom.bin` | Sapphire NITRO+ RX 7900 XTX Vapor-X VBIOS (2MB, from TechPowerUp) |
 | `/etc/libvirt/hooks/qemu` | Libvirt hook dispatcher (currently no-op to avoid deadlocks) |
-| `/usr/local/bin/vm-overwatch` | VM lifecycle wrapper script (MODE1 reset, runs as systemd transient unit) |
+| `/usr/local/bin/vm-overwatch` | VM lifecycle wrapper script (MODE1 reset, runs as systemd transient unit). Logs to `/var/log/vm-overwatch/` |
 | `/home/myuser/navi31-reset/navi31_reset.ko` | Standalone Navi 31 GPU reset kernel module |
 | `/dev/navi31-reset` | Character device for GPU reset (write "mode1" to trigger) |
 | `/usr/local/bin/vm-overwatch-launch` | Launcher that starts vm-overwatch via `systemd-run` |
@@ -206,9 +209,9 @@ Multiple approaches to automate GPU reset via libvirt hooks failed due to deadlo
 ### USB Issues
 
 #### Razer Tartarus V2 Re-enumeration
-The Tartarus V2 re-enumerates on the USB bus (changes device number) after passthrough, causing libvirt to grab a stale device address. Also, Windows needs time to load USB HID drivers before it can detect a detach/reattach event. Fixed by:
-1. Removing hardcoded `<address bus=... device=...>` from USB hostdev source entries in VM XML
-2. Detach/reattach cycle in the wrapper script **30 seconds** after VM start (gives Windows time to boot and load USB drivers; original 8-second delay was too short — Windows hadn't loaded its USB stack yet)
+The Tartarus V2 re-enumerates on the USB bus (changes device number) after passthrough, causing libvirt to grab a stale device address. Fixed by removing hardcoded `<address bus=... device=...>` from USB hostdev source entries in VM XML.
+
+~~Previously included a detach/reattach cycle 30s after VM start as a workaround for USB hub timing issues. Removed — not needed with direct USB connections (no hub). The hack was preventing Razer Synapse from detecting the Tartarus.~~
 
 #### Hardcoded USB Addresses
 Libvirt saves host bus/device addresses into the running VM config. On next boot, these addresses may be stale. Fixed by stripping `<address bus=... device=...>` from all USB `<source>` blocks in the persistent config.
@@ -276,22 +279,25 @@ The VM "overwatch" is defined in libvirt. Key elements:
 ```bash
 # Use the "Overwatch" desktop shortcut, which runs:
 #   systemd-run --unit=vm-overwatch /usr/local/bin/vm-overwatch
-# Flow: stops ollama/openrgb/GDM → unbinds amdgpu → MODE1 reset (509ms)
-#       → binds vfio-pci → starts VM (~15s total from click to VM)
-#       → Tartarus USB detach/reattach at 30s → waits for VM shutdown
+# Flow: disable GPU runtime PM → stops ollama/openrgb/GDM → unbinds amdgpu
+#       → MODE1 reset (509ms) → binds vfio-pci → starts VM
+#       → blanks iGPU (monitor auto-switches to DP) → performance tuning
+#       → waits for VM shutdown
 #       → unbinds vfio-pci → MODE1 reset (509ms) → binds amdgpu
-#       → starts openrgb/ollama/GDM (~7s from VM shutdown to desktop)
+#       → unblanks iGPU → starts openrgb/ollama/GDM
 ```
 
 ### Stop gaming
-Shut down Windows from the Start menu. The wrapper script handles GPU reset and service restart.
+Shut down Windows from the Start menu. The wrapper script handles GPU reset, display switching, and service restart.
 
-The GPU is software-reset via MODE1 (SMU debug mailbox) on both sides of the VM lifecycle. No suspend/resume, no network disruption, no reboot needed between sessions.
+The GPU is software-reset via MODE1 (SMU debug mailbox) on both sides of the VM lifecycle. No suspend/resume, no network disruption, no reboot needed between sessions. The monitor auto-switches between HDMI (iGPU/Linux) and DisplayPort (dGPU/VM) via iGPU framebuffer blanking.
 
 ### Monitor
 ```bash
 journalctl -u vm-overwatch -f   # Live logs
 cat /dev/navi31-reset            # GPU health (SOL + bootloader)
+ls /var/log/vm-overwatch/        # Persistent per-run logs
+vm-overwatch --verbose           # Full bash trace logging
 ```
 
 ---
@@ -308,7 +314,7 @@ cat /dev/navi31-reset            # GPU health (SOL + bootloader)
 | "failed to find romfile" | QEMU sandbox restricts file access | Place ROM in `/usr/share/qemu/` |
 | Xorg fails to start (GDM crash loop) | Xorg picks discrete GPU (on vfio-pci) instead of iGPU | Create `/usr/share/X11/xorg.conf.d/20-igpu.conf` with `BusID "PCI:116:0:0"` (only needed for X11 fallback) |
 | YouTube won't load in VM | NAT/QUIC issues | Switch to bridged networking |
-| Tartarus not detected in VM | USB re-enumeration, stale addresses | Detach/reattach cycle (30s delay), remove hardcoded addresses |
+| Tartarus not detected in VM | USB re-enumeration, stale addresses | Remove hardcoded `<address bus=... device=...>` from USB source entries in VM XML. ~~Old hub workaround: detach/reattach cycle (30s delay) — removed, not needed with direct USB connections~~ |
 | VM has no internet (old suspend/resume method) | br0 bridge torn down during suspend/resume | ~~Wait for br0~~ — no longer needed with MODE1 reset (no suspend) |
 | Grey/black screen on 2nd VM start | Navi 31 GPU reset bug | MODE1 reset via `navi31_reset` module before and after each VM session |
 | Black screen on 1st VM start after amdgpu | GPU in driver-teardown state, not power-on-reset | Pre-VM MODE1 reset after unbinding amdgpu |
@@ -324,6 +330,49 @@ cat /dev/navi31-reset            # GPU health (SOL + bootloader)
 | GNOME Shell crashes when GPU unbinds | dGPU used for GPU-accelerated rendering | Stop GDM before unbinding amdgpu; run wrapper via `systemd-run` |
 | Wrapper script dies when GDM stops | Script runs in GNOME terminal session | Use `systemd-run --unit=vm-overwatch` transient service |
 | Audio volume much lower in VM than native Windows | Windows volume slider shows 100% but internal state out of sync after USB passthrough | Move volume slider to 0% then back to 100% to force Windows to re-apply the level. Also check: SteelSeries GG EQ/gain settings, Volume Mixer per-app levels, Loudness Equalization (if accessible via device properties). Note: `mmsys.cpl` may freeze the VM — use Settings → System → Sound instead |
+| GPU reads 0xffffffff between service stop and unbind | GPU runtime PM puts device in D3 (PCIe link down) when all DRM FDs close after GDM stops | `echo on > /sys/bus/pci/devices/$GPU/power/control` before stopping services. Safety net: if GPU unresponsive at unbind time, use PCI remove/rescan instead of amdgpu unbind |
+| Concurrent vm-overwatch instances cause dirty state | Second instance finds GPU on vfio-pci, tries to operate on poisoned state | Lock file via `flock /run/vm-overwatch.lock` prevents concurrent instances |
+| Windows BSOD 0x9F DRIVER_POWER_STATE_FAILURE | Windows "Balanced" power plan sends power IRPs to passthrough GPU/USB devices; vfio-pci owns the hardware so guest driver can't complete power transitions | Switch to **High Performance** power plan; disable PCI Express ASPM, USB selective suspend, display timeout, sleep, hybrid sleep (see Windows VM Power Settings section) |
+| Need to manually switch monitor input | iGPU HDMI stays active when VM starts on DP, monitor doesn't auto-switch | Blank iGPU framebuffer (`echo 4 > /sys/class/graphics/fbN/blank`) when VM starts; monitor auto-detects to DP. Unblank (`echo 0`) before GDM restarts. fb matched by PCI device path, not hardcoded number |
+
+---
+
+## Windows VM Power Settings
+
+GPU passthrough devices are owned by vfio-pci on the host — the Windows guest driver cannot perform actual hardware power transitions. Windows power management causes **BSOD 0x9F (DRIVER_POWER_STATE_FAILURE)** when it sends power IRPs that the guest AMD driver can't complete.
+
+**Required settings** (applied via `powercfg` through QEMU guest agent):
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| Power plan | **High Performance** (`8c5e7fda-...`) | Disables aggressive power management globally |
+| PCI Express ASPM | **Off** (AC & DC) | ASPM tries to negotiate PCIe link power states — incompatible with vfio-pci passthrough. Primary crash trigger during gameplay. |
+| USB selective suspend | **Disabled** (AC & DC) | Prevents Windows from sleeping passthrough USB devices |
+| Display timeout | **Never** (0) | Prevents power IRPs to GPU for display-off transitions |
+| Sleep after | **Never** (0) | Prevents full system sleep (which would freeze the VM) |
+| Hybrid sleep | **Off** | Sleep would include hibernation prep, writing to passthrough disk |
+
+```powershell
+# Switch to High Performance
+powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+# Disable PCI Express ASPM
+powercfg /setacvalueindex SCHEME_CURRENT 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0
+powercfg /setdcvalueindex SCHEME_CURRENT 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0
+# Disable USB selective suspend
+powercfg /setacvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
+powercfg /setdcvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
+# Disable display timeout
+powercfg /setacvalueindex SCHEME_CURRENT 7516b95f-f776-4464-8c53-06167f40cc99 3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e 0
+powercfg /setdcvalueindex SCHEME_CURRENT 7516b95f-f776-4464-8c53-06167f40cc99 3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e 0
+# Disable sleep and hybrid sleep
+powercfg /setacvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 29f6c1db-86da-48c5-9fdb-f2b67b1f44da 0
+powercfg /setdcvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 29f6c1db-86da-48c5-9fdb-f2b67b1f44da 0
+powercfg /setacvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 94ac6d29-73ce-41a6-809f-6363ba21b47e 0
+powercfg /setdcvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 94ac6d29-73ce-41a6-809f-6363ba21b47e 0
+powercfg /setactive SCHEME_CURRENT
+```
+
+**AMD driver version** (as of 2026-02-23): Radeon Software 32.0.23017.1001 (2026-01-08), with AMD Crash Defender 25.30.0.3.
 
 ---
 
@@ -335,8 +384,15 @@ cat /dev/navi31-reset            # GPU health (SOL + bootloader)
 - [x] **GDM monitors.xml stability** — Verified: GDM consistently shows 3440x1440 21:9 after wrapper restarts GDM. monitors.xml with DP-1 disabled works.
 - [x] **Test Overwatch gameplay** — Verified: Overwatch runs, game performance good, no anti-cheat issues.
 - [x] **Fix VM networking** — ~~Bridge readiness check after suspend/resume~~ No longer needed — MODE1 reset doesn't disrupt networking.
-- [x] **Fix Tartarus USB passthrough** — Increased detach/reattach delay from 8s to 30s; Windows needs time to load USB drivers before the cycle.
+- [x] **Fix Tartarus USB passthrough** — ~~Detach/reattach workaround removed~~ — only needed with USB hubs. With direct connections, just ensure no hardcoded `<address bus=... device=...>` in USB source entries.
 - [x] **VBIOS reverse engineering / standalone GPU reset** — Built `navi31_reset` kernel module implementing MODE1 reset via SMU debug mailbox. Replaces suspend/resume with 509ms software reset. Integrated into `vm-overwatch`. Details at `vbios-reverse-engineering-plan.md`.
+- [x] **Disable Windows Backup reminder** — Disabled via registry: `BackupNotificationDisabled=1`, `BackupReminder toast Enabled=0`, `BackupSettingsRoaming=0` (applied via QEMU guest agent).
+- [x] **Install QEMU guest agent** — Installed `qemu-ga-x86_64.msi` from virtio-win ISO, plus VirtIO Serial driver via Device Manager. Channel added to VM XML. Agent v110.0.2 working.
+- [x] **Fix GPU D3 sleep during teardown** — GPU runtime PM disabled before stopping services (`echo on > power/control`). Safety net: PCI remove/rescan if GPU unresponsive at unbind time.
+- [x] **Auto display switching** — iGPU framebuffer blanking (`echo 4 > fbN/blank`) when VM starts, unblank before GDM restarts. Monitor auto-detects between HDMI (iGPU) and DP (dGPU).
+- [x] **Error logging and diagnostics** — ERR trap with line numbers, state snapshots at 10+ checkpoints, persistent logs in `/var/log/vm-overwatch/`, `--verbose` flag for full bash trace.
+- [x] **Prevent concurrent instances** — Lock file via `flock /run/vm-overwatch.lock`.
+- [x] **Fix Windows BSOD during gameplay** — 6× 0x9F (DRIVER_POWER_STATE_FAILURE) caused by Balanced power plan + PCI Express ASPM on passthrough devices. Fixed: High Performance plan, ASPM off, USB selective suspend off, all timeouts disabled.
 
 ---
 

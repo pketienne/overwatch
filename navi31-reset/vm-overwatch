@@ -1,36 +1,307 @@
 #!/bin/bash
 # Overwatch VM lifecycle manager
 # Runs as a systemd transient service (systemd-run) to survive GDM stop/restart
-# Log: journalctl -u vm-overwatch
+# Log: journalctl -u vm-overwatch | /var/log/vm-overwatch/<run>.log
 #
-# GPU reset method: MODE1 via navi31_reset kernel module (~500ms)
-# Replaces the old suspend/resume approach (~20s + 35s network recovery)
+# GPU reset chain: MODE1 → PCI bus reset → suspend/resume (last resort)
+# Never binds amdgpu to an unresponsive GPU.
+#
+# Usage: vm-overwatch [--verbose]
 
 set -uo pipefail
 
 GPU="0000:03:00.0"
 GPU_AUDIO="0000:03:00.1"
+IGPU="0000:74:00.0"
 RESET_DEV="/dev/navi31-reset"
 RESET_MODULE="/home/myuser/navi31-reset/navi31_reset.ko"
+HOST_CPU=0          # CPU reserved for host tasks
+VM_CPUS="1-7"       # CPUs pinned to VM vCPUs
+LOCK_FILE="/run/vm-overwatch.lock"
+LOG_DIR="/var/log/vm-overwatch"
+
+# --- Logging setup ---
+
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/$(date '+%Y-%m-%d_%H-%M-%S').log"
+
+# Tee all stdout/stderr to both journald (via systemd) and the log file
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 log() { echo "$(date '+%H:%M:%S') $*"; }
+
+# ERR trap — log exact line number and command on any failure
+on_error() {
+    local lineno=$1 cmd=$2 rc=$3
+    log "ERROR: command failed at line $lineno: '$cmd' (exit code $rc)"
+    log_state "on_error"
+}
+trap 'on_error $LINENO "$BASH_COMMAND" $?' ERR
+
+# --verbose flag enables bash trace (set -x) for full command logging
+VERBOSE=false
+if [[ "${1:-}" == "--verbose" ]]; then
+    VERBOSE=true
+    export PS4='+${BASH_SOURCE}:${LINENO}: '
+    set -x
+    log "Verbose mode enabled"
+fi
+
+# --- State snapshot ---
+
+# Dump GPU driver, health, VM state, and driver_override at a named checkpoint
+log_state() {
+    local checkpoint="${1:-unknown}"
+    local gpu_drv gpu_audio_drv gpu_status vm_state gpu_override gpu_audio_override
+    gpu_drv=$(gpu_driver "$GPU")
+    gpu_audio_drv=$(gpu_driver "$GPU_AUDIO")
+    gpu_status=$(cat "$RESET_DEV" 2>/dev/null || echo "unavailable")
+    vm_state=$(virsh domstate overwatch 2>/dev/null || echo "unknown")
+    gpu_override=$(cat "/sys/bus/pci/devices/$GPU/driver_override" 2>/dev/null || echo "none")
+    gpu_audio_override=$(cat "/sys/bus/pci/devices/$GPU_AUDIO/driver_override" 2>/dev/null || echo "none")
+    log "STATE [$checkpoint] gpu=$gpu_drv audio=$gpu_audio_drv override=$gpu_override/$gpu_audio_override registers=[$gpu_status] vm=$vm_state"
+}
+
+# --- Lock ---
+
+# Acquire exclusive lock — prevent concurrent instances
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    log "ERROR: Another vm-overwatch instance is already running (lock: $LOCK_FILE)"
+    exit 1
+fi
+trap 'on_error $LINENO "$BASH_COMMAND" $?; flock -u 9; rm -f "$LOCK_FILE"' ERR
+trap 'flock -u 9; rm -f "$LOCK_FILE"' EXIT
+
+# --- Helper functions ---
 
 gpu_driver() {
     basename "$(readlink "/sys/bus/pci/devices/$1/driver" 2>/dev/null)" 2>/dev/null || echo "unbound"
 }
 
-gpu_reset() {
-    log "MODE1 resetting GPU..."
-    local start end elapsed
-    start=$(date +%s%N)
-    echo mode1 > "$RESET_DEV"
-    end=$(date +%s%N)
-    elapsed=$(( (end - start) / 1000000 ))
-    log "GPU reset complete (${elapsed}ms)"
-    log "Post-reset: $(cat $RESET_DEV)"
+# Check if GPU registers are responsive (not returning all 0xffffffff)
+gpu_healthy() {
+    local status
+    status=$(cat "$RESET_DEV" 2>/dev/null) || return 1
+    if echo "$status" | grep -q "0xffffffff"; then
+        return 1
+    fi
+    return 0
 }
 
+# Find the iGPU framebuffer by PCI device path (not hardcoded fb number)
+igpu_fb() {
+    for fb in /sys/class/graphics/fb*/; do
+        if [ "$(readlink -f "$fb/device" 2>/dev/null)" = "/sys/devices/pci0000:00/$IGPU" ] || \
+           readlink -f "$fb/device" 2>/dev/null | grep -q "$IGPU"; then
+            echo "$fb"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Blank iGPU output (DPMS powerdown) — monitor will auto-detect to DP
+blank_igpu() {
+    local fb
+    fb=$(igpu_fb) || { log "WARNING: iGPU framebuffer not found — cannot blank"; return 1; }
+    log "Blanking iGPU output (${fb}blank = 4)..."
+    echo 4 > "${fb}blank" 2>/dev/null || { log "WARNING: Failed to blank iGPU"; return 1; }
+    log "iGPU blanked — monitor should auto-detect to DisplayPort"
+    return 0
+}
+
+# Unblank iGPU output — restore HDMI signal before GDM starts
+unblank_igpu() {
+    local fb
+    fb=$(igpu_fb) || { log "WARNING: iGPU framebuffer not found — cannot unblank"; return 1; }
+    log "Unblanking iGPU output (${fb}blank = 0)..."
+    echo 0 > "${fb}blank" 2>/dev/null || { log "WARNING: Failed to unblank iGPU"; return 1; }
+    log "iGPU unblanked"
+    return 0
+}
+
+# Try MODE1 reset. Returns 0 on success.
+try_mode1() {
+    log "Trying MODE1 reset..."
+    local start end elapsed
+    start=$(date +%s%N)
+    if echo mode1 > "$RESET_DEV" 2>/dev/null; then
+        end=$(date +%s%N)
+        elapsed=$(( (end - start) / 1000000 ))
+        log "MODE1 reset complete (${elapsed}ms)"
+        log "Post-reset: $(cat $RESET_DEV)"
+        if gpu_healthy; then
+            return 0
+        fi
+        log "WARNING: GPU unhealthy after MODE1"
+    else
+        end=$(date +%s%N)
+        elapsed=$(( (end - start) / 1000000 ))
+        log "MODE1 reset FAILED (${elapsed}ms)"
+    fi
+    return 1
+}
+
+# Try PCI bus reset (FLR/SBR via kernel). Returns 0 on success.
+try_pci_reset() {
+    log "Trying PCI bus reset..."
+    if [ ! -f "/sys/bus/pci/devices/$GPU/reset" ]; then
+        log "PCI bus reset not available for $GPU"
+        return 1
+    fi
+    echo 1 > "/sys/bus/pci/devices/$GPU/reset" 2>/dev/null || true
+    sleep 2
+    log "Post-PCI-reset: $(cat $RESET_DEV 2>/dev/null)"
+    if gpu_healthy; then
+        log "PCI bus reset succeeded"
+        return 0
+    fi
+    log "GPU still unhealthy after PCI bus reset"
+    return 1
+}
+
+# Try suspend/resume hardware reset (last resort). Returns 0 on success.
+try_suspend_resume() {
+    log "Trying suspend/resume hardware reset (last resort)..."
+    # rtcwake: suspend to RAM, wake after 5 seconds
+    rtcwake -m mem -s 5 2>/dev/null || true
+    # After resume, wait for system to stabilize
+    sleep 5
+    log "Resumed from suspend"
+    log "Post-suspend: $(cat $RESET_DEV 2>/dev/null)"
+    if gpu_healthy; then
+        log "Suspend/resume reset succeeded"
+        return 0
+    fi
+    log "GPU still unhealthy after suspend/resume"
+    return 1
+}
+
+# Robust GPU reset with fallback chain.
+# Returns 0 if GPU is healthy after reset, 1 if all methods failed.
+gpu_reset() {
+    # Check health before trying anything
+    if ! gpu_healthy; then
+        log "WARNING: GPU unresponsive before reset (0xffffffff)"
+    fi
+
+    # 1. MODE1 (fastest, ~500ms)
+    if gpu_healthy && try_mode1; then
+        return 0
+    fi
+
+    # 2. PCI bus reset (FLR/SBR, works at link level)
+    if try_pci_reset; then
+        return 0
+    fi
+
+    # 3. Suspend/resume (hardware power cycle, guaranteed but slow)
+    if try_suspend_resume; then
+        return 0
+    fi
+
+    log "ERROR: All GPU reset methods failed — GPU is unrecoverable"
+    return 1
+}
+
+# Pin all IRQs to host CPU so VM cores get no interrupt overhead
+pin_irqs_to_host() {
+    log "Pinning all IRQs to CPU $HOST_CPU..."
+    # Stop irqbalance so it doesn't redistribute
+    systemctl stop irqbalance 2>/dev/null || true
+    for irq_dir in /proc/irq/*/; do
+        echo $HOST_CPU > "${irq_dir}smp_affinity_list" 2>/dev/null || true
+    done
+}
+
+# Set CPU governor to performance on all cores
+set_performance_governor() {
+    log "Setting CPU governor to performance..."
+    for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        echo performance > "$gov" 2>/dev/null || true
+    done
+}
+
+# Move host kernel threads and processes off VM cores
+isolate_vm_cpus() {
+    log "Isolating VM CPUs ($VM_CPUS) from host tasks..."
+    local moved=0
+    for pid in $(ps -eo pid --no-headers); do
+        taskset -pc $HOST_CPU "$pid" > /dev/null 2>&1 && moved=$((moved + 1)) || true
+    done
+    log "Moved $moved processes to CPU $HOST_CPU"
+    # Move RCU callbacks to host CPU
+    for rcu in /sys/bus/workqueue/devices/writeback/cpumask; do
+        echo 1 > "$rcu" 2>/dev/null || true
+    done
+    echo 1 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
+}
+
+# Undo performance tuning after VM stops
+restore_cpu_defaults() {
+    log "Restoring CPU defaults..."
+    # Governor back to powersave
+    for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        echo powersave > "$gov" 2>/dev/null || true
+    done
+    # Restart irqbalance to redistribute IRQs
+    systemctl start irqbalance 2>/dev/null || true
+}
+
+# Restore host services (iGPU desktop, etc.) — always called, even on failure
+restore_host() {
+    local gpu_ok="$1"  # "true" or "false"
+
+    # Rebind VT consoles
+    log "Rebinding VT consoles..."
+    for vtcon in /sys/class/vtconsole/vtcon*/bind; do
+        echo 1 > "$vtcon" 2>/dev/null || true
+    done
+
+    if [ "$gpu_ok" = "true" ]; then
+        # Bind to amdgpu
+        log "Binding to amdgpu..."
+        echo "$GPU" > /sys/bus/pci/drivers/amdgpu/bind 2>/dev/null || true
+        sleep 3
+        echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/bind 2>/dev/null || true
+        log "GPU driver: $(gpu_driver $GPU)"
+    else
+        log "WARNING: Skipping amdgpu bind — GPU is unresponsive"
+        log "WARNING: Desktop will run on iGPU only until next reboot"
+    fi
+
+    # Restart services
+    log "Starting openrgb..."
+    systemctl start openrgb 2>/dev/null || true
+
+    log "Starting ollama..."
+    systemctl start ollama 2>/dev/null || true
+
+    # Unblank iGPU before starting GDM so monitor switches back to HDMI
+    unblank_igpu
+
+    # Start GDM (iGPU will always work regardless of dGPU state)
+    log "Starting GDM..."
+    systemctl start gdm
+    sleep 2
+
+    # Ensure GDM monitors.xml is correct
+    if [ -f /home/myuser/.config/monitors.xml ]; then
+        cp /home/myuser/.config/monitors.xml /var/lib/gdm3/.config/monitors.xml
+        chown gdm:gdm /var/lib/gdm3/.config/monitors.xml
+    fi
+
+    log_state "restore_host_done"
+}
+
+# === Main Flow ===
+
 log "=== Starting Overwatch VM ==="
+log_state "startup"
+
+# Prune old logs (keep last 20)
+ls -t "$LOG_DIR"/*.log 2>/dev/null | tail -n +21 | xargs rm -f 2>/dev/null || true
 
 # 0. Ensure navi31_reset module is loaded
 if [ ! -e "$RESET_DEV" ]; then
@@ -48,7 +319,12 @@ if [ ! -e "$RESET_DEV" ]; then
 fi
 log "GPU status: $(cat $RESET_DEV)"
 
-# 1. Stop services using the dGPU
+# 1. Disable runtime PM on dGPU — prevent D3 sleep when services release FDs
+log "Disabling GPU runtime PM (forcing D0)..."
+echo on > "/sys/bus/pci/devices/$GPU/power/control" 2>/dev/null || true
+echo on > "/sys/bus/pci/devices/$GPU_AUDIO/power/control" 2>/dev/null || true
+
+# 2. Stop services using the dGPU
 log "Stopping ollama..."
 systemctl stop ollama 2>/dev/null || true
 
@@ -82,83 +358,96 @@ for vtcon in /sys/class/vtconsole/vtcon*/bind; do
 done
 sleep 1
 
+log_state "pre_unbind"
+
 # 6. Unbind dGPU from amdgpu
 log "Current GPU driver: $(gpu_driver $GPU)"
 if [ "$(gpu_driver $GPU)" = "amdgpu" ]; then
-    log "Unbinding GPU audio..."
-    echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/unbind 2>/dev/null || true
-    sleep 1
+    # Safety check: if GPU went to D3 despite runtime PM disable, don't attempt
+    # amdgpu unbind — it will hang. Use PCI remove instead.
+    if ! gpu_healthy; then
+        log "WARNING: GPU unresponsive (D3?) before unbind — using PCI remove instead"
+        echo 1 > "/sys/bus/pci/devices/$GPU_AUDIO/remove" 2>/dev/null || true
+        echo 1 > "/sys/bus/pci/devices/$GPU/remove" 2>/dev/null || true
+        sleep 2
+        log "Rescanning PCI bus..."
+        echo 1 > /sys/bus/pci/rescan 2>/dev/null || true
+        sleep 2
+    else
+        log "Unbinding GPU audio..."
+        echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/unbind 2>/dev/null || true
+        sleep 1
 
-    log "Unbinding GPU from amdgpu..."
-    echo "$GPU" > /sys/bus/pci/drivers/amdgpu/unbind
-    sleep 2
-    log "Unbind completed. GPU driver: $(gpu_driver $GPU)"
+        log "Unbinding GPU from amdgpu..."
+        echo "$GPU" > /sys/bus/pci/drivers/amdgpu/unbind
+        sleep 2
+        log "Unbind completed. GPU driver: $(gpu_driver $GPU)"
+    fi
 fi
 
-# 7. Pre-VM GPU reset: MODE1 reset so VM VBIOS can POST cleanly
-gpu_reset
+log_state "post_unbind"
+
+# 7. Pre-VM GPU reset
+if ! gpu_reset; then
+    log "ERROR: Pre-VM GPU reset failed — aborting VM launch"
+    log_state "pre_reset_failed"
+    restore_host "false"
+    exit 1
+fi
+
+log_state "post_reset"
 
 # 8. Bind to vfio-pci
 log "Binding GPU to vfio-pci..."
 modprobe vfio-pci 2>/dev/null || true
-echo "vfio-pci" > /sys/bus/pci/devices/$GPU/driver_override
-echo "$GPU" > /sys/bus/pci/drivers/vfio-pci/bind
-echo "vfio-pci" > /sys/bus/pci/devices/$GPU_AUDIO/driver_override
-echo "$GPU_AUDIO" > /sys/bus/pci/drivers/vfio-pci/bind
+if [ "$(gpu_driver $GPU)" = "vfio-pci" ]; then
+    log "GPU already on vfio-pci (previous dirty state) — skipping bind"
+else
+    echo "vfio-pci" > /sys/bus/pci/devices/$GPU/driver_override
+    echo "$GPU" > /sys/bus/pci/drivers/vfio-pci/bind
+fi
+if [ "$(gpu_driver $GPU_AUDIO)" = "vfio-pci" ]; then
+    log "GPU audio already on vfio-pci — skipping bind"
+else
+    echo "vfio-pci" > /sys/bus/pci/devices/$GPU_AUDIO/driver_override
+    echo "$GPU_AUDIO" > /sys/bus/pci/drivers/vfio-pci/bind
+fi
 sleep 1
 log "GPU driver: $(gpu_driver $GPU)"
 if [ "$(gpu_driver $GPU)" != "vfio-pci" ]; then
     log "ERROR: GPU not on vfio-pci! Aborting."
+    log_state "vfio_bind_failed"
     echo "" > /sys/bus/pci/devices/$GPU/driver_override 2>/dev/null || true
     echo "" > /sys/bus/pci/devices/$GPU_AUDIO/driver_override 2>/dev/null || true
-    echo "$GPU" > /sys/bus/pci/drivers/amdgpu/bind 2>/dev/null || true
-    for vtcon in /sys/class/vtconsole/vtcon*/bind; do
-        echo 1 > "$vtcon" 2>/dev/null || true
-    done
-    systemctl start openrgb 2>/dev/null || true
-    systemctl start ollama 2>/dev/null || true
-    systemctl start gdm
+    gpu_reset && restore_host "true" || restore_host "false"
     exit 1
 fi
+
+log_state "vfio_bound"
 
 # 9. Start VM (no need to wait for br0 — we didn't suspend)
 log "Starting VM..."
 if ! virsh start overwatch; then
     log "ERROR: Failed to start VM! Restoring GPU..."
+    log_state "vm_start_failed"
     echo "" > /sys/bus/pci/devices/$GPU/driver_override 2>/dev/null || true
     echo "" > /sys/bus/pci/devices/$GPU_AUDIO/driver_override 2>/dev/null || true
     echo "$GPU" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
     echo "$GPU_AUDIO" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
-    echo "$GPU" > /sys/bus/pci/drivers/amdgpu/bind 2>/dev/null || true
-    for vtcon in /sys/class/vtconsole/vtcon*/bind; do
-        echo 1 > "$vtcon" 2>/dev/null || true
-    done
-    systemctl start openrgb 2>/dev/null || true
-    systemctl start ollama 2>/dev/null || true
-    systemctl start gdm
+    restore_host "true"
     exit 1
 fi
 log "VM started successfully."
 
-# 10. Fix Tartarus USB (background — detach/reattach cycle)
-(
-    sleep 30
-    log "Tartarus fix: detaching..."
-    virsh detach-device overwatch /dev/stdin --live <<'XMLEOF' || log "Tartarus detach failed"
-<hostdev mode="subsystem" type="usb" managed="yes">
-  <source><vendor id="0x1532"/><product id="0x022b"/></source>
-</hostdev>
-XMLEOF
-    sleep 3
-    log "Tartarus fix: reattaching..."
-    virsh attach-device overwatch /dev/stdin --live <<'XMLEOF' || log "Tartarus attach failed"
-<hostdev mode="subsystem" type="usb" managed="yes">
-  <source><vendor id="0x1532"/><product id="0x022b"/></source>
-</hostdev>
-XMLEOF
-    log "Tartarus fix: done."
-) &
+# 10. Blank iGPU so monitor auto-detects to DisplayPort
+blank_igpu
 
+# 11. Performance tuning — minimize VM exits from host interrupts
+pin_irqs_to_host
+set_performance_governor
+isolate_vm_cpus
+
+log_state "vm_running"
 log "VM running. Waiting for shutdown..."
 
 # 11. Wait for VM to shut down
@@ -167,7 +456,12 @@ while virsh domstate overwatch 2>/dev/null | grep -q "running"; do
 done
 log "VM shut down detected."
 
-# 12. Post-VM: Unbind vfio-pci and reset GPU for host use
+log_state "vm_shutdown"
+
+# 12. Restore CPU defaults
+restore_cpu_defaults
+
+# 13. Post-VM: Unbind vfio-pci and reset GPU for host use
 log "Unbinding vfio-pci..."
 echo "$GPU" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
 echo "$GPU_AUDIO" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
@@ -175,38 +469,16 @@ echo "" > /sys/bus/pci/devices/$GPU/driver_override 2>/dev/null || true
 echo "" > /sys/bus/pci/devices/$GPU_AUDIO/driver_override 2>/dev/null || true
 sleep 1
 
-# 13. Post-VM GPU reset: MODE1 reset to clean up after VM
-gpu_reset
+log_state "post_vfio_unbind"
 
-# 14. Bind to amdgpu
-log "Binding to amdgpu..."
-echo "$GPU" > /sys/bus/pci/drivers/amdgpu/bind 2>/dev/null || true
-sleep 3
-echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/bind 2>/dev/null || true
-log "GPU driver: $(gpu_driver $GPU)"
-
-# 15. Rebind VT consoles
-log "Rebinding VT consoles..."
-for vtcon in /sys/class/vtconsole/vtcon*/bind; do
-    echo 1 > "$vtcon" 2>/dev/null || true
-done
-
-# 16. Restart services
-log "Starting openrgb..."
-systemctl start openrgb 2>/dev/null || true
-
-log "Starting ollama..."
-systemctl start ollama 2>/dev/null || true
-
-# 17. Start GDM
-log "Starting GDM..."
-systemctl start gdm
-sleep 2
-
-# 18. Ensure GDM monitors.xml is correct
-if [ -f /home/myuser/.config/monitors.xml ]; then
-    cp /home/myuser/.config/monitors.xml /var/lib/gdm3/.config/monitors.xml
-    chown gdm:gdm /var/lib/gdm3/.config/monitors.xml
+# 14. Post-VM GPU reset with fallback chain
+if gpu_reset; then
+    log_state "post_vm_reset_ok"
+    restore_host "true"
+    log "=== Done. GPU: $(gpu_driver $GPU), ollama: $(systemctl is-active ollama) ==="
+else
+    log_state "post_vm_reset_failed"
+    restore_host "false"
+    log "=== Done (degraded). GPU reset failed — iGPU only. Reboot to recover dGPU. ==="
+    exit 1
 fi
-
-log "=== Done. GPU: $(gpu_driver $GPU), ollama: $(systemctl is-active ollama) ==="
