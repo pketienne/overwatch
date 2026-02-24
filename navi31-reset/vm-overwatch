@@ -549,17 +549,123 @@ ensure_vm_running() {
 # Re-attach USB devices — clears ghost entries from previous VM sessions
 ensure_usb_reattached() {
     log "Re-attaching USB devices..."
+    local usb_log="$LOG_DIR/usb-reattach.log"
+    local ts_start ts_end
+    ts_start=$(date +%s%N)
+
+    # Snapshot host USB state
+    local lsusb_before
+    lsusb_before=$(lsusb 2>/dev/null || echo "(lsusb failed)")
+    log "USB_DIAG: host USB devices before reattach:"
+    echo "$lsusb_before" | while read -r line; do log "USB_DIAG:   $line"; done
+
     for usb_entry in "${USB_DEVICES[@]}"; do
         usb_vid="${usb_entry%%:*}"
         usb_rest="${usb_entry#*:}"
         usb_pid="${usb_rest%%:*}"
         usb_name="${usb_rest#*:}"
+        local vid_short="${usb_vid#0x}" pid_short="${usb_pid#0x}"
         usb_xml="<hostdev mode='subsystem' type='usb' managed='yes'><source><vendor id='$usb_vid'/><product id='$usb_pid'/></source></hostdev>"
-        virsh detach-device overwatch /dev/stdin --live <<< "$usb_xml" 2>/dev/null || true
-        sleep 1
-        virsh attach-device overwatch /dev/stdin --live <<< "$usb_xml" 2>/dev/null || true
-        log "Re-attached $usb_name ($usb_vid:$usb_pid)"
+
+        # Check host visibility
+        local host_visible="no"
+        if echo "$lsusb_before" | grep -qi "${vid_short}:${pid_short}"; then
+            host_visible="yes"
+        fi
+        log "USB_DIAG: $usb_name ($usb_vid:$usb_pid) host_visible=$host_visible"
+
+        # Detach (may fail if not currently attached — that's expected)
+        local detach_out detach_rc
+        detach_out=$(virsh detach-device overwatch /dev/stdin --live <<< "$usb_xml" 2>&1) && detach_rc=0 || detach_rc=$?
+        log "USB_DIAG: $usb_name detach rc=$detach_rc output='$(echo "$detach_out" | tr '\n' ' ')'"
+        sleep 2
+
+        # Re-check host visibility after detach (device should return to host)
+        local host_after_detach="no"
+        if lsusb 2>/dev/null | grep -qi "${vid_short}:${pid_short}"; then
+            host_after_detach="yes"
+        fi
+        log "USB_DIAG: $usb_name host_visible_after_detach=$host_after_detach"
+
+        # Wait for device to re-appear on host bus (up to 30s)
+        if [ "$host_after_detach" = "no" ]; then
+            log "USB_DIAG: $usb_name not on host bus — polling for re-enumeration..."
+            local poll_start poll_waited=0
+            poll_start=$(date +%s)
+            while [ $poll_waited -lt 30 ]; do
+                if lsusb 2>/dev/null | grep -qi "${vid_short}:${pid_short}"; then
+                    poll_waited=$(( $(date +%s) - poll_start ))
+                    log "USB_DIAG: $usb_name re-appeared after ${poll_waited}s"
+                    sleep 1  # settle time after enumeration
+                    break
+                fi
+                sleep 1
+                poll_waited=$(( $(date +%s) - poll_start ))
+            done
+            if [ $poll_waited -ge 30 ]; then
+                log "USB_DIAG: $usb_name did NOT re-appear after 30s — trying USB bus rescan"
+                for usbbus in /sys/bus/usb/devices/usb*/; do
+                    echo 0 > "${usbbus}authorized" 2>/dev/null || true
+                    echo 1 > "${usbbus}authorized" 2>/dev/null || true
+                done
+                sleep 3
+                if lsusb 2>/dev/null | grep -qi "${vid_short}:${pid_short}"; then
+                    log "USB_DIAG: $usb_name re-appeared after bus rescan"
+                else
+                    log "WARNING: $usb_name ($usb_vid:$usb_pid) not found after 30s + bus rescan — skipping attach"
+                    continue
+                fi
+            fi
+        fi
+
+        # Attach
+        local attach_out attach_rc
+        attach_out=$(virsh attach-device overwatch /dev/stdin --live <<< "$usb_xml" 2>&1) && attach_rc=0 || attach_rc=$?
+        log "USB_DIAG: $usb_name attach rc=$attach_rc output='$(echo "$attach_out" | tr '\n' ' ')'"
+
+        if [ $attach_rc -eq 0 ]; then
+            log "Re-attached $usb_name ($usb_vid:$usb_pid)"
+        else
+            log "WARNING: Failed to attach $usb_name ($usb_vid:$usb_pid)"
+        fi
     done
+
+    # Snapshot host USB state after all reattachments
+    local lsusb_after
+    lsusb_after=$(lsusb 2>/dev/null || echo "(lsusb failed)")
+    log "USB_DIAG: host USB devices after reattach:"
+    echo "$lsusb_after" | while read -r line; do log "USB_DIAG:   $line"; done
+
+    # Check VM's view of USB devices
+    local vm_usb
+    vm_usb=$(virsh dumpxml overwatch 2>/dev/null | grep -A5 "hostdev.*usb" || echo "(failed)")
+    log "USB_DIAG: VM USB hostdev entries:"
+    echo "$vm_usb" | while read -r line; do log "USB_DIAG:   $line"; done
+
+    ts_end=$(date +%s%N)
+    local elapsed_ms=$(( (ts_end - ts_start) / 1000000 ))
+    log "USB_DIAG: reattach completed in ${elapsed_ms}ms"
+
+    # Append structured record to usb-reattach.log
+    {
+        echo "---"
+        echo "timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "elapsed_ms: $elapsed_ms"
+        echo "vm_uptime_s: $(( $(date +%s) - ${VM_START_TIME:-$(date +%s)} ))"
+        echo "lsusb_before: $(echo "$lsusb_before" | wc -l) devices"
+        echo "lsusb_after: $(echo "$lsusb_after" | wc -l) devices"
+        for usb_entry in "${USB_DEVICES[@]}"; do
+            usb_vid="${usb_entry%%:*}"
+            usb_rest="${usb_entry#*:}"
+            usb_pid="${usb_rest%%:*}"
+            usb_name="${usb_rest#*:}"
+            local vid_short="${usb_vid#0x}" pid_short="${usb_pid#0x}"
+            local in_host="no" in_vm="no"
+            echo "$lsusb_after" | grep -qi "${vid_short}:${pid_short}" && in_host="yes"
+            echo "$vm_usb" | grep -qi "$usb_vid" && in_vm="yes"
+            echo "device: $usb_name vid=$usb_vid pid=$usb_pid host=$in_host vm=$in_vm"
+        done
+    } >> "$usb_log"
 }
 
 ensure_igpu_blanked() {
