@@ -316,17 +316,18 @@ ensure_usb_reattached() {
     done
 }
 
-ensure_igpu_blanked() {
+set_igpu_blank() {
+    local target=$1 label=$2
     local fb blank_val
-    fb=$(igpu_fb) || { log "WARNING: iGPU framebuffer not found — cannot blank"; return 1; }
-    blank_val=$(cat "${fb}blank" 2>/dev/null || echo "0")
-    if [ "$blank_val" = "4" ]; then
-        log "iGPU already blanked"
+    fb=$(igpu_fb) || { log "WARNING: iGPU framebuffer not found — cannot $label"; return 1; }
+    blank_val=$(cat "${fb}blank" 2>/dev/null || echo "?")
+    if [ "$blank_val" = "$target" ]; then
+        log "iGPU already ${label}ed"
         return 0
     fi
-    log "Blanking iGPU output (${fb}blank = 4)..."
-    echo 4 > "${fb}blank" 2>/dev/null || { log "WARNING: Failed to blank iGPU"; return 1; }
-    log "iGPU blanked — monitor should auto-detect to DisplayPort"
+    log "${label^}ing iGPU output (${fb}blank = $target)..."
+    echo "$target" > "${fb}blank" 2>/dev/null || { log "WARNING: Failed to $label iGPU"; return 1; }
+    log "iGPU ${label}ed"
 }
 
 ensure_performance_tuning() {
@@ -461,19 +462,6 @@ ensure_gpu_on_host() {
     log "Runtime PM disabled for GPU and audio"
 }
 
-ensure_igpu_unblanked() {
-    local fb blank_val
-    fb=$(igpu_fb) || { log "WARNING: iGPU framebuffer not found — cannot unblank"; return 1; }
-    blank_val=$(cat "${fb}blank" 2>/dev/null || echo "4")
-    if [ "$blank_val" = "0" ]; then
-        log "iGPU already unblanked"
-        return 0
-    fi
-    log "Unblanking iGPU output (${fb}blank = 0)..."
-    echo 0 > "${fb}blank" 2>/dev/null || { log "WARNING: Failed to unblank iGPU"; return 1; }
-    log "iGPU unblanked"
-}
-
 ensure_services_running() {
     local svc
     for svc in openrgb ollama; do
@@ -511,7 +499,7 @@ _do_stop() {
     ensure_cpu_defaults
     ensure_gpu_unbound_from_vfio
     ensure_gpu_on_host || log "WARNING: Could not restore GPU to host — iGPU only"
-    ensure_igpu_unblanked || true
+    set_igpu_blank 0 unblank || true
     ensure_services_running
 
     log "=== Host restored ==="
@@ -536,7 +524,7 @@ _do_start() {
 
     # Post-VM-start setup (non-critical, continue on failure)
     ensure_usb_reattached
-    ensure_igpu_blanked || true
+    set_igpu_blank 4 blank || true
     ensure_performance_tuning
 
     log_state "vm_running"
