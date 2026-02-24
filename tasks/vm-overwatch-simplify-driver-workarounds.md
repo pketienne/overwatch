@@ -105,6 +105,27 @@ times, kill orphaned QEMU, and proceed to host restore.
 
 Removed unused `VM_CPUS` variable.
 
+## Step 10: Fix runtime PM race during host restore [DONE]
+
+The udev rules from the initial runtime PM fix were insufficient — both
+`amdgpu` (via `runpm=-1` auto) and `snd_hda_intel` (via `power_save=1`)
+override `power/control` back to `auto` during driver probe, defeating
+`ACTION=="add"` rules.
+
+Fifth VM cycle crashed during host restore: audio device entered D3hot
+immediately after `snd_hda_intel` probed it, then failed to resume
+(`Unable to change power state from D3hot to D0`), cascading into
+`device lost from bus` and a soft lockup.
+
+**Fixed** (two changes):
+1. `myhost:/etc/modprobe.d/amdgpu.conf`: `options amdgpu runpm=0` —
+   prevents amdgpu from ever enabling runtime PM at the driver level
+2. vm-overwatch `ensure_gpu_on_host()`: disable runtime PM on GPU
+   immediately after amdgpu bind, and on audio immediately after PCI
+   rescan, before `snd_hda_intel` has time to put the device to D3hot
+
+**Deploy and test**: clean cycle, `outcome=success`, no crash.
+
 ## Testing notes (2026-02-24)
 
 Commits: `19dd65e` (steps 1-5), `27857f1` (steps 7-9)
@@ -131,6 +152,15 @@ between VM cycles) required hard reboots. These are caused by amdgpu runtime
 PM resuming the GPU from D3 and finding it unresponsive — a separate issue
 from the driver workarounds we removed.
 
+- **Fifth deploy (libvirtd fix test)**: vm-overwatch died mid-session (the
+  `exec > >(tee ...)` process tracking issue — systemd tracks tee PID, not
+  bash). Host restore on next cycle crashed — audio device entered D3hot
+  during host restore and failed to resume. Required hard reboot.
+
+- **Sixth deploy (step 10, runtime PM race fix)**: Clean cycle.
+  `outcome=success`, `shutdown=clean_acpi`, `was_reset=no`. Both devices
+  show `power/control=on` after restore. No crash.
+
 ## Result
 
 967 → 808 lines across both commits (-159 lines, ~16% reduction).
@@ -153,16 +183,27 @@ related to VFIO passthrough — it happens during normal GDM desktop operation.
 `ensure_runtime_pm_disabled()` only protects during the vm-overwatch startup
 window.
 
-**Fix**: Added udev rules to `myhost:/etc/udev/rules.d/99-gpu-passthrough.rules`
-to permanently disable runtime PM for both GPU functions (video + audio):
+**Initial fix (udev rules only)**: Added rules to
+`myhost:/etc/udev/rules.d/99-gpu-passthrough.rules`:
 ```
 ACTION=="add", KERNEL=="0000:03:00.0", SUBSYSTEM=="pci", ATTR{power/control}="on"
 ACTION=="add", KERNEL=="0000:03:00.1", SUBSYSTEM=="pci", ATTR{power/control}="on"
 ```
-This forces the GPU to stay in D0 (fully powered) at all times. Tradeoff is
-~10-20W higher idle power, but the GPU never enters the D3 state that crashes it.
-Udev rule takes effect on boot; vm-overwatch also re-applies after amdgpu rebind
-in `ensure_gpu_on_host()` since driver rebind resets `power/control` to `auto`.
+Host survived 9 hours idle — but a later VM cycle crashed during host restore
+because both `amdgpu` and `snd_hda_intel` override `power/control` back to
+`auto` during driver probe, defeating the udev rules.
 
-**Verified**: Host survived 9 hours idle after VM cycle with zero GPU errors
-(previously crashed within 5-10 minutes). Fix is confirmed working.
+**Root cause**: Udev `ACTION=="add"` fires before driver probe. Both drivers
+re-enable runtime PM during probe, overriding the rules. The audio device
+(`03:00.1`) entered D3hot within seconds of `snd_hda_intel` probing, and
+the subsequent D3hot→D0 resume failed, crashing the GPU.
+
+**Complete fix (step 10)**:
+1. `myhost:/etc/modprobe.d/amdgpu.conf` — `options amdgpu runpm=0` tells
+   the driver to never enable runtime PM (previously `runpm=-1` = auto).
+2. vm-overwatch: disable runtime PM on each device immediately after it
+   appears — GPU right after `amdgpu bind`, audio right after PCI rescan —
+   closing the race window before `snd_hda_intel` puts the audio into D3hot.
+
+**Verified**: Clean VM cycle with host restore, no crash. Both devices show
+`power/control=on` after restore.

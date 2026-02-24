@@ -657,6 +657,11 @@ ensure_gpu_on_host() {
     sleep 3
     log "GPU driver: $(gpu_driver $GPU)"
 
+    # Disable runtime PM on GPU immediately after bind — amdgpu sets
+    # power/control to "auto" during probe, and the GPU crashes on D3 resume.
+    # Must happen before audio re-enumeration to prevent cascading failures.
+    echo on > "/sys/bus/pci/devices/$GPU/power/control" 2>/dev/null || true
+
     # GPU audio is often stuck in D3cold after VM passthrough — MODE1 reset
     # only resets the GFX engine, not the audio function. Binding snd_hda_intel
     # to a D3cold device triggers a failed power transition that crashes the
@@ -668,20 +673,22 @@ ensure_gpu_on_host() {
         sleep 1
         echo 1 > /sys/bus/pci/rescan 2>/dev/null || true
         sleep 2
+        # Disable runtime PM on audio immediately — snd_hda_intel puts it
+        # into D3hot within seconds, and D3hot→D0 fails after passthrough.
+        echo on > "/sys/bus/pci/devices/$GPU_AUDIO/power/control" 2>/dev/null || true
         if [ "$(gpu_driver $GPU_AUDIO)" = "snd_hda_intel" ]; then
             log "GPU audio re-enumerated and auto-probed successfully"
         elif [ -e "/sys/bus/pci/devices/$GPU_AUDIO" ]; then
             log "Binding GPU audio to snd_hda_intel..."
             echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/bind 2>/dev/null || \
                 log "WARNING: snd_hda_intel bind failed — HDMI/DP audio unavailable"
+            echo on > "/sys/bus/pci/devices/$GPU_AUDIO/power/control" 2>/dev/null || true
         else
             log "WARNING: GPU audio device not found after rescan"
         fi
     fi
 
-    # Disable runtime PM — amdgpu rebind resets power/control to "auto",
-    # and the GPU crashes when runtime PM tries to resume from D3.
-    ensure_runtime_pm_disabled
+    log "Runtime PM disabled for GPU and audio"
 
     log_bind_result "success"
 }
