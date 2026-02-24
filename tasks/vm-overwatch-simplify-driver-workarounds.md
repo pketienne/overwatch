@@ -200,22 +200,21 @@ Removed remaining code from the broken-driver era and unnecessary overhead
 2. **`driver_override` from `log_state` and `do_status`** (~8 lines): always
    shows `(null)/(null)` in steady state; actual bind functions already log
    results
-3. **iGPU blank/unblank** (~35 lines): `igpu_fb`, `ensure_igpu_blanked`,
-   `ensure_igpu_unblanked`, `IGPU` constant, `iGPU:` status line, and
-   callsites — monitor should auto-switch to DisplayPort when dGPU becomes
-   active. **Needs testing** — revert if monitor doesn't switch.
+3. ~~**iGPU blank/unblank**~~: **REVERTED** — monitor does not auto-switch
+   to DisplayPort. Kernel logs `No EDID read` on iGPU HDMI while it stays
+   active. iGPU blanking is required to force the monitor input switch.
 4. **PID affinity loops** (~25 lines): removed `for pid` loops from both
    `ensure_performance_tuning` and `ensure_cpu_defaults`, plus the early-exit
    governor+irqbalance check. libvirt `<cputune>` already pins vCPU threads;
    IRQ affinity pinning is the meaningful part. PID iteration added ~1s
    startup time for negligible benefit.
 
-629 → 538 lines (-91 lines, ~14% reduction). Needs deploy+test to verify
-steps 3 and 4.
+629 → 591 lines (-38 lines, ~6% reduction). Steps 1, 2, 4 verified with
+one clean VM start/stop cycle. Step 3 reverted after testing.
 
 ## Result
 
-967 → 538 lines across all commits (-429 lines, ~44% reduction).
+967 → 591 lines across all commits (-376 lines, ~39% reduction).
 
 Remaining code is all actively used on every VM cycle:
 - Audio D3cold workaround (PCI remove+rescan) — still fires every cycle, adds
