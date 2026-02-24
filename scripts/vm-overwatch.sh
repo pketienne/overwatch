@@ -623,20 +623,23 @@ open('${shutdown_ts_file}', 'w').write(str(int(time.time())))
     # Wait for VM to shut down — instrumented with QEMU process state tracking
     # Accept definitive non-running state OR domain-not-found (libvirtd lost track).
     # Transient empty output (libvirtd hiccup) is treated as "keep waiting".
-    local qemu_pid domain_missing=0 prev_pstate="S"
+    # QEMU state transitions are only logged after the shutdown signal to avoid noise.
+    local qemu_pid domain_missing=0 prev_pstate=""
     qemu_pid=$(pgrep -f "guest=overwatch" 2>/dev/null) || true
     while true; do
         local vm_poll pstate
         vm_poll=$(virsh domstate overwatch 2>&1) || true
 
-        # Track QEMU process state transitions (S=sleeping, D=disk sleep/VFIO teardown)
-        if [ -n "$qemu_pid" ] && [ -d "/proc/$qemu_pid" ]; then
-            pstate=$(sed -n 's/^State:\t\(.\).*/\1/p' "/proc/$qemu_pid/status" 2>/dev/null) || pstate="?"
-        elif [ -n "$qemu_pid" ]; then
-            pstate="exited"
-        fi
-        if [ "$pstate" != "$prev_pstate" ]; then
-            log "Shutdown: QEMU process state $prev_pstate → $pstate"
+        # Track QEMU process state transitions, but only after shutdown signal
+        if [ -f "$shutdown_ts_file" ] && [ -n "$qemu_pid" ]; then
+            if [ -d "/proc/$qemu_pid" ]; then
+                pstate=$(sed -n 's/^State:\t\(.\).*/\1/p' "/proc/$qemu_pid/status" 2>/dev/null) || pstate="?"
+            else
+                pstate="exited"
+            fi
+            if [ -n "$prev_pstate" ] && [ "$pstate" != "$prev_pstate" ]; then
+                log "Shutdown: QEMU process state $prev_pstate → $pstate"
+            fi
             prev_pstate=$pstate
         fi
 
@@ -672,7 +675,12 @@ open('${shutdown_ts_file}', 'w').write(str(int(time.time())))
         initiated=$(cat "$shutdown_ts_file")
         completed=$(date +%s)
         delta=$((completed - initiated))
-        log "Shutdown took ${delta}s (from button click to VM stop)"
+        # Ignore stale timestamps (e.g. from test runs) — must be within 5 min
+        if [ $delta -le 300 ]; then
+            log "Shutdown took ${delta}s (from shutdown signal to VM stop)"
+        else
+            log "Shutdown signal was stale (${delta}s ago) — ignoring"
+        fi
         rm -f "$shutdown_ts_file"
     fi
     log_state "vm_shutdown"
