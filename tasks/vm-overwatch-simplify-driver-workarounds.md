@@ -212,9 +212,33 @@ Removed remaining code from the broken-driver era and unnecessary overhead
 629 → 591 lines (-38 lines, ~6% reduction). Steps 1, 2, 4 verified with
 one clean VM start/stop cycle. Step 3 reverted after testing.
 
+Also unified `ensure_igpu_blanked`/`ensure_igpu_unblanked` into a single
+`set_igpu_blank <value> <label>` function (DRY cleanup, -12 lines).
+591 → 579 lines.
+
+## Shutdown timing measurement [DONE]
+
+Added instrumentation to measure actual Windows shutdown duration (2026-02-24).
+User reported variable shutdown times (10-15s vs 2-3 minutes) when observed
+on-screen. Previous logs only captured total VM uptime, making it impossible
+to isolate the shutdown phase.
+
+**Implementation**: UDP signal from guest to host.
+- `shutdown-vm.bat` on Windows desktop: sends a UDP packet to
+  `192.168.0.100:9147`, then runs `shutdown /s /t 0`
+- vm-overwatch: python3 UDP listener started before the wait loop; on VM
+  stop, computes delta and logs `"Shutdown took Ns (from button click to VM stop)"`
+- Bat file deployed to guest via QEMU guest agent (`guest-file-open/write/close`)
+
+**Baseline**: 9s on a fresh boot with nothing running. Real gaming session
+data pending — variable shutdown times likely caused by GPU driver teardown,
+app cleanup, or Windows Update staging.
+
+579 → 606 lines (+27 lines for the timing feature).
+
 ## Result
 
-967 → 591 lines across all commits (-376 lines, ~39% reduction).
+967 → 606 lines across all commits (-361 lines, ~37% reduction).
 
 Remaining code is all actively used on every VM cycle:
 - Audio D3cold workaround (PCI remove+rescan) — still fires every cycle, adds
