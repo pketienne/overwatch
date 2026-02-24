@@ -161,18 +161,41 @@ from the driver workarounds we removed.
   `outcome=success`, `shutdown=clean_acpi`, `was_reset=no`. Both devices
   show `power/control=on` after restore. No crash.
 
+## Round 2: Remove remaining dead code and over-engineering [DONE]
+
+Three consecutive clean VM cycles confirmed the system is stable after round 1.
+Removed the remaining safety-net code that never fires (2026-02-24):
+
+1. **Reset chain** (~100 lines): `gpu_healthy`, `try_mode1`, `gpu_reset`,
+   `ensure_gpu_reset`, `ensure_reset_module`, `RESET_DEV`/`RESET_MODULE`
+   constants — never fires; if the GPU becomes unhealthy, amdgpu bind failure
+   is already logged and the reset module can be invoked manually
+2. **Bind history logging** (~45 lines): `log_bind_result`, `BIND_LOG`,
+   `VM_START_TIME`, `VM_SHUTDOWN_METHOD` — diagnostic TSV from the
+   broken-driver era; same info is in journald
+3. **Pre-unbind `ensure_runtime_pm_disabled`** (~5 lines): redundant with
+   `modprobe.d runpm=0` and the post-rebind disable in `ensure_gpu_on_host`
+4. **5 redundant `log_state` checkpoints** (~10 lines): duplicated adjacent
+   log messages. Kept: `on_error`, `post_unbind`, `vfio_bind_failed`,
+   `post_vfio_unbind`, `vm_running`, `vm_shutdown`
+5. **Per-run log files and `exec > >(tee ...)`** (~6 lines): removed the tee
+   PID tracking bug and the per-run log files — journald already captures
+   everything
+6. **i2c double-kill pattern** (~8 lines): OpenRGB is already stopped before
+   `fuser -k` runs; single pass is sufficient
+7. **`gpu_health` dimension and "degraded" state from `do_status`** (~10 lines):
+   follows from removing the reset infrastructure
+
+808 → 629 lines (-179 lines, ~22% reduction). Verified with one clean VM
+start/stop cycle — no errors, host restored successfully.
+
 ## Result
 
-967 → 808 lines across both commits (-159 lines, ~16% reduction).
+967 → 629 lines across all commits (-338 lines, ~35% reduction).
 
-Remaining code kept as safety nets:
-- `gpu_healthy()` — lightweight register check, used by `do_status` and post-VM reset
-- `try_mode1()` / `gpu_reset()` / `ensure_gpu_reset()` — post-VM safety net in
-  `_do_stop()`, always skips (GPU healthy), never fires
-- `ensure_runtime_pm_disabled()` — 2 lines, cheap insurance (the GPU crashes
-  during this session proved exactly why runtime PM is dangerous)
+Remaining code is all actively used on every VM cycle:
 - Audio D3cold workaround (PCI remove+rescan) — still fires every cycle, adds
-  ~3s. Test removing separately.
+  ~3s. Could test removing separately but low priority.
 
 ## Open issue: GPU crashes during desktop use [FIXED]
 
