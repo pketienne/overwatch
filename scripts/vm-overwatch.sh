@@ -346,6 +346,69 @@ ensure_performance_tuning() {
     echo 1 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
 }
 
+# --- Shutdown diagnostics (queries Windows Event Log for previous shutdown) ---
+
+# Queries the Windows Diagnostics-Performance event log via QEMU guest agent.
+# Event IDs: 200=shutdown summary, 201=slow service, 202=slow app, 203=slow driver.
+# Prints structured output to stdout; caller logs it.
+log_previous_shutdown_diagnostics() {
+    python3 << 'PYEOF'
+import subprocess, json, base64, time, sys
+
+def qga(payload):
+    try:
+        r = subprocess.run(
+            ["virsh", "qemu-agent-command", "overwatch", json.dumps(payload)],
+            capture_output=True, text=True, timeout=10)
+        return json.loads(r.stdout) if r.returncode == 0 else None
+    except Exception:
+        return None
+
+# Wait for guest agent (up to 60s)
+for _ in range(30):
+    if qga({"execute": "guest-ping"}):
+        break
+    time.sleep(2)
+else:
+    sys.exit(0)
+
+ps_cmd = (
+    "$events = Get-WinEvent -FilterHashtable @{"
+    "LogName='Microsoft-Windows-Diagnostics-Performance/Operational';"
+    "Id=200,201,202,203} -MaxEvents 10 -EA SilentlyContinue; "
+    "foreach($e in $events){"
+    "$lines = $e.Message.Trim().Split([char]10); "
+    "$summary = ($lines | Select-Object -First 3 | "
+    "ForEach-Object { $_.Trim() }) -join ' '; "
+    "Write-Output(\"$($e.TimeCreated.ToString('HH:mm:ss'))"
+    " ID=$($e.Id) $summary\")}"
+)
+
+result = qga({"execute": "guest-exec", "arguments": {
+    "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    "arg": ["-Command", ps_cmd],
+    "capture-output": True}})
+if not result:
+    sys.exit(0)
+
+pid = result["return"]["pid"]
+time.sleep(5)
+
+status = qga({"execute": "guest-exec-status", "arguments": {"pid": pid}})
+if not status:
+    sys.exit(0)
+r = status["return"]
+if not r.get("exited"):
+    time.sleep(5)
+    status = qga({"execute": "guest-exec-status", "arguments": {"pid": pid}})
+    if status:
+        r = status["return"]
+
+if r.get("out-data"):
+    print(base64.b64decode(r["out-data"]).decode().strip())
+PYEOF
+}
+
 # --- Host restoration (used by stop) ---
 
 ensure_vm_stopped() {
@@ -531,6 +594,18 @@ _do_start() {
     log_state "vm_running"
     log "VM running. Waiting for shutdown..."
 
+    # Query previous shutdown diagnostics from Windows in background (non-blocking)
+    (
+        diag=$(log_previous_shutdown_diagnostics 2>/dev/null) || true
+        if [ -n "$diag" ]; then
+            log "Previous shutdown diagnostics (Windows Event Log):"
+            while IFS= read -r line; do
+                [ -n "$line" ] && log "  $line"
+            done <<< "$diag"
+        fi
+    ) &
+    local diag_pid=$!
+
     # Listen for shutdown signal from guest (user clicks "Shutdown VM" shortcut)
     local shutdown_ts_file="/tmp/.vm-overwatch-shutdown-ts"
     rm -f "$shutdown_ts_file"
@@ -545,23 +620,35 @@ open('${shutdown_ts_file}', 'w').write(str(int(time.time())))
 " &>/dev/null &
     local listener_pid=$!
 
-    # Wait for VM to shut down
+    # Wait for VM to shut down — instrumented with QEMU process state tracking
     # Accept definitive non-running state OR domain-not-found (libvirtd lost track).
     # Transient empty output (libvirtd hiccup) is treated as "keep waiting".
-    local domain_missing=0
+    local qemu_pid domain_missing=0 prev_pstate="S"
+    qemu_pid=$(pgrep -f "guest=overwatch" 2>/dev/null) || true
     while true; do
-        local vm_poll
+        local vm_poll pstate
         vm_poll=$(virsh domstate overwatch 2>&1) || true
+
+        # Track QEMU process state transitions (S=sleeping, D=disk sleep/VFIO teardown)
+        if [ -n "$qemu_pid" ] && [ -d "/proc/$qemu_pid" ]; then
+            pstate=$(sed -n 's/^State:\t\(.\).*/\1/p' "/proc/$qemu_pid/status" 2>/dev/null) || pstate="?"
+        elif [ -n "$qemu_pid" ]; then
+            pstate="exited"
+        fi
+        if [ "$pstate" != "$prev_pstate" ]; then
+            log "Shutdown: QEMU process state $prev_pstate → $pstate"
+            prev_pstate=$pstate
+        fi
+
         if echo "$vm_poll" | grep -q "failed to get domain"; then
             domain_missing=$((domain_missing + 1))
             if [ $domain_missing -ge 3 ]; then
                 log "WARNING: Domain not found in libvirt (QEMU orphaned?) — treating as shutdown"
-                # Kill orphaned QEMU if still running
-                local qemu_pid
-                qemu_pid=$(pgrep -f "guest=overwatch" 2>/dev/null) || true
-                if [ -n "$qemu_pid" ]; then
-                    log "Killing orphaned QEMU (pid $qemu_pid)"
-                    kill "$qemu_pid" 2>/dev/null || true
+                local orphan_pid
+                orphan_pid=$(pgrep -f "guest=overwatch" 2>/dev/null) || true
+                if [ -n "$orphan_pid" ]; then
+                    log "Killing orphaned QEMU (pid $orphan_pid)"
+                    kill "$orphan_pid" 2>/dev/null || true
                     sleep 2
                 fi
                 break
@@ -571,11 +658,13 @@ open('${shutdown_ts_file}', 'w').write(str(int(time.time())))
         else
             domain_missing=0
         fi
-        sleep 5
+        sleep 2
     done
-    # Clean up listener and report shutdown timing
+    # Clean up listener and diagnostics background job
     kill "$listener_pid" 2>/dev/null || true
     wait "$listener_pid" 2>/dev/null || true
+    kill "$diag_pid" 2>/dev/null || true
+    wait "$diag_pid" 2>/dev/null || true
 
     log "VM shut down detected."
     if [ -f "$shutdown_ts_file" ]; then
