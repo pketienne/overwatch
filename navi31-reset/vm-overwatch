@@ -18,6 +18,7 @@ GPU="0000:03:00.0"
 GPU_AUDIO="0000:03:00.1"
 IGPU="0000:74:00.0"
 HOST_CPU=0          # CPU reserved for host tasks
+SHUTDOWN_SIGNAL_PORT=9147   # UDP port for Windows shutdown signal
 LOCK_FILE="/run/vm-overwatch.lock"
 
 # USB devices that need detach/reattach after VM start to clear ghost entries
@@ -530,6 +531,20 @@ _do_start() {
     log_state "vm_running"
     log "VM running. Waiting for shutdown..."
 
+    # Listen for shutdown signal from guest (user clicks "Shutdown VM" shortcut)
+    local shutdown_ts_file="/tmp/.vm-overwatch-shutdown-ts"
+    rm -f "$shutdown_ts_file"
+    python3 -c "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('', ${SHUTDOWN_SIGNAL_PORT}))
+s.recvfrom(1)
+s.close()
+open('${shutdown_ts_file}', 'w').write(str(int(time.time())))
+" &>/dev/null &
+    local listener_pid=$!
+
     # Wait for VM to shut down
     # Accept definitive non-running state OR domain-not-found (libvirtd lost track).
     # Transient empty output (libvirtd hiccup) is treated as "keep waiting".
@@ -558,7 +573,19 @@ _do_start() {
         fi
         sleep 5
     done
+    # Clean up listener and report shutdown timing
+    kill "$listener_pid" 2>/dev/null || true
+    wait "$listener_pid" 2>/dev/null || true
+
     log "VM shut down detected."
+    if [ -f "$shutdown_ts_file" ]; then
+        local initiated completed delta
+        initiated=$(cat "$shutdown_ts_file")
+        completed=$(date +%s)
+        delta=$((completed - initiated))
+        log "Shutdown took ${delta}s (from button click to VM stop)"
+        rm -f "$shutdown_ts_file"
+    fi
     log_state "vm_shutdown"
 
     # Restore host
