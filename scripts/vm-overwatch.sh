@@ -322,11 +322,8 @@ set_igpu_blank() {
     local fb blank_val
     fb=$(igpu_fb) || { log "WARNING: iGPU framebuffer not found — cannot $label"; return 1; }
     blank_val=$(cat "${fb}blank" 2>/dev/null || echo "?")
-    if [ "$blank_val" = "$target" ]; then
-        log "iGPU already ${label}ed"
-        return 0
-    fi
-    log "${label^}ing iGPU output (${fb}blank = $target)..."
+    # Always write — kernel may report stale blank state after reboot
+    log "${label^}ing iGPU output (${fb}blank: $blank_val → $target)..."
     echo "$target" > "${fb}blank" 2>/dev/null || { log "WARNING: Failed to $label iGPU"; return 1; }
     log "iGPU ${label}ed"
 }
