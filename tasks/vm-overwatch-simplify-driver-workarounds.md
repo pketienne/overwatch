@@ -161,4 +161,8 @@ ACTION=="add", KERNEL=="0000:03:00.1", SUBSYSTEM=="pci", ATTR{power/control}="on
 ```
 This forces the GPU to stay in D0 (fully powered) at all times. Tradeoff is
 ~10-20W higher idle power, but the GPU never enters the D3 state that crashes it.
-Applied manually for current session; udev rule takes effect automatically on boot.
+Udev rule takes effect on boot; vm-overwatch also re-applies after amdgpu rebind
+in `ensure_gpu_on_host()` since driver rebind resets `power/control` to `auto`.
+
+**Verified**: Host survived 9 hours idle after VM cycle with zero GPU errors
+(previously crashed within 5-10 minutes). Fix is confirmed working.
