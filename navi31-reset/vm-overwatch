@@ -10,8 +10,7 @@
 # Runs as a systemd transient service (systemd-run) to survive GDM stop/restart
 # Log: journalctl -u vm-overwatch | /var/log/vm-overwatch/<run>.log
 #
-# GPU reset chain: MODE1 → PCI bus reset → suspend/resume (last resort)
-# Never binds amdgpu to an unresponsive GPU.
+# GPU reset: MODE1 only (fallback chain removed — healthy driver doesn't need it).
 #
 # Usage: vm-overwatch [--verbose] start|stop|status
 
@@ -296,65 +295,18 @@ try_mode1() {
     return 1
 }
 
-# Try PCI bus reset (FLR/SBR via kernel). Returns 0 on success.
-try_pci_reset() {
-    log "Trying PCI bus reset..."
-    if [ ! -f "/sys/bus/pci/devices/$GPU/reset" ]; then
-        log "PCI bus reset not available for $GPU"
-        return 1
-    fi
-    echo 1 > "/sys/bus/pci/devices/$GPU/reset" 2>/dev/null || true
-    sleep 2
-    log "Post-PCI-reset: $(cat $RESET_DEV 2>/dev/null)"
-    if gpu_healthy; then
-        log "PCI bus reset succeeded"
-        return 0
-    fi
-    log "GPU still unhealthy after PCI bus reset"
-    return 1
-}
-
-# Try suspend/resume hardware reset (last resort). Returns 0 on success.
-try_suspend_resume() {
-    log "Trying suspend/resume hardware reset (last resort)..."
-    # rtcwake: suspend to RAM, wake after 5 seconds
-    rtcwake -m mem -s 5 2>/dev/null || true
-    # After resume, wait for system to stabilize
-    sleep 5
-    log "Resumed from suspend"
-    log "Post-suspend: $(cat $RESET_DEV 2>/dev/null)"
-    if gpu_healthy; then
-        log "Suspend/resume reset succeeded"
-        return 0
-    fi
-    log "GPU still unhealthy after suspend/resume"
-    return 1
-}
-
-# Robust GPU reset with fallback chain.
-# Returns 0 if GPU is healthy after reset, 1 if all methods failed.
+# GPU reset via MODE1 only.
+# Returns 0 if GPU is healthy after reset, 1 on failure.
 gpu_reset() {
-    # Check health before trying anything
     if ! gpu_healthy; then
         log "WARNING: GPU unresponsive before reset (0xffffffff)"
     fi
 
-    # 1. MODE1 (fastest, ~500ms)
-    if gpu_healthy && try_mode1; then
+    if try_mode1; then
         return 0
     fi
 
-    # 2. PCI bus reset (FLR/SBR, works at link level)
-    if try_pci_reset; then
-        return 0
-    fi
-
-    # 3. Suspend/resume (hardware power cycle, guaranteed but slow)
-    if try_suspend_resume; then
-        return 0
-    fi
-
-    log "ERROR: All GPU reset methods failed — GPU is unrecoverable"
+    log "ERROR: MODE1 reset failed — GPU may need manual intervention"
     return 1
 }
 
@@ -447,29 +399,17 @@ ensure_gpu_unbound_from_host() {
 
     log_state "pre_unbind"
 
-    # Safety check: if GPU went to D3 despite runtime PM disable, don't attempt
-    # amdgpu unbind — it will hang. Use PCI remove instead.
-    if ! gpu_healthy; then
-        log "WARNING: GPU unresponsive (D3?) before unbind — using PCI remove instead"
-        echo 1 > "/sys/bus/pci/devices/$GPU_AUDIO/remove" 2>/dev/null || true
-        echo 1 > "/sys/bus/pci/devices/$GPU/remove" 2>/dev/null || true
-        sleep 2
-        log "Rescanning PCI bus..."
-        echo 1 > /sys/bus/pci/rescan 2>/dev/null || true
-        sleep 2
-    else
-        if [ "$audio_drv" = "snd_hda_intel" ]; then
-            log "Unbinding GPU audio..."
-            echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/unbind 2>/dev/null || true
-            sleep 1
-        fi
+    if [ "$audio_drv" = "snd_hda_intel" ]; then
+        log "Unbinding GPU audio..."
+        echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/unbind 2>/dev/null || true
+        sleep 1
+    fi
 
-        if [ "$gpu_drv" = "amdgpu" ]; then
-            log "Unbinding GPU from amdgpu..."
-            echo "$GPU" > /sys/bus/pci/drivers/amdgpu/unbind
-            sleep 2
-            log "Unbind completed. GPU driver: $(gpu_driver $GPU)"
-        fi
+    if [ "$gpu_drv" = "amdgpu" ]; then
+        log "Unbinding GPU from amdgpu..."
+        echo "$GPU" > /sys/bus/pci/drivers/amdgpu/unbind
+        sleep 2
+        log "Unbind completed. GPU driver: $(gpu_driver $GPU)"
     fi
 
     log_state "post_unbind"
@@ -797,13 +737,6 @@ ensure_gpu_on_host() {
         return 0
     fi
 
-    if [ -e "$RESET_DEV" ] && ! gpu_healthy; then
-        log "WARNING: Skipping amdgpu bind — GPU is unresponsive"
-        log "WARNING: Desktop will run on iGPU only until next reboot"
-        log_bind_result "skipped_unhealthy"
-        return 1
-    fi
-
     # Pre-bind diagnostic snapshot
     local gpu_power gpu_link gpu_d_state gpu_regs audio_power
     gpu_power=$(cat "/sys/bus/pci/devices/$GPU/power_state" 2>/dev/null || echo "?")
@@ -913,13 +846,12 @@ _do_start() {
     fi
 
     # Pre-VM preparation (critical failures abort with cleanup)
-    ensure_reset_module || { _do_stop; exit 1; }
+    ensure_reset_module || log "WARNING: Reset module unavailable — GPU health checks disabled"
     ensure_runtime_pm_disabled
     ensure_services_stopped
     ensure_device_fds_released
     ensure_vt_unbound
     ensure_gpu_unbound_from_host
-    ensure_gpu_reset || { log "ERROR: Pre-VM GPU reset failed"; log_state "pre_reset_failed"; _do_stop; exit 1; }
     ensure_gpu_on_vfio || { log "ERROR: VFIO bind failed"; _do_stop; exit 1; }
     ensure_vm_running || { log "ERROR: VM start failed"; _do_stop; exit 1; }
     VM_START_TIME=$(date +%s)
