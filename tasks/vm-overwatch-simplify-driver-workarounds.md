@@ -189,9 +189,33 @@ Removed the remaining safety-net code that never fires (2026-02-24):
 808 → 629 lines (-179 lines, ~22% reduction). Verified with one clean VM
 start/stop cycle — no errors, host restored successfully.
 
+## Round 3: Remove diagnostics, iGPU blanking, and PID pinning [DONE]
+
+Removed remaining code from the broken-driver era and unnecessary overhead
+(2026-02-24):
+
+1. **Pre-bind diagnostic snapshot** (~7 lines): `power_state`, `link_speed`,
+   `d3cold_allowed` reads in `ensure_gpu_on_host` — only useful for diagnosing
+   bind failures which no longer occur; amdgpu bind errors are sufficient
+2. **`driver_override` from `log_state` and `do_status`** (~8 lines): always
+   shows `(null)/(null)` in steady state; actual bind functions already log
+   results
+3. **iGPU blank/unblank** (~35 lines): `igpu_fb`, `ensure_igpu_blanked`,
+   `ensure_igpu_unblanked`, `IGPU` constant, `iGPU:` status line, and
+   callsites — monitor should auto-switch to DisplayPort when dGPU becomes
+   active. **Needs testing** — revert if monitor doesn't switch.
+4. **PID affinity loops** (~25 lines): removed `for pid` loops from both
+   `ensure_performance_tuning` and `ensure_cpu_defaults`, plus the early-exit
+   governor+irqbalance check. libvirt `<cputune>` already pins vCPU threads;
+   IRQ affinity pinning is the meaningful part. PID iteration added ~1s
+   startup time for negligible benefit.
+
+629 → 538 lines (-91 lines, ~14% reduction). Needs deploy+test to verify
+steps 3 and 4.
+
 ## Result
 
-967 → 629 lines across all commits (-338 lines, ~35% reduction).
+967 → 538 lines across all commits (-429 lines, ~44% reduction).
 
 Remaining code is all actively used on every VM cycle:
 - Audio D3cold workaround (PCI remove+rescan) — still fires every cycle, adds
