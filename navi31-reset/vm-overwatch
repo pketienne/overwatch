@@ -16,6 +16,7 @@ set -uo pipefail
 
 GPU="0000:03:00.0"
 GPU_AUDIO="0000:03:00.1"
+IGPU="0000:74:00.0"
 HOST_CPU=0          # CPU reserved for host tasks
 LOCK_FILE="/run/vm-overwatch.lock"
 
@@ -48,12 +49,25 @@ gpu_driver() {
     fi
 }
 
+# Find the iGPU framebuffer by PCI device path (not hardcoded fb number)
+igpu_fb() {
+    for fb in /sys/class/graphics/fb*/; do
+        if [ "$(readlink -f "$fb/device" 2>/dev/null)" = "/sys/devices/pci0000:00/$IGPU" ] || \
+           readlink -f "$fb/device" 2>/dev/null | grep -q "$IGPU"; then
+            echo "$fb"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ============================================================
 # status — print current system state (no side effects)
 # ============================================================
 
 do_status() {
     local gpu_drv audio_drv vm_state gpu_power
+    local fb blank_val igpu_state
     local gdm_state ollama_state openrgb_state
     local gov irqbalance_state
     local state
@@ -66,6 +80,16 @@ do_status() {
     vm_state=$(virsh domstate overwatch 2>/dev/null) || true
     vm_state=$(echo "$vm_state" | xargs)
     vm_state=${vm_state:-unknown}
+
+    fb=$(igpu_fb 2>/dev/null) && blank_val=$(cat "${fb}blank" 2>/dev/null) || true
+    blank_val=${blank_val:-?}
+    if [ "$blank_val" = "0" ]; then
+        igpu_state="unblanked"
+    elif [ "$blank_val" = "4" ]; then
+        igpu_state="blanked"
+    else
+        igpu_state="unknown ($blank_val)"
+    fi
 
     gdm_state=$(systemctl is-active gdm 2>/dev/null) || true
     gdm_state=${gdm_state:-unknown}
@@ -93,6 +117,7 @@ do_status() {
     echo "GPU:       $gpu_drv ($gpu_power)"
     echo "Audio:     $audio_drv"
     echo "VM:        $vm_state"
+    echo "iGPU:      $igpu_state"
     echo "Services:  GDM=$gdm_state ollama=$ollama_state openrgb=$openrgb_state"
     echo "CPU:       $gov, irqbalance=$irqbalance_state"
     echo "State:     $state"
@@ -291,6 +316,19 @@ ensure_usb_reattached() {
     done
 }
 
+ensure_igpu_blanked() {
+    local fb blank_val
+    fb=$(igpu_fb) || { log "WARNING: iGPU framebuffer not found — cannot blank"; return 1; }
+    blank_val=$(cat "${fb}blank" 2>/dev/null || echo "0")
+    if [ "$blank_val" = "4" ]; then
+        log "iGPU already blanked"
+        return 0
+    fi
+    log "Blanking iGPU output (${fb}blank = 4)..."
+    echo 4 > "${fb}blank" 2>/dev/null || { log "WARNING: Failed to blank iGPU"; return 1; }
+    log "iGPU blanked — monitor should auto-detect to DisplayPort"
+}
+
 ensure_performance_tuning() {
     log "Applying VM performance tuning..."
     # Set CPU governor to performance on all cores
@@ -423,6 +461,19 @@ ensure_gpu_on_host() {
     log "Runtime PM disabled for GPU and audio"
 }
 
+ensure_igpu_unblanked() {
+    local fb blank_val
+    fb=$(igpu_fb) || { log "WARNING: iGPU framebuffer not found — cannot unblank"; return 1; }
+    blank_val=$(cat "${fb}blank" 2>/dev/null || echo "4")
+    if [ "$blank_val" = "0" ]; then
+        log "iGPU already unblanked"
+        return 0
+    fi
+    log "Unblanking iGPU output (${fb}blank = 0)..."
+    echo 0 > "${fb}blank" 2>/dev/null || { log "WARNING: Failed to unblank iGPU"; return 1; }
+    log "iGPU unblanked"
+}
+
 ensure_services_running() {
     local svc
     for svc in openrgb ollama; do
@@ -460,6 +511,7 @@ _do_stop() {
     ensure_cpu_defaults
     ensure_gpu_unbound_from_vfio
     ensure_gpu_on_host || log "WARNING: Could not restore GPU to host — iGPU only"
+    ensure_igpu_unblanked || true
     ensure_services_running
 
     log "=== Host restored ==="
@@ -484,6 +536,7 @@ _do_start() {
 
     # Post-VM-start setup (non-critical, continue on failure)
     ensure_usb_reattached
+    ensure_igpu_blanked || true
     ensure_performance_tuning
 
     log_state "vm_running"
