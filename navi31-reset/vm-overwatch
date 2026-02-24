@@ -678,6 +678,11 @@ ensure_gpu_on_host() {
             log "WARNING: GPU audio device not found after rescan"
         fi
     fi
+
+    # Disable runtime PM — amdgpu rebind resets power/control to "auto",
+    # and the GPU crashes when runtime PM tries to resume from D3.
+    ensure_runtime_pm_disabled
+
     log_bind_result "success"
 }
 
