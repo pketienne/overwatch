@@ -1,0 +1,14 @@
+[Unit]
+Description=Overwatch VM lifecycle (GPU passthrough)
+After=libvirtd.service
+Requires=libvirtd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vm-overwatch start
+TimeoutStartSec=infinity
+TimeoutStopSec=120
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

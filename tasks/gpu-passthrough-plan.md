@@ -806,7 +806,7 @@ Wireless headset via USB passthrough).
 
 ### 1. Add PCIe bus reset before amdgpu rebind
 
-**Status:** Not implemented
+**Status:** Implemented (vm-overwatch.sh lines 519-530)
 
 **Problem:** After VFIO releases the GPU, `ensure_gpu_on_host()` binds amdgpu
 directly with no hardware reset. The GPU is still in whatever state the Windows
@@ -837,7 +837,7 @@ to a clean power state. This may make the existing PCI remove/rescan of
 
 ### 2. Test removing PCI remove/rescan for GPU audio after bus reset
 
-**Status:** Not tested
+**Status:** Done — direct bind works, remove/rescan deleted
 
 **Problem:** `ensure_gpu_on_host()` does a PCI remove + full bus rescan on
 `03:00.1` (lines 502-520) to work around the audio function being stuck in

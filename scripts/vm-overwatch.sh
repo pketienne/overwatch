@@ -7,7 +7,7 @@
 #   stop    Inspect current state, do minimum work to reach host-mode (idempotent)
 #   status  Print current system state across all dimensions
 #
-# Runs as a systemd transient service (systemd-run) to survive GDM stop/restart
+# Runs as a systemd service: systemctl start vm-overwatch
 # Log: journalctl -u vm-overwatch
 #
 # Usage: vm-overwatch [--verbose] start|stop|status
@@ -516,6 +516,26 @@ ensure_gpu_on_host() {
         return 0
     fi
 
+    # Bus reset GPU before rebinding to amdgpu. After VFIO passthrough, the GPU
+    # firmware is in whatever state the Windows guest left it. Without a reset,
+    # amdgpu tries to initialize on dirty state, causing TDRs and hangs.
+    # RX 7900 XTX only supports Secondary Bus Reset (no FLR), which resets both
+    # 03:00.0 and 03:00.1 via the PCIe link.
+    log "Resetting GPU (PCIe bus reset)..."
+    echo 1 > "/sys/bus/pci/devices/$GPU/reset" 2>/dev/null || true
+    local i vendor
+    for i in $(seq 1 20); do
+        vendor=$(setpci -s "$GPU" VENDOR_ID 2>/dev/null) || true
+        if [ "$vendor" = "1002" ]; then
+            log "Bus reset complete (device ready after ${i}00ms)"
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "$vendor" != "1002" ]; then
+        log "WARNING: GPU not responding after bus reset — proceeding with bind anyway"
+    fi
+
     # Bind GPU to amdgpu — this powers up the entire GPU die
     log "Binding to amdgpu..."
     echo "$GPU" > /sys/bus/pci/drivers/amdgpu/bind 2>/dev/null || true
@@ -527,30 +547,21 @@ ensure_gpu_on_host() {
     # Must happen before audio re-enumeration to prevent cascading failures.
     echo on > "/sys/bus/pci/devices/$GPU/power/control" 2>/dev/null || true
 
-    # GPU audio is often stuck in D3cold after VM passthrough — MODE1 reset
-    # only resets the GFX engine, not the audio function. Binding snd_hda_intel
-    # to a D3cold device triggers a failed power transition that crashes the
-    # entire GPU ("device lost from bus"). Fix: PCI remove + rescan after amdgpu
-    # has powered the GPU die, so the audio codec re-enumerates in a clean state.
+    # GPU audio: the SBR (bus reset above) resets both 03:00.0 and 03:00.1,
+    # so the audio function should be in a clean power state. Try direct bind
+    # without PCI remove/rescan.
     if [ -e "/sys/bus/pci/devices/$GPU_AUDIO" ]; then
-        log "Re-enumerating GPU audio device..."
-        echo 1 > "/sys/bus/pci/devices/$GPU_AUDIO/remove" 2>/dev/null || true
-        sleep 1
-        echo 1 > /sys/bus/pci/rescan 2>/dev/null || true
-        sleep 2
-        # Disable runtime PM on audio immediately — snd_hda_intel puts it
-        # into D3hot within seconds, and D3hot→D0 fails after passthrough.
         echo on > "/sys/bus/pci/devices/$GPU_AUDIO/power/control" 2>/dev/null || true
         if [ "$(gpu_driver $GPU_AUDIO)" = "snd_hda_intel" ]; then
-            log "GPU audio re-enumerated and auto-probed successfully"
-        elif [ -e "/sys/bus/pci/devices/$GPU_AUDIO" ]; then
-            log "Binding GPU audio to snd_hda_intel..."
+            log "GPU audio already bound to snd_hda_intel"
+        else
+            log "Binding GPU audio to snd_hda_intel (direct, no rescan)..."
             echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/bind 2>/dev/null || \
                 log "WARNING: snd_hda_intel bind failed — HDMI/DP audio unavailable"
             echo on > "/sys/bus/pci/devices/$GPU_AUDIO/power/control" 2>/dev/null || true
-        else
-            log "WARNING: GPU audio device not found after rescan"
         fi
+    else
+        log "WARNING: GPU audio device not found"
     fi
 
     log "Runtime PM disabled for GPU and audio"
@@ -601,6 +612,14 @@ _do_stop() {
 
 _do_start() {
     log "=== Starting Overwatch VM ==="
+
+    # Handle SIGTERM from systemctl stop: shut down VM, restore host, exit
+    trap '_on_sigterm' TERM
+    _on_sigterm() {
+        log "Received SIGTERM (systemctl stop) — shutting down..."
+        _do_stop
+        exit 0
+    }
 
     # Refuse if VM already running
     if virsh domstate overwatch 2>/dev/null | grep -q "running"; then
