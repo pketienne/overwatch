@@ -277,6 +277,23 @@ ensure_gpu_on_vfio() {
         log_state "vfio_bind_failed"
         return 1
     fi
+
+    # Bus reset after vfio-pci bind — gives the Windows AMD driver a clean
+    # GPU state (closer to power-on) which may reduce boot-time TDR timeouts.
+    log "Resetting GPU (PCIe bus reset for clean guest handoff)..."
+    echo 1 > "/sys/bus/pci/devices/$GPU/reset" 2>/dev/null || true
+    local i vendor
+    for i in $(seq 1 20); do
+        vendor=$(setpci -s "$GPU" VENDOR_ID 2>/dev/null) || true
+        if [ "$vendor" = "1002" ]; then
+            log "Bus reset complete (device ready after ${i}00ms)"
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "$vendor" != "1002" ]; then
+        log "WARNING: GPU not responding after bus reset — proceeding anyway"
+    fi
 }
 
 ensure_vm_running() {
@@ -435,6 +452,23 @@ out = run_ps(
 )
 if out:
     print("GPU_DRIVER")
+    print(out)
+
+# 4. GPU HD Audio driver status (should be disabled device, no AtiHDAudioService driver)
+out = run_ps(
+    "$dev = Get-PnpDevice -EA SilentlyContinue "
+    "| Where-Object InstanceId -like 'HDAUDIO*VEN_1002*' "
+    "| Select-Object -First 1; "
+    "$drv = pnputil /enum-drivers /class MEDIA 2>&1 "
+    "| Select-String 'oem.*\\.inf|AtiHDAudio|Provider.*AMD' "
+    "| ForEach-Object { $_.Line.Trim() }; "
+    "if($dev){ Write-Output(\"Device: $($dev.Status) $($dev.FriendlyName)\") } "
+    "else { Write-Output('Device: not found') }; "
+    "if($drv){ Write-Output(\"Driver store: $($drv -join ' | ')\") } "
+    "else { Write-Output('Driver store: AtiHDAudioService not present') }"
+)
+if out:
+    print("HD_AUDIO")
     print(out)
 PYEOF
 }
@@ -653,6 +687,7 @@ _do_start() {
                     SHUTDOWN_DIAG) section="shutdown"; log "Previous shutdown diagnostics (Windows Event Log):" ;;
                     CRASH_DUMPS)   section="crashes";  log "Recent crash dumps:" ;;
                     GPU_DRIVER)    section="driver";   log "GPU driver:" ;;
+                    HD_AUDIO)      section="audio";    log "HD Audio:" ;;
                     "") ;;
                     *) log "  $line" ;;
                 esac

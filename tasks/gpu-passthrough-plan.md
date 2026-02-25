@@ -747,26 +747,47 @@ Set-ItemProperty -Path $regpath -Name DisableDrmdmaPowerOff -Value 1
 > **Note:** If Windows Update reinstalls the AMD driver, these values may be
 > reset. Verify after any driver update.
 
-### Disable GPU HDA Audio Device
+### GPU HDA Audio: AtiHDAudioService Removed
 
 The GPU audio function (`03:00.1`) must be passed through to the VM (the AMD
-driver fails with Code 43 without it), but the HDA audio codec behind vfio-pci
-cannot respond to power IRPs. During shutdown, `HDAudBus!HdaController::TransferCodecVerbs`
-blocks waiting for the codec, causing a 0x9F BSOD. Fix: disable the device in
-Windows so HDAudBus never sends power IRPs to it.
+driver fails with Code 43 without it), but the AMD HD Audio driver
+(`AtiHDAudioService` / `oem39.inf`) caused PnP Driver Watchdog events on every
+boot (>3s initialization timeout). Fix: uninstall the AMD audio driver package
+and let Windows use the generic `High Definition Audio Device` driver instead.
 
+```powershell
+# Remove device, then delete driver from store
+pnputil /remove-device "HDAUDIO\FUNC_01&VEN_1002&DEV_AA01&SUBSYS_00AA0100&REV_1008\5&1E9E0D5E&0&0001"
+pnputil /delete-driver oem39.inf /force
 ```
-pnputil /disable-device "HDAUDIO\FUNC_01&VEN_1002&DEV_AA01&SUBSYS_00AA0100&REV_1008\5&1E9E0D5E&0&0001"
+
+After reboot, Windows binds the generic HD Audio driver — `Status: OK`,
+no PnP watchdog events. HDMI/DP audio is unused (all audio goes through
+the SteelSeries Arctis Pro Wireless headset via USB passthrough).
+
+> **Note:** AMD Adrenalin driver updates may reinstall `AtiHDAudioService`.
+> vm-overwatch boot diagnostics monitor for this (HD Audio section in logs).
+
+### TDR Timeout for GPU Passthrough
+
+The AMD display driver takes longer to initialize after VFIO handoff than a cold
+boot (~5s for DWM first frame composition). The default `TdrDelay` of 2s causes
+`VIDEO_TDR_TIMEOUT_DETECTED` (0x141) live kernel dumps on every boot. Fix:
+increase TDR timeouts in the registry.
+
+```powershell
+$path = "HKLM:\System\CurrentControlSet\Control\GraphicsDrivers"
+Set-ItemProperty -Path $path -Name TdrDelay -Value 8 -Type DWord
+Set-ItemProperty -Path $path -Name TdrDdiDelay -Value 20 -Type DWord
 ```
 
-The device will show `Status: Error` / `Problem: CM_PROB_DISABLED` in
-`Get-PnpDevice` — this is expected. The disable persists across clean shutdowns.
-HDMI/DP audio is unused (all audio goes through the SteelSeries Arctis Pro
-Wireless headset via USB passthrough).
+| Key | Value | Default | Why |
+|-----|-------|---------|-----|
+| `TdrDelay` | 8 | 2 | GPU scheduler wait before declaring TDR |
+| `TdrDdiDelay` | 20 | 5 | OS wait for threads inside display driver |
 
-> **Note:** The instance ID may change if the VM's PCI topology changes (e.g.
-> adding/removing devices shifts bus assignments). Verify with:
-> `Get-PnpDevice | Where-Object { $_.InstanceId -like "HDAUDIO*VEN_1002*" }`
+No impact on boot speed (timeouts, not delays). A real GPU hang takes 8s instead
+of 2s before Windows reacts — negligible in practice.
 
 ---
 
@@ -789,14 +810,15 @@ Wireless headset via USB passthrough).
 | GDM wrong aspect ratio (single GPU) | monitors.xml connector mismatch | Update connector name (e.g. `HDMI-1` -> `HDMI-3` when dGPU on amdgpu shifts numbering) |
 | GDM wrong aspect ratio (dual GPU) | Both dGPU DP-1 and iGPU HDMI-3 connected to same monitor; monitors.xml lists only one output so GDM falls back to auto (3840x2160) | Add `<disabled>` section for DP-1 in monitors.xml |
 | GNOME Shell crashes when GPU unbinds | dGPU used for GPU-accelerated rendering | Stop GDM before unbinding amdgpu; run wrapper via `systemd-run` |
-| vm-overwatch dies when GDM stops | Script runs in GNOME terminal session | Use `systemd-run --unit=vm-overwatch` transient service (desktop shortcut does this) |
+| vm-overwatch dies when GDM stops | Script runs in GNOME terminal session | Runs as systemd service (`systemctl start vm-overwatch`); SIGTERM handler runs full host restore on stop |
 | Audio volume much lower in VM | Windows volume state desyncs after USB passthrough | Move volume slider to 0% then back to 100%. Check SteelSeries GG EQ, Volume Mixer per-app levels. Use Settings -> System -> Sound (not `mmsys.cpl` which may freeze the VM) |
 | GPU crashes during desktop use | amdgpu runtime PM puts GPU into D3; resume finds device unresponsive (`0xffffffff` registers), `device lost from bus`, soft lockup | `/etc/modprobe.d/amdgpu.conf` with `options amdgpu runpm=0`. vm-overwatch also writes `power/control=on` after amdgpu bind on restore |
-| GPU audio D3cold after VM passthrough | Audio function stuck in D3cold after VFIO; binding snd_hda_intel triggers failed power transition that crashes the entire GPU | vm-overwatch does PCI remove + rescan of audio device after amdgpu binds the GPU, so the audio codec re-enumerates in a clean state |
+| GPU audio D3cold after VM passthrough | Audio function stuck in D3cold after VFIO; binding snd_hda_intel triggers failed power transition that crashes the entire GPU | PCIe bus reset (SBR) resets both GPU and audio function; vm-overwatch binds snd_hda_intel directly without PCI remove/rescan |
 | Concurrent vm-overwatch instances cause dirty state | Second instance finds GPU in unexpected driver state | Lock file via `flock /run/vm-overwatch.lock` prevents concurrent instances |
 | Windows BSOD 0x9F DRIVER_POWER_STATE_FAILURE | Windows "Balanced" power plan sends power IRPs to passthrough GPU/USB devices; vfio-pci owns the hardware so guest driver can't complete power transitions | Switch to **High Performance** power plan; disable PCI Express ASPM, USB selective suspend, display timeout, sleep, hybrid sleep (see Windows VM Power Settings section) |
 | Frequent 0x9F BSODs after Windows Update | Windows Update pushed AMD driver 31.0.14000.58004 (Feb 2026) which corrupts GPU state every 2-5 min during gameplay | Roll back via Device Manager -> Display adapters -> Roll Back Driver. Block reinstall: Settings -> Windows Update -> Pause updates, or `wushowhide.diagcab` to hide the driver update. Known-good driver: Radeon Software 32.0.23017.1001 (2026-01-08) |
-| Windows BSOD 0x9F during shutdown specifically | `HDAudBus!HdaController::TransferCodecVerbs` blocks waiting for GPU HDA audio codec to respond during power-down (`IRP_MN_SET_POWER` to D1); codec never responds because it's behind vfio-pci | Disable the AMD HD Audio device in Windows: `pnputil /disable-device "HDAUDIO\FUNC_01&VEN_1002&DEV_AA01&SUBSYS_00AA0100&REV_1008\5&1E9E0D5E&0&0001"`. The GPU audio PCI function (`03:00.1`) must still be passed through (AMD driver fails with Code 43 without it). Also disable AMD driver power features via registry (see Power Settings section) |
+| Windows BSOD 0x9F during shutdown specifically | `HDAudBus!HdaController::TransferCodecVerbs` blocks waiting for GPU HDA audio codec to respond during power-down (`IRP_MN_SET_POWER` to D1); codec never responds because it's behind vfio-pci | Uninstall AtiHDAudioService driver (`pnputil /delete-driver oem39.inf /force`); Windows generic HD Audio driver handles the device without triggering the issue. GPU audio PCI function (`03:00.1`) must still be passed through (AMD driver Code 43 without it). Also disable AMD driver power features via registry (see Power Settings section) |
+| WATCHDOG/AMD_WATCHDOG live kernel dumps on every VM boot | AMD display driver init after VFIO handoff takes >2s (default TdrDelay); DWM first frame composition triggers `VIDEO_TDR_TIMEOUT_DETECTED` (0x141) | Set `TdrDelay=8` and `TdrDdiDelay=20` in `HKLM\System\CurrentControlSet\Control\GraphicsDrivers`. Timeouts not delays — no boot speed impact |
 | amdgpu bind hangs after VM passthrough (`trn=2 ACK should not assert`) | GPU SMU mailbox stuck after heavy GPU usage in VM (e.g. gaming); VFIO release doesn't fully reset the GPU, amdgpu probe loops forever on SMU communication | Reboot required. This is a hardware-level issue — the GPU needs a full PCI bus reset that only a machine reboot provides. Lightweight test cycles may restore fine but extended gaming sessions can leave the GPU in an unrecoverable state |
 | Monitor doesn't auto-switch to DP when VM starts | iGPU HDMI stays active, monitor doesn't detect DP | Blank iGPU framebuffer (`echo 4 > /sys/class/graphics/fbN/blank`) when VM starts; monitor auto-detects to DP. fb matched by PCI device path, not hardcoded number. vm-overwatch handles this |
 
