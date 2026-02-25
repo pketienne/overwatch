@@ -50,6 +50,25 @@ gpu_driver() {
     fi
 }
 
+# PCIe Secondary Bus Reset + readiness poll via setpci.
+# RX 7900 XTX only supports SBR (no FLR); resets both 03:00.0 and 03:00.1.
+gpu_bus_reset() {
+    local label="${1:-PCIe bus reset}"
+    log "Resetting GPU ($label)..."
+    echo 1 > "/sys/bus/pci/devices/$GPU/reset" 2>/dev/null || true
+    local i vendor
+    for i in $(seq 1 20); do
+        vendor=$(setpci -s "$GPU" VENDOR_ID 2>/dev/null) || true
+        if [ "$vendor" = "1002" ]; then
+            log "Bus reset complete (device ready after ${i}00ms)"
+            return 0
+        fi
+        sleep 0.1
+    done
+    log "WARNING: GPU not responding after bus reset"
+    return 1
+}
+
 # Find the iGPU framebuffer by PCI device path (not hardcoded fb number)
 igpu_fb() {
     for fb in /sys/class/graphics/fb*/; do
@@ -246,7 +265,7 @@ ensure_gpu_unbound_from_host() {
         log "Unbinding GPU from amdgpu..."
         echo "$GPU" > /sys/bus/pci/drivers/amdgpu/unbind
         sleep 2
-        log "Unbind completed. GPU driver: $(gpu_driver $GPU)"
+        log "Unbind completed. GPU driver: $(gpu_driver "$GPU")"
     fi
 
     log_state "post_unbind"
@@ -255,24 +274,24 @@ ensure_gpu_unbound_from_host() {
 ensure_gpu_on_vfio() {
     modprobe vfio-pci 2>/dev/null || true
 
-    if [ "$(gpu_driver $GPU)" = "vfio-pci" ] && [ "$(gpu_driver $GPU_AUDIO)" = "vfio-pci" ]; then
+    if [ "$(gpu_driver "$GPU")" = "vfio-pci" ] && [ "$(gpu_driver "$GPU_AUDIO")" = "vfio-pci" ]; then
         log "GPU already on vfio-pci — skipping bind"
         return 0
     fi
 
     log "Binding GPU to vfio-pci..."
-    if [ "$(gpu_driver $GPU)" != "vfio-pci" ]; then
+    if [ "$(gpu_driver "$GPU")" != "vfio-pci" ]; then
         echo "vfio-pci" > /sys/bus/pci/devices/$GPU/driver_override
         echo "$GPU" > /sys/bus/pci/drivers/vfio-pci/bind
     fi
-    if [ "$(gpu_driver $GPU_AUDIO)" != "vfio-pci" ]; then
+    if [ "$(gpu_driver "$GPU_AUDIO")" != "vfio-pci" ]; then
         echo "vfio-pci" > /sys/bus/pci/devices/$GPU_AUDIO/driver_override
         echo "$GPU_AUDIO" > /sys/bus/pci/drivers/vfio-pci/bind
     fi
     sleep 1
 
-    log "GPU driver: $(gpu_driver $GPU)"
-    if [ "$(gpu_driver $GPU)" != "vfio-pci" ]; then
+    log "GPU driver: $(gpu_driver "$GPU")"
+    if [ "$(gpu_driver "$GPU")" != "vfio-pci" ]; then
         log "ERROR: GPU not on vfio-pci after bind attempt"
         log_state "vfio_bind_failed"
         return 1
@@ -280,20 +299,7 @@ ensure_gpu_on_vfio() {
 
     # Bus reset after vfio-pci bind — gives the Windows AMD driver a clean
     # GPU state (closer to power-on) which may reduce boot-time TDR timeouts.
-    log "Resetting GPU (PCIe bus reset for clean guest handoff)..."
-    echo 1 > "/sys/bus/pci/devices/$GPU/reset" 2>/dev/null || true
-    local i vendor
-    for i in $(seq 1 20); do
-        vendor=$(setpci -s "$GPU" VENDOR_ID 2>/dev/null) || true
-        if [ "$vendor" = "1002" ]; then
-            log "Bus reset complete (device ready after ${i}00ms)"
-            break
-        fi
-        sleep 0.1
-    done
-    if [ "$vendor" != "1002" ]; then
-        log "WARNING: GPU not responding after bus reset — proceeding anyway"
-    fi
+    gpu_bus_reset "clean guest handoff" || true
 }
 
 ensure_vm_running() {
@@ -470,6 +476,31 @@ out = run_ps(
 if out:
     print("HD_AUDIO")
     print(out)
+
+# 5. Display driver events — mini-TDR recoveries (4101), display config changes,
+#    and DxgKrnl events that indicate GPU stalls or mode switches during gameplay.
+out = run_ps(
+    "$events = @(); "
+    "$events += Get-WinEvent -FilterHashtable @{"
+    "LogName='System'; ProviderName='Display'} "
+    "-MaxEvents 20 -EA SilentlyContinue; "
+    "$events += Get-WinEvent -FilterHashtable @{"
+    "LogName='System'; ProviderName='Microsoft-Windows-DxgKrnl'} "
+    "-MaxEvents 10 -EA SilentlyContinue; "
+    "$events += Get-WinEvent -FilterHashtable @{"
+    "LogName='System'; ProviderName='Dwm'} "
+    "-MaxEvents 10 -EA SilentlyContinue; "
+    "$events = $events | Sort-Object TimeCreated -Descending "
+    "| Select-Object -First 20; "
+    "foreach($e in $events){"
+    "$msg = $e.Message -replace '\\r?\\n',' ' -replace '\\s+',' '; "
+    "if($msg.Length -gt 200){ $msg = $msg.Substring(0,200) + '...' }; "
+    "Write-Output(\"$($e.TimeCreated.ToString('HH:mm:ss'))"
+    " [$($e.ProviderName)] ID=$($e.Id) $msg\")}"
+)
+if out:
+    print("DISPLAY_EVENTS")
+    print(out)
 PYEOF
 }
 
@@ -553,28 +584,13 @@ ensure_gpu_on_host() {
     # Bus reset GPU before rebinding to amdgpu. After VFIO passthrough, the GPU
     # firmware is in whatever state the Windows guest left it. Without a reset,
     # amdgpu tries to initialize on dirty state, causing TDRs and hangs.
-    # RX 7900 XTX only supports Secondary Bus Reset (no FLR), which resets both
-    # 03:00.0 and 03:00.1 via the PCIe link.
-    log "Resetting GPU (PCIe bus reset)..."
-    echo 1 > "/sys/bus/pci/devices/$GPU/reset" 2>/dev/null || true
-    local i vendor
-    for i in $(seq 1 20); do
-        vendor=$(setpci -s "$GPU" VENDOR_ID 2>/dev/null) || true
-        if [ "$vendor" = "1002" ]; then
-            log "Bus reset complete (device ready after ${i}00ms)"
-            break
-        fi
-        sleep 0.1
-    done
-    if [ "$vendor" != "1002" ]; then
-        log "WARNING: GPU not responding after bus reset — proceeding with bind anyway"
-    fi
+    gpu_bus_reset "post-VFIO host rebind" || true
 
     # Bind GPU to amdgpu — this powers up the entire GPU die
     log "Binding to amdgpu..."
     echo "$GPU" > /sys/bus/pci/drivers/amdgpu/bind 2>/dev/null || true
     sleep 3
-    log "GPU driver: $(gpu_driver $GPU)"
+    log "GPU driver: $(gpu_driver "$GPU")"
 
     # Disable runtime PM on GPU immediately after bind — amdgpu sets
     # power/control to "auto" during probe, and the GPU crashes on D3 resume.
@@ -586,7 +602,7 @@ ensure_gpu_on_host() {
     # without PCI remove/rescan.
     if [ -e "/sys/bus/pci/devices/$GPU_AUDIO" ]; then
         echo on > "/sys/bus/pci/devices/$GPU_AUDIO/power/control" 2>/dev/null || true
-        if [ "$(gpu_driver $GPU_AUDIO)" = "snd_hda_intel" ]; then
+        if [ "$(gpu_driver "$GPU_AUDIO")" = "snd_hda_intel" ]; then
             log "GPU audio already bound to snd_hda_intel"
         else
             log "Binding GPU audio to snd_hda_intel (direct, no rescan)..."
@@ -688,6 +704,7 @@ _do_start() {
                     CRASH_DUMPS)   section="crashes";  log "Recent crash dumps:" ;;
                     GPU_DRIVER)    section="driver";   log "GPU driver:" ;;
                     HD_AUDIO)      section="audio";    log "HD Audio:" ;;
+                    DISPLAY_EVENTS) section="display"; log "Display events (previous session):" ;;
                     "") ;;
                     *)
                         log "  $line"

@@ -879,6 +879,36 @@ remove/rescan is unnecessary.
   remove/rescan), remove the remove/rescan block
 - If it still fails (D3cold, failed power transition), keep the remove/rescan
 
+### 3. Test: disable Auto HDR to isolate hiccup root cause
+
+**Status:** Pending
+
+**Problem:** Overwatch gameplay hiccups (brief screen freezes) occur most reliably
+at match→menu transitions. Display event instrumentation shows Windows Auto HDR
+(Event ID 4125) activating every session. Each HDR mode switch reconfigures the
+display pipeline, which in exclusive fullscreen can cause a visible stall. Alt+tab
+instantly fixes the hiccup (forces a clean fullscreen exit/re-entry).
+
+**Goal:** Determine whether Auto HDR mode switching is the root cause. This is a
+diagnostic test only — HDR should remain enabled in the final configuration.
+
+**Test:** Windows Settings → System → Display → HDR → turn off Auto HDR. Play
+several matches and observe whether match→menu hiccups still occur. Re-enable
+Auto HDR after testing.
+
+### 4. Test: force HDR always-on to prevent mode switching
+
+**Status:** Pending — test after Action Item 3 confirms HDR is the cause
+
+**Problem:** If Action Item 3 confirms HDR mode switching causes the hiccups, the
+fix is to keep HDR always-on rather than letting Windows toggle it per-app. This
+avoids the display pipeline reconfiguration while preserving HDR output.
+
+**Test:** Windows Settings → System → Display → HDR → keep HDR enabled, disable
+Auto HDR. Ensure Overwatch uses HDR natively (Video settings → HDR Display). Play
+several matches and observe whether match→menu hiccups still occur with HDR
+permanently active.
+
 ---
 
 ## Things That May Change After Reinstall
