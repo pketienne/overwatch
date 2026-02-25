@@ -369,6 +369,7 @@ All matched by vendor/product ID only — **no hardcoded bus/device addresses** 
 6. Install Battle.net (~738 MB) and Overwatch (~66 GB)
 7. Set Overwatch aspect ratio to **21:9** in game settings (for 3440x1440)
 8. Apply Windows VM power settings (see section below)
+9. Disable GPU HDA audio device (see "Disable GPU HDA Audio Device" section below)
 
 ---
 
@@ -685,6 +686,27 @@ Set-ItemProperty -Path $regpath -Name DisableDrmdmaPowerOff -Value 1
 > **Note:** If Windows Update reinstalls the AMD driver, these values may be
 > reset. Verify after any driver update.
 
+### Disable GPU HDA Audio Device
+
+The GPU audio function (`03:00.1`) must be passed through to the VM (the AMD
+driver fails with Code 43 without it), but the HDA audio codec behind vfio-pci
+cannot respond to power IRPs. During shutdown, `HDAudBus!HdaController::TransferCodecVerbs`
+blocks waiting for the codec, causing a 0x9F BSOD. Fix: disable the device in
+Windows so HDAudBus never sends power IRPs to it.
+
+```
+pnputil /disable-device "HDAUDIO\FUNC_01&VEN_1002&DEV_AA01&SUBSYS_00AA0100&REV_1008\5&1E9E0D5E&0&0001"
+```
+
+The device will show `Status: Error` / `Problem: CM_PROB_DISABLED` in
+`Get-PnpDevice` — this is expected. The disable persists across clean shutdowns.
+HDMI/DP audio is unused (all audio goes through the SteelSeries Arctis Pro
+Wireless headset via USB passthrough).
+
+> **Note:** The instance ID may change if the VM's PCI topology changes (e.g.
+> adding/removing devices shifts bus assignments). Verify with:
+> `Get-PnpDevice | Where-Object { $_.InstanceId -like "HDAUDIO*VEN_1002*" }`
+
 ---
 
 ## Troubleshooting Reference
@@ -713,7 +735,7 @@ Set-ItemProperty -Path $regpath -Name DisableDrmdmaPowerOff -Value 1
 | Concurrent vm-overwatch instances cause dirty state | Second instance finds GPU in unexpected driver state | Lock file via `flock /run/vm-overwatch.lock` prevents concurrent instances |
 | Windows BSOD 0x9F DRIVER_POWER_STATE_FAILURE | Windows "Balanced" power plan sends power IRPs to passthrough GPU/USB devices; vfio-pci owns the hardware so guest driver can't complete power transitions | Switch to **High Performance** power plan; disable PCI Express ASPM, USB selective suspend, display timeout, sleep, hybrid sleep (see Windows VM Power Settings section) |
 | Frequent 0x9F BSODs after Windows Update | Windows Update pushed AMD driver 31.0.14000.58004 (Feb 2026) which corrupts GPU state every 2-5 min during gameplay | Roll back via Device Manager -> Display adapters -> Roll Back Driver. Block reinstall: Settings -> Windows Update -> Pause updates, or `wushowhide.diagcab` to hide the driver update. Known-good driver: Radeon Software 32.0.23017.1001 (2026-01-08) |
-| Windows BSOD 0x9F during shutdown specifically | AMD driver ULPS and internal power management try power state transitions during shutdown; power IRP times out after ~2 min causing 0x9F bugcheck | Disable AMD driver power features via registry (see Power Settings section): `EnableUlps=0`, `PP_SclkDeepSleepDisable=1`, `DisableDrmdmaPowerOff=1`. QEMU `-no-shutdown` keeps process alive after BSOD, masking the crash — check `virsh domstate` to distinguish hung shutdown from BSOD |
+| Windows BSOD 0x9F during shutdown specifically | `HDAudBus!HdaController::TransferCodecVerbs` blocks waiting for GPU HDA audio codec to respond during power-down (`IRP_MN_SET_POWER` to D1); codec never responds because it's behind vfio-pci | Disable the AMD HD Audio device in Windows: `pnputil /disable-device "HDAUDIO\FUNC_01&VEN_1002&DEV_AA01&SUBSYS_00AA0100&REV_1008\5&1E9E0D5E&0&0001"`. The GPU audio PCI function (`03:00.1`) must still be passed through (AMD driver fails with Code 43 without it). Also disable AMD driver power features via registry (see Power Settings section) |
 | amdgpu bind hangs after VM passthrough (`trn=2 ACK should not assert`) | GPU SMU mailbox stuck after heavy GPU usage in VM (e.g. gaming); VFIO release doesn't fully reset the GPU, amdgpu probe loops forever on SMU communication | Reboot required. This is a hardware-level issue — the GPU needs a full PCI bus reset that only a machine reboot provides. Lightweight test cycles may restore fine but extended gaming sessions can leave the GPU in an unrecoverable state |
 | Monitor doesn't auto-switch to DP when VM starts | iGPU HDMI stays active, monitor doesn't detect DP | Blank iGPU framebuffer (`echo 4 > /sys/class/graphics/fbN/blank`) when VM starts; monitor auto-detects to DP. fb matched by PCI device path, not hardcoded number. vm-overwatch handles this |
 
