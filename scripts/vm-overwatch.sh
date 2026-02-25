@@ -689,7 +689,12 @@ _do_start() {
                     GPU_DRIVER)    section="driver";   log "GPU driver:" ;;
                     HD_AUDIO)      section="audio";    log "HD Audio:" ;;
                     "") ;;
-                    *) log "  $line" ;;
+                    *)
+                        log "  $line"
+                        if [ "$section" = "audio" ] && [[ "$line" == Device:* ]] && [[ "$line" == *AMD* ]]; then
+                            log "  WARNING: AtiHDAudioService has rebound — PnP Watchdog events may return"
+                        fi
+                        ;;
                 esac
             done <<< "$output"
         fi
