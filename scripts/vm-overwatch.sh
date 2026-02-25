@@ -611,7 +611,7 @@ import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('', ${SHUTDOWN_SIGNAL_PORT}))
-s.recvfrom(1)
+s.recvfrom(64)
 s.close()
 open('${shutdown_ts_file}', 'w').write(str(int(time.time())))
 " &>/dev/null &

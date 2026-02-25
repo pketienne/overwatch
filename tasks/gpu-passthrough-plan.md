@@ -13,7 +13,7 @@ One-click GPU passthrough for Overwatch 2 on myhost. The RX 7900 XTX is switchab
 - **GPU Audio**: Navi 31 HDMI/DP Audio (PCI `03:00.1`, device ID `1002:ab30`)
 - **Integrated GPU**: AMD `1002:13c0` (PCI `74:00.0`, IOMMU group 30)
 - **Motherboard**: MSI MPG X870E CARBON WIFI (MS-7E49), BIOS 1.A80 (Jan 8, 2026)
-- **RAM**: 92GB (16GB allocated to VM)
+- **RAM**: 96GB DDR5 (16GB allocated to VM)
 - **Monitor**: LG ULTRAGEAR+ 45" OLED (3440x1440 native, HDMI to iGPU, DP to 7900 XTX)
 - **Input**: Kinesis Advantage2 (29ea:0102), Razer Naga V2 Pro (1532:00a7), Razer Tartarus V2 (1532:022b), Razer Strider Chroma (1532:0c05), SteelSeries Arctis Pro Wireless (1038:1290 + 1038:1294)
 - **Bootloader**: GRUB (Ubuntu, kernel 6.17.0-14-generic)
@@ -50,11 +50,11 @@ GRUB_EARLY_INITRD_LINUX_CUSTOM="acpi-ivrs-override.img"
 | `/usr/share/qemu/gpu-rom.bin` | Sapphire NITRO+ RX 7900 XTX Vapor-X VBIOS (2MB, from TechPowerUp) |
 | `/usr/local/bin/vm-overwatch` | VM lifecycle script — stops services, switches GPU drivers, starts VM, waits for shutdown, restores host. Runs as systemd transient unit. Logs to journald |
 | `/etc/modprobe.d/amdgpu.conf` | `options amdgpu runpm=0` — disables runtime PM to prevent GPU crashes during D3 resume |
-| `/etc/udev/rules.d/99-gpu-passthrough.rules` | Disables runtime PM on GPU/audio at device add; prevents discrete GPU from getting a logind seat |
+| `/etc/udev/rules.d/99-gpu-passthrough.rules` | Prevents discrete GPU DRM device from getting a logind seat (stops GDM greeter on dGPU) |
 | `/etc/modules-load.d/vfio-pci.conf` | Ensures vfio-pci module loads at boot |
 | `/var/lib/gdm3/.config/monitors.xml` | GDM display config (3440x1440@85Hz on iGPU HDMI, dGPU DP disabled) |
 | `/etc/libvirt/hooks/qemu` | No-op (`exit 0`) — prevents hook deadlocks with systemctl/virsh |
-| `shutdown-vm.bat` (Windows desktop) | Sends UDP timing signal to vm-overwatch, then `shutdown /s /t 0` |
+| `C:\ProgramData\vm-overwatch\notify-host-shutdown.ps1` | Sends UDP shutdown signal to vm-overwatch; triggered by `NotifyHostShutdown` scheduled task on Event ID 1074 |
 
 ---
 
@@ -212,21 +212,25 @@ sudo cp scripts/vm-overwatch.sh /usr/local/bin/vm-overwatch
 sudo chmod +x /usr/local/bin/vm-overwatch
 ```
 
-Source is in this repo at `scripts/vm-overwatch.sh`. The script manages the full GPU passthrough lifecycle: stop services -> unbind amdgpu -> bind vfio-pci -> start VM -> wait for shutdown -> unbind vfio-pci -> bind amdgpu -> restart services.
+Source is in this repo at `scripts/vm-overwatch.sh`. The script manages the full GPU passthrough lifecycle:
 
-#### 6.2 udev rules — runtime PM + seat prevention
+1. **Pre-VM**: Stop services (ollama, openrgb, GDM) → release device FDs (`fuser -k` on DRM and i2c devices) → unbind VT consoles → unbind snd_hda_intel from GPU audio → unbind amdgpu → bind GPU + audio to vfio-pci
+2. **VM running**: Start VM → re-attach USB devices (Kinesis, Tartarus detach/reattach to clear ghost entries) → blank iGPU → set CPU governor to `performance`, pin all IRQs to CPU 0, stop irqbalance, move RCU callbacks to CPU 0
+3. **Post-VM**: Restore CPU governor to `powersave`, restart irqbalance → unbind vfio-pci → rebind VT consoles → bind amdgpu → PCI remove+rescan GPU audio (re-enumerates from D3cold) → disable runtime PM → unblank iGPU → restart services
+
+#### 6.2 udev rules — seat prevention
 
 Create `/etc/udev/rules.d/99-gpu-passthrough.rules`:
 ```
-# Disable runtime PM on discrete GPU and audio (amdgpu D3 resume crashes the GPU)
-# Note: amdgpu and snd_hda_intel override power/control during probe, so
-# modprobe.d/amdgpu.conf (runpm=0) is the primary fix. These rules are belt-and-suspenders.
-ACTION=="add", KERNEL=="0000:03:00.0", SUBSYSTEM=="pci", ATTR{power/control}="on"
-ACTION=="add", KERNEL=="0000:03:00.1", SUBSYSTEM=="pci", ATTR{power/control}="on"
-
-# Prevent discrete GPU from being assigned a seat by logind
-ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x1002", ATTR{device}=="0x744c", TAG-="seat"
+# Prevent the 7900 XTX from being assigned to any seat.
+# This stops GDM from spawning a greeter on it.
+# The render node remains available for compute (ollama).
+ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ENV{ID_PATH}=="pci-0000:03:00.0", ENV{ID_SEAT}=""
 ```
+
+This clears the seat assignment on the dGPU's DRM device so logind doesn't assign it a seat. Without this, GDM would try to manage the dGPU output, interfering with GPU passthrough. The render node (`renderD128`) is unaffected and remains available for compute workloads (ollama).
+
+**Note:** Runtime PM for the GPU is handled by `/etc/modprobe.d/amdgpu.conf` (`runpm=0`), not by udev rules.
 
 #### 6.3 amdgpu runtime PM fix
 
@@ -266,6 +270,17 @@ sudo chmod +x /etc/libvirt/hooks/qemu
 ```
 
 This prevents libvirt from running any hook logic (which causes deadlocks with systemctl/virsh). All lifecycle management is handled by the vm-overwatch wrapper.
+
+#### 6.7 Passwordless sudo
+
+The desktop shortcut (Phase 9) runs `sudo systemd-run ...` with `Terminal=false`, so there is no terminal to enter a password. The `myuser` user needs passwordless sudo for at least `systemctl` and `systemd-run`.
+
+Create `/etc/sudoers.d/vm-overwatch`:
+```
+myuser ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop vm-overwatch, /usr/bin/systemd-run *
+```
+
+Or, if the user already has blanket NOPASSWD (`myuser ALL=(ALL) NOPASSWD: ALL`), no additional configuration is needed.
 
 ---
 
@@ -361,15 +376,16 @@ All matched by vendor/product ID only — **no hardcoded bus/device addresses** 
 
 ### Phase 8: Install Windows 11 + Overwatch
 
-1. Attach a Windows 11 ISO to the VM
-2. Install Windows with UEFI + TPM 2.0
-3. Install AMD GPU drivers (Adrenalin) inside Windows
-4. Install VirtIO drivers (attach virtio-win.iso, install via Device Manager)
-5. Install QEMU Guest Agent (`qemu-ga-x86_64.msi` from virtio-win ISO)
-6. Install Battle.net (~738 MB) and Overwatch (~66 GB)
-7. Set Overwatch aspect ratio to **21:9** in game settings (for 3440x1440)
-8. Apply Windows VM power settings (see section below)
-9. Disable GPU HDA audio device (see "Disable GPU HDA Audio Device" section below)
+1. Download the [virtio-win ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso) to `/home/myuser/Downloads/virtio-win.iso` (referenced by VM XML)
+2. Attach a Windows 11 ISO to the VM
+3. Install Windows with UEFI + TPM 2.0
+4. Install AMD GPU drivers (Adrenalin) inside Windows
+5. Install VirtIO drivers (attach virtio-win.iso, install via Device Manager)
+6. Install QEMU Guest Agent (`qemu-ga-x86_64.msi` from virtio-win ISO)
+7. Install Battle.net (~738 MB) and Overwatch (~66 GB)
+8. Set Overwatch aspect ratio to **21:9** in game settings (for 3440x1440)
+9. Apply Windows VM power settings (see section below)
+10. Disable GPU HDA audio device (see "Disable GPU HDA Audio Device" section below)
 
 ---
 
@@ -387,16 +403,61 @@ Terminal=false
 Categories=System;
 ```
 
-The shortcut stops any stale vm-overwatch unit, then starts a fresh one via `systemd-run`. The transient service survives GDM stop/restart (no terminal dependency). Uses `sudo` for root operations.
+The shortcut stops any stale vm-overwatch unit, then starts a fresh one via `systemd-run`. The transient service survives GDM stop/restart (no terminal dependency). Uses `sudo` for root operations (see Phase 6.7 for sudoers config).
 
-Optionally, create a `shutdown-vm.bat` shortcut on the Windows desktop for shutdown timing:
-```batch
-@echo off
-:: Signal vm-overwatch that shutdown was initiated (for timing measurement)
-powershell -NoProfile -Command "$u=New-Object Net.Sockets.UdpClient;$b=[byte[]]@(1);$u.Send($b,1,'192.168.0.100',9147);$u.Close()"
-:: Initiate Windows shutdown
-shutdown /s /t 0
+#### 9.2 Windows shutdown signal (scheduled task)
+
+vm-overwatch listens on UDP port 9147 for a shutdown timing signal from the guest. A Windows scheduled task fires on any shutdown (Event ID 1074) and sends the signal automatically — no manual `.bat` shortcut needed.
+
+Install the notification script:
+```powershell
+mkdir C:\ProgramData\vm-overwatch -Force
 ```
+
+Copy `scripts/notify-host-shutdown.ps1` from this repo to `C:\ProgramData\vm-overwatch\notify-host-shutdown.ps1`. Contents:
+```powershell
+$udp = New-Object System.Net.Sockets.UdpClient
+$bytes = [System.Text.Encoding]::ASCII.GetBytes("shutdown")
+$udp.Send($bytes, $bytes.Length, "192.168.0.100", 9147)
+$udp.Close()
+```
+
+Create the scheduled task (run in an elevated PowerShell):
+```powershell
+$trigger = New-ScheduledTaskTrigger -AtStartup  # placeholder, replaced by EventTrigger below
+$action = New-ScheduledTaskAction -Execute "powershell.exe" `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\vm-overwatch\notify-host-shutdown.ps1"
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+Register-ScheduledTask -TaskName "NotifyHostShutdown" -Action $action -Principal $principal -Force
+
+# Set the trigger to Event ID 1074 (system shutdown initiated)
+$task = Get-ScheduledTask -TaskName "NotifyHostShutdown"
+$task.Triggers = @(
+    $(New-Object Microsoft.PowerShell.Cmdletization.GeneratedTypes.ScheduledTask.CimTrigger)
+)
+# Use schtasks for the event trigger (PowerShell cmdlets don't support event triggers natively)
+schtasks /Change /TN "NotifyHostShutdown" /XML (
+    [xml]@"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <EventTrigger>
+      <Subscription>&lt;QueryList&gt;&lt;Query Id="0"&gt;&lt;Select Path="System"&gt;*[System[EventID=1074]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+    </EventTrigger>
+  </Triggers>
+  <Actions>
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>-NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\vm-overwatch\notify-host-shutdown.ps1</Arguments>
+    </Exec>
+  </Actions>
+  <Principals><Principal><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings><Enabled>true</Enabled><AllowStartIfOnBatteries>true</AllowStartIfOnBatteries></Settings>
+</Task>
+"@ | Out-File "$env:TEMP\nhs.xml" -Encoding Unicode; "$env:TEMP\nhs.xml")
+```
+
+Or more simply, create the task via Task Scheduler GUI: trigger on Event Log `System`, Event ID `1074`, action runs the PowerShell script as SYSTEM.
 
 ---
 
@@ -404,7 +465,7 @@ shutdown /s /t 0
 
 **Start gaming**: Click the "Overwatch" desktop shortcut. vm-overwatch stops services (ollama, openrgb, GDM), switches the GPU to vfio-pci, starts the VM, blanks the iGPU (monitor auto-switches to DP), and tunes CPU performance. Takes ~15s from click to Windows desktop.
 
-**Stop gaming**: Shut down Windows from the Start menu (or use the `shutdown-vm.bat` desktop shortcut). vm-overwatch detects the shutdown, restores the GPU to amdgpu, unblanks the iGPU (monitor switches back to HDMI), and restarts all services.
+**Stop gaming**: Shut down Windows from the Start menu. The `NotifyHostShutdown` scheduled task automatically sends a UDP timing signal to vm-overwatch on shutdown. vm-overwatch detects the shutdown, restores the GPU to amdgpu, unblanks the iGPU (monitor switches back to HDMI), and restarts all services.
 
 **Monitor**: `journalctl -u vm-overwatch -f` for live logs. `vm-overwatch status` for a snapshot of GPU driver, VM state, iGPU, services, and CPU governor.
 
@@ -730,7 +791,7 @@ Wireless headset via USB passthrough).
 | GNOME Shell crashes when GPU unbinds | dGPU used for GPU-accelerated rendering | Stop GDM before unbinding amdgpu; run wrapper via `systemd-run` |
 | vm-overwatch dies when GDM stops | Script runs in GNOME terminal session | Use `systemd-run --unit=vm-overwatch` transient service (desktop shortcut does this) |
 | Audio volume much lower in VM | Windows volume state desyncs after USB passthrough | Move volume slider to 0% then back to 100%. Check SteelSeries GG EQ, Volume Mixer per-app levels. Use Settings -> System -> Sound (not `mmsys.cpl` which may freeze the VM) |
-| GPU crashes during desktop use | amdgpu runtime PM puts GPU into D3; resume finds device unresponsive (`0xffffffff` registers), `device lost from bus`, soft lockup | `/etc/modprobe.d/amdgpu.conf` with `options amdgpu runpm=0` (primary fix). Udev rules for `power/control=on` as belt-and-suspenders |
+| GPU crashes during desktop use | amdgpu runtime PM puts GPU into D3; resume finds device unresponsive (`0xffffffff` registers), `device lost from bus`, soft lockup | `/etc/modprobe.d/amdgpu.conf` with `options amdgpu runpm=0`. vm-overwatch also writes `power/control=on` after amdgpu bind on restore |
 | GPU audio D3cold after VM passthrough | Audio function stuck in D3cold after VFIO; binding snd_hda_intel triggers failed power transition that crashes the entire GPU | vm-overwatch does PCI remove + rescan of audio device after amdgpu binds the GPU, so the audio codec re-enumerates in a clean state |
 | Concurrent vm-overwatch instances cause dirty state | Second instance finds GPU in unexpected driver state | Lock file via `flock /run/vm-overwatch.lock` prevents concurrent instances |
 | Windows BSOD 0x9F DRIVER_POWER_STATE_FAILURE | Windows "Balanced" power plan sends power IRPs to passthrough GPU/USB devices; vfio-pci owns the hardware so guest driver can't complete power transitions | Switch to **High Performance** power plan; disable PCI Express ASPM, USB selective suspend, display timeout, sleep, hybrid sleep (see Windows VM Power Settings section) |
@@ -749,4 +810,5 @@ Wireless headset via USB passthrough).
 | i2c device numbers (`/dev/i2c-4` through `/dev/i2c-10`) | Different driver probe order | Check `ls /sys/bus/i2c/devices/`, update vm-overwatch `fuser` lines |
 | DRM card numbers (`/dev/dri/card0`, `card1`) | Different GPU probe order | Check `ls -la /dev/dri/by-path/` |
 | Monitor connector names (`HDMI-3`, `DP-1`) | Different GPU/output enumeration | Check `xrandr --listmonitors`, update monitors.xml |
+| virtio-win.iso path | VM XML references `/home/myuser/Downloads/virtio-win.iso` | Re-download ISO to same path, or update VM XML |
 | Netplan config filename | Ubuntu installer may use different naming | Adjust bridge config to match |
