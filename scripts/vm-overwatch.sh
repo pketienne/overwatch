@@ -343,12 +343,14 @@ ensure_performance_tuning() {
     echo 1 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
 }
 
-# --- Shutdown diagnostics (queries Windows Event Log for previous shutdown) ---
+# --- Guest diagnostics (queries Windows via QEMU guest agent) ---
 
-# Queries the Windows Diagnostics-Performance event log via QEMU guest agent.
-# Event IDs: 200=shutdown summary, 201=slow service, 202=slow app, 203=slow driver.
-# Prints structured output to stdout; caller logs it.
-log_previous_shutdown_diagnostics() {
+# Queries three data sources after VM boot:
+#   1. Shutdown diagnostics (Event IDs 200-203) — shutdown duration, slow services/drivers
+#   2. Recent crash dumps (LiveKernelReports, Minidump) — TDR/BSOD history
+#   3. AMD GPU driver version — detect silent Windows Update driver changes
+# Prints tagged sections to stdout; caller parses and logs them.
+log_guest_diagnostics() {
     python3 << 'PYEOF'
 import subprocess, json, base64, time, sys
 
@@ -361,6 +363,28 @@ def qga(payload):
     except Exception:
         return None
 
+def run_ps(cmd):
+    result = qga({"execute": "guest-exec", "arguments": {
+        "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "arg": ["-Command", cmd],
+        "capture-output": True}})
+    if not result:
+        return ""
+    pid = result["return"]["pid"]
+    time.sleep(5)
+    status = qga({"execute": "guest-exec-status", "arguments": {"pid": pid}})
+    if not status:
+        return ""
+    r = status["return"]
+    if not r.get("exited"):
+        time.sleep(5)
+        status = qga({"execute": "guest-exec-status", "arguments": {"pid": pid}})
+        if status:
+            r = status["return"]
+    if r.get("out-data"):
+        return base64.b64decode(r["out-data"]).decode().strip()
+    return ""
+
 # Wait for guest agent (up to 60s)
 for _ in range(30):
     if qga({"execute": "guest-ping"}):
@@ -369,7 +393,8 @@ for _ in range(30):
 else:
     sys.exit(0)
 
-ps_cmd = (
+# 1. Previous shutdown diagnostics
+out = run_ps(
     "$events = Get-WinEvent -FilterHashtable @{"
     "LogName='Microsoft-Windows-Diagnostics-Performance/Operational';"
     "Id=200,201,202,203} -MaxEvents 10 -EA SilentlyContinue; "
@@ -380,29 +405,37 @@ ps_cmd = (
     "Write-Output(\"$($e.TimeCreated.ToString('HH:mm:ss'))"
     " ID=$($e.Id) $summary\")}"
 )
+if out:
+    print("SHUTDOWN_DIAG")
+    print(out)
 
-result = qga({"execute": "guest-exec", "arguments": {
-    "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-    "arg": ["-Command", ps_cmd],
-    "capture-output": True}})
-if not result:
-    sys.exit(0)
+# 2. Recent TDR/crash events (LiveKernelReports)
+out = run_ps(
+    "$files = Get-ChildItem "
+    "C:\\Windows\\LiveKernelReports\\*\\*.dmp,"
+    "C:\\Windows\\Minidump\\*.dmp "
+    "-EA SilentlyContinue | Sort-Object LastWriteTime -Descending "
+    "| Select-Object -First 5; "
+    "foreach($f in $files){"
+    "Write-Output(\"$($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))"
+    " $([math]::Round($f.Length/1MB,1))MB $($f.Name)\")}"
+)
+if out:
+    print("CRASH_DUMPS")
+    print(out)
 
-pid = result["return"]["pid"]
-time.sleep(5)
-
-status = qga({"execute": "guest-exec-status", "arguments": {"pid": pid}})
-if not status:
-    sys.exit(0)
-r = status["return"]
-if not r.get("exited"):
-    time.sleep(5)
-    status = qga({"execute": "guest-exec-status", "arguments": {"pid": pid}})
-    if status:
-        r = status["return"]
-
-if r.get("out-data"):
-    print(base64.b64decode(r["out-data"]).decode().strip())
+# 3. AMD GPU driver version
+out = run_ps(
+    "$d = Get-PnpDevice -Class Display -EA SilentlyContinue "
+    "| Where-Object { $_.FriendlyName -like '*AMD*' -or "
+    "$_.FriendlyName -like '*Radeon*' } | Select-Object -First 1; "
+    "if($d){ $drv = Get-PnpDeviceProperty -InstanceId $d.InstanceId "
+    "-KeyName DEVPKEY_Device_DriverVersion -EA SilentlyContinue; "
+    "Write-Output(\"$($d.Status) $($d.FriendlyName) v$($drv.Data)\") }"
+)
+if out:
+    print("GPU_DRIVER")
+    print(out)
 PYEOF
 }
 
@@ -591,14 +624,20 @@ _do_start() {
     log_state "vm_running"
     log "VM running. Waiting for shutdown..."
 
-    # Query previous shutdown diagnostics from Windows in background (non-blocking)
+    # Query guest diagnostics from Windows in background (non-blocking)
     (
-        diag=$(log_previous_shutdown_diagnostics 2>/dev/null) || true
-        if [ -n "$diag" ]; then
-            log "Previous shutdown diagnostics (Windows Event Log):"
+        output=$(log_guest_diagnostics 2>/dev/null) || true
+        if [ -n "$output" ]; then
+            local section=""
             while IFS= read -r line; do
-                [ -n "$line" ] && log "  $line"
-            done <<< "$diag"
+                case "$line" in
+                    SHUTDOWN_DIAG) section="shutdown"; log "Previous shutdown diagnostics (Windows Event Log):" ;;
+                    CRASH_DUMPS)   section="crashes";  log "Recent crash dumps:" ;;
+                    GPU_DRIVER)    section="driver";   log "GPU driver:" ;;
+                    "") ;;
+                    *) log "  $line" ;;
+                esac
+            done <<< "$output"
         fi
     ) &
     local diag_pid=$!
