@@ -33,7 +33,7 @@ One-click GPU passthrough for Overwatch 2 on myhost. The RX 7900 XTX is switchab
 - Lock file prevents concurrent vm-overwatch instances
 - Host-side CPU isolation: vCPU cores (1-7) get zero host interference; emulator/IO pinned to core 0
 - Auto HDR disabled (native HDR on), Game Bar disabled, AMD telemetry disabled
-- **Known issue:** intermittent non-fatal WATCHDOG dump (~1 in 3 boots) from Defender service init contention — cannot be eliminated with Tamper Protection on
+- GPU hot-plugged after Windows boots (not present at boot) — eliminates WATCHDOG TDR dumps from DxgKrnl WDDM init contention
 
 ### Kernel Parameters
 

@@ -63,40 +63,29 @@ Three-layer isolation: libvirt `emulatorpin`/`iothreadpin` on core 0, vm-overwat
 
 ---
 
-## 7. Eliminate remaining WATCHDOG TDR dumps (~1 in 3 boots)
+## 7. Eliminate remaining WATCHDOG TDR dumps (~1 in 3 boots) — Resolved
 
-**Status:** Open — investigating options
+**Status:** Resolved — GPU hot-plug after boot
 
 **Problem:** Intermittent non-fatal `VIDEO_DXGKRNL_LIVEDUMP` (0x1B0) WATCHDOG
-dumps at ~T+49s and ~T+78s after boot. Root cause is Windows Defender
-(`MsMpEng`, ~51s CPU) contending with AMD GPU driver init. Disabling Defender
-eliminates dumps entirely, but Tamper Protection prevents programmatic disable
-of real-time scanning.
+dumps at ~T+49s and ~T+78s after boot. Initially attributed to Windows Defender
+(`MsMpEng`) CPU contention, but the actual root cause was DxgKrnl initializing
+the WDDM driver on the VFIO GPU during Windows boot — the GPU was present from
+VM start, so the driver init competed with all other boot-time activity.
 
-**Options to evaluate:**
+**Root cause:** DxgKrnl WDDM init on a GPU that's present at boot time. The
+driver init window (~T+21-49s) overlaps with boot contention regardless of
+Defender — Defender amplifies it but isn't the fundamental cause.
 
-### 7a. Expand Defender process/path exclusions
+**Fix:** Hot-plug the GPU after Windows boots instead of including it in the
+persistent VM XML. `vm-overwatch` now:
+1. Starts the VM without GPU hardware (hostdevs removed from persistent config)
+2. Waits for the QEMU guest agent (confirms Windows boot is complete)
+3. Hot-plugs GPU via `virsh attach-device --live`, then GPU audio 1s later
 
-Add AMD driver paths and GPU-heavy processes to Defender's exclusion list.
-Already have some AMD exclusions; check whether they cover the driver binaries
-active during the T+21-49s init window. Low risk, easy to test.
+**Test results:** 0/5 cycles with hot-plug produced WATCHDOG dumps vs 3/5 with
+GPU present at boot. The DxgKrnl init happens post-boot with no contention,
+eliminating the TDR timeout entirely.
 
-### 7b. Install lightweight third-party AV
-
-Windows auto-disables Defender's real-time engine when it detects a compatible
-AV. A minimal AV (e.g., ESET) would cause Defender to step aside entirely.
-Eliminates the contention but adds a permanent dependency.
-
-### 7c. Increase TDR timeouts
-
-Raise `TdrDelay` and `TdrDdiDelay` registry values to give the GPU driver more
-time to init under contention. Doesn't fix the contention but may provide
-enough margin — zero dumps occur with Defender disabled even at default
-timeouts. Low risk, reversible.
-
-### 7d. Defer AMD driver service startup
-
-Delay AMD services (`atiesrxx`, `atieclxx`) via
-`sc.exe config ... start=delayed-auto` so they start after Defender's initial
-CPU burst passes. The case study showed contention is specifically about timing
-overlap at T+21-49s. Most targeted fix if the timing shift is sufficient.
+**Implementation:** `ensure_gpu_hotplugged()` in vm-overwatch.sh. GPU/audio PCI
+hostdevs removed from persistent VM config — managed entirely by vm-overwatch.
