@@ -205,6 +205,68 @@ contributor.
 
 ---
 
+## GPU Hot-Plug Attempt (Method 2)
+
+The WATCHDOG TDR dumps (~1 in 3 boots) were caused by DxgKrnl WDDM driver init
+during boot contention. Testing confirmed that manually hot-plugging the GPU
+after boot via `virsh attach-device --live` eliminated dumps entirely: 0/5
+cycles vs 3/5 with GPU present at boot. This motivated a full implementation.
+
+### What was built
+
+`ensure_gpu_hotplugged()` in vm-overwatch.sh: wait for guest agent (confirms
+Windows boot complete), then hot-plug GPU and audio PCI hostdevs via
+`virsh attach-device --live`. GPU/audio hostdevs removed from persistent VM
+config — managed entirely by vm-overwatch.
+
+Deployed, started VM. Hot-plug succeeded — guest agent ready in ~8s, both
+devices attached, AMD GPU showed `Status: OK` in PnP, AMD driver loaded.
+
+### What failed
+
+No display output. The monitor got no signal on DisplayPort. Investigation:
+
+1. `Win32_VideoController` showed the AMD GPU with no resolution set
+2. `WmiMonitorBasicDisplayParams` detected the LG ULTRAGEAR+ monitor (EDID was
+   read) but all monitors showed `Status: Unknown`
+3. `displayswitch /external` — appeared to work briefly (monitor's auto-input
+   detection cycled to DP for 5-10s) but no actual video signal was produced.
+   No display events in Windows Event Log confirmed nothing happened.
+4. `EnumDisplayDevices` — only 1 display adapter registered: Microsoft Basic
+   Display Driver. The AMD GPU was completely absent from the display subsystem.
+5. `QueryDisplayConfig` — only 1 active display path (the Basic Display Driver)
+6. `SetDisplayConfig` with `SDC_TOPOLOGY_EXTERNAL` — returned
+   `ERROR_INVALID_PARAMETER` (87) from both Session 0 and the interactive
+   session, confirming the topology didn't exist
+
+### Root cause
+
+**WDDM does not support hot-adding a display adapter to an active Windows
+session.** The PCI device is detected, PnP loads the driver, the GPU reports
+OK — but DxgKrnl never registers it as a display adapter because it wasn't
+present during boot. Without OVMF executing the VBIOS option ROM at VM start,
+the display engine hardware never initializes, and the WDDM display topology
+is never created. This is a fundamental Windows architecture limitation, not a
+configuration issue.
+
+### Key insight
+
+The pre-implementation manual test (hot-plug via virsh) confirmed "zero TDR
+dumps" but never verified display output — it only measured crash dump
+presence. The test validated the hypothesis it was designed to test (TDR
+elimination) but missed the critical side effect (no display). **Validate all
+user-visible outcomes, not just the metric that motivated the change.**
+
+### Pivot
+
+Keep GPU in persistent VM config (OVMF runs VBIOS, display engine initializes,
+WDDM registers adapter at boot) but prevent the AMD WDDM driver from loading
+during boot by disabling the device in Windows Device Manager (persistent
+`ConfigFlags` in registry). After boot settles, enable via `Enable-PnpDevice`
+through guest agent — driver loads post-boot with zero contention.
+
+---
+
 ## Build/Remove Cycle (Method 5)
 
 The script grew from 212 to 967 lines through iterative problem-solving:
