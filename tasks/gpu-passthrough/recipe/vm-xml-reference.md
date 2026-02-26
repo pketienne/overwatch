@@ -1,13 +1,6 @@
 # VM XML Reference
 
-> **GPU hot-plug architecture:** The GPU (`03:00.0`) and GPU audio (`03:00.1`)
-> PCI hostdevs are **not** in the persistent VM config. They are hot-plugged by
-> `vm-overwatch` after Windows boots via `virsh attach-device --live`. This
-> eliminates WATCHDOG TDR dumps caused by DxgKrnl initializing the WDDM driver
-> during boot contention. See [Action Item 7](../action-items.md#7-eliminate-remaining-watchdog-tdr-dumps-1-in-3-boots).
-
-Full XML from `virsh dumpxml overwatch` (with GPU hostdevs that are now
-hot-plugged rather than persistent):
+Full XML from `virsh dumpxml overwatch`:
 
 ```xml
 <domain type='kvm'>
@@ -160,10 +153,21 @@ hot-plugged rather than persistent):
       <backend type='emulator' version='2.0'/>
     </tpm>
     <audio id='1' type='none'/>
-    <!-- GPU PCI hostdevs removed from persistent config — hot-plugged by vm-overwatch -->
-    <!-- See ensure_gpu_hotplugged() in vm-overwatch.sh for the live-attach XML -->
-    <!-- GPU:   03:00.0 (rom bar='on' for hot-add, file='/usr/share/qemu/gpu-rom.bin') -->
-    <!-- Audio: 03:00.1 -->
+    <hostdev mode='subsystem' type='pci' managed='no'>
+      <driver name='vfio'/>
+      <source>
+        <address domain='0x0000' bus='0x03' slot='0x00' function='0x0'/>
+      </source>
+      <rom bar='off' file='/usr/share/qemu/gpu-rom.bin'/>
+      <address type='pci' domain='0x0000' bus='0x04' slot='0x00' function='0x0'/>
+    </hostdev>
+    <hostdev mode='subsystem' type='pci' managed='no'>
+      <driver name='vfio'/>
+      <source>
+        <address domain='0x0000' bus='0x03' slot='0x00' function='0x1'/>
+      </source>
+      <address type='pci' domain='0x0000' bus='0x05' slot='0x00' function='0x0'/>
+    </hostdev>
     <hostdev mode='subsystem' type='usb' managed='yes'>
       <source>
         <vendor id='0x29ea'/>

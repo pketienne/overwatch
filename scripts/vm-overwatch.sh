@@ -27,18 +27,6 @@ USB_DEVICES=(
     "0x1532:0x022b:Tartarus V2"
 )
 
-# GPU PCI hostdev XML for hot-plug (rom bar must be 'on' for QEMU hot-add)
-GPU_HOSTDEV_XML="<hostdev mode='subsystem' type='pci' managed='no'>\
-<driver name='vfio'/>\
-<source><address domain='0x0000' bus='0x03' slot='0x00' function='0x0'/></source>\
-<rom bar='on' file='/usr/share/qemu/gpu-rom.bin'/>\
-</hostdev>"
-
-GPU_AUDIO_HOSTDEV_XML="<hostdev mode='subsystem' type='pci' managed='no'>\
-<driver name='vfio'/>\
-<source><address domain='0x0000' bus='0x03' slot='0x00' function='0x1'/></source>\
-</hostdev>"
-
 # --- Parse arguments ---
 
 VERBOSE=false
@@ -382,31 +370,6 @@ ensure_performance_tuning() {
     echo 1 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
 }
 
-# Hot-plug GPU after Windows boots — avoids WATCHDOG TDR during boot init.
-# GPU/audio PCI hostdevs are NOT in the persistent VM XML; vm-overwatch manages
-# them entirely via hot-plug.
-ensure_gpu_hotplugged() {
-    log "Waiting for guest agent..."
-    for attempt in $(seq 1 30); do
-        if virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
-            log "Guest agent ready (attempt $attempt)"
-            break
-        fi
-        sleep 2
-    done
-
-    log "Hot-plugging GPU..."
-    virsh attach-device overwatch /dev/stdin --live <<< "$GPU_HOSTDEV_XML" || {
-        log "ERROR: GPU hot-plug failed"
-        return 1
-    }
-    sleep 1
-    virsh attach-device overwatch /dev/stdin --live <<< "$GPU_AUDIO_HOSTDEV_XML" || {
-        log "WARNING: GPU audio hot-plug failed"
-    }
-    log "GPU hot-plugged successfully"
-}
-
 # --- Guest diagnostics (queries Windows via QEMU guest agent) ---
 
 # Queries three data sources after VM boot:
@@ -734,9 +697,6 @@ _do_start() {
     ensure_usb_reattached
     set_igpu_blank 4 blank || true
     ensure_performance_tuning
-
-    # Hot-plug GPU after boot settles — avoids WATCHDOG TDR during boot init
-    ensure_gpu_hotplugged || { log "ERROR: GPU hot-plug failed"; _do_stop; exit 1; }
 
     log_state "vm_running"
     log "VM running. Waiting for shutdown..."

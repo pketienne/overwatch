@@ -81,14 +81,14 @@ WDDM driver on the VFIO GPU during boot contention (proven by BasicDisplay test
   register hot-added display adapters). See
   [case study](../troubleshooting-methodology/case-studies.md#gpu-hot-plug-attempt-method-2).
 
-### 7a. Increase TDR timeout to 60-120s
+### 7a. Increase TDR timeout to 60s
 
-Set `TdrDelay` and `TdrDdiDelay` to 60s (or higher) in the guest registry. The
-dumps are non-fatal livedumps — the GPU recovers on its own. A longer timeout
-gives DxgKrnl more time to complete WDDM init under contention, preventing the
+Set `TdrDelay` and `TdrDdiDelay` to 60s in the guest registry. The dumps are
+non-fatal livedumps — the GPU recovers on its own. A longer timeout gives
+DxgKrnl more time to complete WDDM init under contention, preventing the
 timeout from firing. No impact on normal boot time (timeout only matters if the
 GPU doesn't respond). Previous testing only went up to 25s; subagent research
-recommended 60-120s but this was never tested.
+recommended 60-120s but 25s was the highest value tested before this.
 
 Downside: if the GPU actually hangs during gameplay, recovery takes 60s instead
 of 2s. Acceptable tradeoff given actual hangs are rare.
@@ -99,13 +99,32 @@ HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\TdrDelay = 60 (DWORD)
 HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\TdrDdiDelay = 60 (DWORD)
 ```
 
+**Test results (2026-02-26):** 0/3 WATCHDOG dumps with TdrDelay=60,
+TdrDdiDelay=60. Cycle 1 GPU status OK; cycles 2-3 GPU status `Unknown` (may be
+PnP query timing during rapid test cycling — needs investigation). Compared to
+baseline ~60% dump rate (3/5) and previous TdrDelay=25 which still produced
+dumps.
+
 ### 7b. Combine hot-plug with a display solution
 
 Hot-plug eliminates 100% of dumps (0/5) but WDDM doesn't register hot-added
 display adapters. If a method exists to activate display output on a hot-plugged
 GPU, this would be the ideal fix. Potential avenues:
-- Looking Glass (shared memory framebuffer — host renders guest output)
-- QEMU virtual display + GPU compute-only passthrough
-- Future Windows/WDDM updates that support hot-added display adapters
+
+**Looking Glass** — open-source IVSHMEM-based framebuffer sharing. Guest
+captures GPU framebuffer to shared memory; host displays it in a window with
+sub-millisecond latency. However, it still needs the GPU registered as a WDDM
+display adapter to have a framebuffer to capture. Would require an Indirect
+Display Driver (IDD) on the guest side to give the GPU something to render to,
+and it's unclear whether that works on a hot-plugged GPU that WDDM never
+registered. Most realistic option but unproven for this use case.
+
+**Sunshine/Moonlight streaming** — Sunshine (game streaming server) in the guest
+can create virtual displays without a physical monitor and hooks into DXGI
+directly, bypassing WDDM display registration. Moonlight (client) on the host
+decodes and displays it. Over localhost the latency could be minimal. Tradeoff
+is encoding overhead and added complexity.
+
+**Future WDDM updates** — not actionable, just noting the possibility.
 
 This is a research item, not an immediate fix.
