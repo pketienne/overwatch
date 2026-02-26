@@ -48,7 +48,8 @@ GRUB_EARLY_INITRD_LINUX_CUSTOM="acpi-ivrs-override.img"
 | `/etc/default/grub` | Kernel params: `amd_iommu=on`, IVRS override initrd |
 | `/boot/acpi-ivrs-override.img` | Patched IVRS ACPI table (zeroed exclusion flags, OEM rev 2) |
 | `/usr/share/qemu/gpu-rom.bin` | Sapphire NITRO+ RX 7900 XTX Vapor-X VBIOS (2MB, from TechPowerUp) |
-| `/usr/local/bin/vm-overwatch` | VM lifecycle script — stops services, switches GPU drivers, starts VM, waits for shutdown, restores host. Runs as systemd transient unit. Logs to journald |
+| `/usr/local/bin/vm-overwatch` | VM lifecycle script — stops services, switches GPU drivers, starts VM, waits for shutdown, restores host. Logs to journald |
+| `/etc/systemd/system/vm-overwatch.service` | Systemd service unit for vm-overwatch (`Type=simple`, `ExecStart=/usr/local/bin/vm-overwatch start`). Start with `systemctl start vm-overwatch`, stop with `systemctl stop vm-overwatch` |
 | `/etc/modprobe.d/amdgpu.conf` | `options amdgpu runpm=0` — disables runtime PM to prevent GPU crashes during D3 resume |
 | `/etc/udev/rules.d/99-gpu-passthrough.rules` | Prevents discrete GPU DRM device from getting a logind seat (stops GDM greeter on dGPU) |
 | `/etc/modules-load.d/vfio-pci.conf` | Ensures vfio-pci module loads at boot |
@@ -218,7 +219,16 @@ Source is in this repo at `scripts/vm-overwatch.sh`. The script manages the full
 2. **VM running**: Start VM → re-attach USB devices (Kinesis, Tartarus detach/reattach to clear ghost entries) → blank iGPU → set CPU governor to `performance`, pin all IRQs to CPU 0, stop irqbalance, move RCU callbacks to CPU 0
 3. **Post-VM**: Restore CPU governor to `powersave`, restart irqbalance → unbind vfio-pci → rebind VT consoles → bind amdgpu → PCI remove+rescan GPU audio (re-enumerates from D3cold) → disable runtime PM → unblank iGPU → restart services
 
-#### 6.2 udev rules — seat prevention
+#### 6.2 vm-overwatch systemd service
+
+```bash
+sudo cp scripts/vm-overwatch.service /etc/systemd/system/vm-overwatch.service
+sudo systemctl daemon-reload
+```
+
+Source is in this repo at `scripts/vm-overwatch.service`. The service wraps `vm-overwatch start` with proper lifecycle management: `Type=simple` (long-running foreground process), `TimeoutStartSec=infinity` (VM sessions last hours), `TimeoutStopSec=120` (graceful shutdown + host restore). `systemctl stop` sends SIGTERM, which triggers the script's cleanup handler.
+
+#### 6.3 udev rules — seat prevention
 
 Create `/etc/udev/rules.d/99-gpu-passthrough.rules`:
 ```
@@ -232,7 +242,7 @@ This clears the seat assignment on the dGPU's DRM device so logind doesn't assig
 
 **Note:** Runtime PM for the GPU is handled by `/etc/modprobe.d/amdgpu.conf` (`runpm=0`), not by udev rules.
 
-#### 6.3 amdgpu runtime PM fix
+#### 6.4 amdgpu runtime PM fix
 
 Create `/etc/modprobe.d/amdgpu.conf`:
 ```
@@ -241,14 +251,14 @@ options amdgpu runpm=0
 
 This prevents amdgpu from enabling runtime PM at the driver level. Without this, the GPU enters D3 during idle and crashes on resume (`device lost from bus`, soft lockup). The default `runpm=-1` (auto) enables runtime PM on desktop GPUs.
 
-#### 6.4 Auto-load vfio-pci module
+#### 6.5 Auto-load vfio-pci module
 
 Create `/etc/modules-load.d/vfio-pci.conf`:
 ```
 vfio-pci
 ```
 
-#### 6.5 GDM monitors.xml
+#### 6.6 GDM monitors.xml
 
 Copy your monitors.xml (with iGPU HDMI as primary, dGPU DP disabled) to both locations:
 ```bash
@@ -258,7 +268,7 @@ sudo chown gdm:gdm /var/lib/gdm3/.config/monitors.xml
 
 The monitors.xml must list the iGPU output (e.g. `HDMI-3`) as the active monitor at 3440x1440@85Hz, and mark the dGPU output (e.g. `DP-1`) as `<disabled>`. The exact connector names may change after reinstall — check with `gnome-display-settings` or `xrandr`.
 
-#### 6.6 libvirt hooks (no-op)
+#### 6.7 libvirt hooks (no-op)
 
 Create `/etc/libvirt/hooks/qemu`:
 ```bash
@@ -271,13 +281,13 @@ sudo chmod +x /etc/libvirt/hooks/qemu
 
 This prevents libvirt from running any hook logic (which causes deadlocks with systemctl/virsh). All lifecycle management is handled by the vm-overwatch wrapper.
 
-#### 6.7 Passwordless sudo
+#### 6.8 Passwordless sudo
 
-The desktop shortcut (Phase 9) runs `sudo systemd-run ...` with `Terminal=false`, so there is no terminal to enter a password. The `myuser` user needs passwordless sudo for at least `systemctl` and `systemd-run`.
+The desktop shortcut (Phase 9) runs `sudo systemctl start vm-overwatch` with `Terminal=false`, so there is no terminal to enter a password. The `myuser` user needs passwordless sudo for at least `systemctl`.
 
 Create `/etc/sudoers.d/vm-overwatch`:
 ```
-myuser ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop vm-overwatch, /usr/bin/systemd-run *
+myuser ALL=(ALL) NOPASSWD: /usr/bin/systemctl start vm-overwatch, /usr/bin/systemctl stop vm-overwatch
 ```
 
 Or, if the user already has blanket NOPASSWD (`myuser ALL=(ALL) NOPASSWD: ALL`), no additional configuration is needed.
@@ -399,13 +409,13 @@ Create `~/Desktop/start-vm.desktop`:
 Type=Application
 Name=Overwatch
 Comment=Start the Overwatch Windows VM with GPU passthrough
-Exec=bash -c "sudo systemctl stop vm-overwatch 2>/dev/null; sudo systemd-run --unit=vm-overwatch --collect --description='Overwatch VM lifecycle' /usr/local/bin/vm-overwatch start"
+Exec=bash -c "sudo systemctl start vm-overwatch"
 Icon=computer
 Terminal=false
 Categories=System;
 ```
 
-The shortcut stops any stale vm-overwatch unit, then starts a fresh one via `systemd-run`. The transient service survives GDM stop/restart (no terminal dependency). Uses `sudo` for root operations (see Phase 6.7 for sudoers config).
+The shortcut starts the vm-overwatch systemd service. If the service is already running, `systemctl start` is a no-op. The service survives GDM stop/restart (no terminal dependency). Uses `sudo` for root operations (see Phase 6.8 for sudoers config).
 
 #### 9.2 Windows shutdown signal (scheduled task)
 
@@ -796,11 +806,30 @@ Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-
 Create a script at `C:\ProgramData\vm-overwatch\DeferDefenderEnable.ps1`:
 
 ```powershell
+# Defer Defender real-time monitoring during boot to prevent GPU TDR
+# Policy value 1 = disabled at boot. After 90s, flip to 0, restart service, then re-arm to 1.
+
+$policyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection"
+
 Start-Sleep -Seconds 90
-Remove-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" -Force -Recurse -EA SilentlyContinue
-Set-MpPreference -DisableRealtimeMonitoring $false
-Restart-Service WinDefend -Force -EA SilentlyContinue
+
+# Re-enable Defender: set policy to 0 (allow), restart service
+Set-ItemProperty -Path $policyPath -Name DisableRealtimeMonitoring -Value 0 -Type DWord
+Restart-Service WinDefend -Force -ErrorAction SilentlyContinue
+
+# Wait for service to pick up the new policy
+Start-Sleep -Seconds 10
+
+# Re-arm for next boot: set policy back to 1 (disable)
+# WinDefend already started with value=0, so this only takes effect on next service start
+Set-ItemProperty -Path $policyPath -Name DisableRealtimeMonitoring -Value 1 -Type DWord
 ```
+
+> **Important**: The script toggles the policy value rather than removing the key.
+> This ensures the policy is always armed (value=1) at rest, so subsequent boots
+> start with Defender deferred. The running WinDefend service does not re-read the
+> policy mid-session, so setting it back to 1 after restart has no effect until the
+> next boot.
 
 Register the scheduled task:
 
@@ -880,7 +909,7 @@ Disable-ScheduledTask -TaskName StartAUEP
 | No display after VM shutdown | iGPU display in DPMS off state | vm-overwatch unblanks iGPU and restarts GDM |
 | GDM wrong aspect ratio (single GPU) | monitors.xml connector mismatch | Update connector name (e.g. `HDMI-1` -> `HDMI-3` when dGPU on amdgpu shifts numbering) |
 | GDM wrong aspect ratio (dual GPU) | Both dGPU DP-1 and iGPU HDMI-3 connected to same monitor; monitors.xml lists only one output so GDM falls back to auto (3840x2160) | Add `<disabled>` section for DP-1 in monitors.xml |
-| GNOME Shell crashes when GPU unbinds | dGPU used for GPU-accelerated rendering | Stop GDM before unbinding amdgpu; run wrapper via `systemd-run` |
+| GNOME Shell crashes when GPU unbinds | dGPU used for GPU-accelerated rendering | Stop GDM before unbinding amdgpu; run via systemd service (`systemctl start vm-overwatch`) |
 | vm-overwatch dies when GDM stops | Script runs in GNOME terminal session | Runs as systemd service (`systemctl start vm-overwatch`); SIGTERM handler runs full host restore on stop |
 | Audio volume much lower in VM | Windows volume state desyncs after USB passthrough | Move volume slider to 0% then back to 100%. Check SteelSeries GG EQ, Volume Mixer per-app levels. Use Settings -> System -> Sound (not `mmsys.cpl` which may freeze the VM) |
 | GPU crashes during desktop use | amdgpu runtime PM puts GPU into D3; resume finds device unresponsive (`0xffffffff` registers), `device lost from bus`, soft lockup | `/etc/modprobe.d/amdgpu.conf` with `options amdgpu runpm=0`. vm-overwatch also writes `power/control=on` after amdgpu bind on restore |

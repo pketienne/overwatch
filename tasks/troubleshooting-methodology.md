@@ -1,6 +1,6 @@
 # GPU Passthrough Troubleshooting Methodology
 
-Lessons extracted from the full GPU passthrough project (Feb 20-24, 2026):
+Lessons extracted from the full GPU passthrough project (Feb 20-25, 2026):
 building a switchable RX 7900 XTX passthrough system on myhost with
 vm-overwatch, from first `amd_iommu=on` through clean 24-second shutdown.
 
@@ -20,6 +20,9 @@ Day 3 (Feb 23): The marathon session — IOMMU, i2c hangs, hook deadlocks,
 Day 4 (Feb 24): Broken AMD driver identified, 3 rounds of code removal,
                 runtime PM race fixed, shutdown BSOD root cause found
                 via WinDbg analysis
+Day 5 (Feb 25): WATCHDOG TDR root cause — Windows Defender boot contention,
+                AUEPMaster dual-launch-path discovery, registry policy
+                deferral fix, systemd service conversion
 ```
 
 The script grew from 212 lines to 967 lines (building workarounds), then
@@ -531,6 +534,27 @@ The fix was also disabling the scheduled task:
 (`Get-Service`), scheduled tasks (`Get-ScheduledTask`), startup folder,
 `Run`/`RunOnce` registry keys, and COM surrogate registrations. AMD software
 in particular uses multiple redundant launch mechanisms.
+
+### 7. Verifying a stateful fix in a single cycle
+
+The Windows Defender boot deferral used a registry policy
+(`DisableRealtimeMonitoring=1`) to suppress real-time scanning during GPU init.
+The `DeferDefenderEnable.ps1` script re-enabled Defender after 90 seconds by
+deleting the registry key with `Remove-Item`. This passed the test cycle — zero
+WATCHDOG dumps, Defender confirmed active afterward.
+
+But the fix was a one-shot: `Remove-Item` destroyed the policy key entirely, so
+the next boot had no policy in place. Defender started at full speed, GPU TDR
+dumps returned. The bug survived across 4+ boots before being caught.
+
+The fix was trivial: toggle the value (set to 0, restart WinDefend, set back to
+1) instead of deleting the key. The policy stays armed at rest and only flips
+briefly during the re-enable window.
+
+**Any fix that modifies persistent state (registry, config files, scheduled
+tasks) must be tested across at least two full cycles.** A single-cycle test
+only proves the fix works *once* — it says nothing about whether the fix
+re-arms itself for the next invocation.
 
 ---
 
