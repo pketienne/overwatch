@@ -2,7 +2,7 @@
 
 ## 1. Add PCIe bus reset before amdgpu rebind
 
-**Status:** Implemented (vm-overwatch.sh lines 519-530)
+**Status:** Implemented (`gpu_bus_reset()` in vm-overwatch.sh, called from `ensure_gpu_on_host()`)
 
 **Problem:** After VFIO releases the GPU, `ensure_gpu_on_host()` binds amdgpu
 directly with no hardware reset. The GPU is still in whatever state the Windows
@@ -28,30 +28,22 @@ only available reset method is Secondary Bus Reset (SBR), which resets both
 `03:00.0` and `03:00.1` via the PCIe link.
 
 **Note:** Since the bus reset hits both functions, the audio device also returns
-to a clean power state. This may make the existing PCI remove/rescan of
-`03:00.1` unnecessary — test after implementing the bus reset.
+to a clean power state. This eliminated the need for PCI remove/rescan of
+`03:00.1` — confirmed in Action Item 2.
 
 ## 2. Test removing PCI remove/rescan for GPU audio after bus reset
 
 **Status:** Done — direct bind works, remove/rescan deleted
 
-**Problem:** `ensure_gpu_on_host()` does a PCI remove + full bus rescan on
-`03:00.1` (lines 502-520) to work around the audio function being stuck in
-D3cold after VFIO passthrough. This is the riskiest operation in the rebind
-— `echo 1 > /sys/bus/pci/rescan` re-enumerates the entire PCI bus, which can
-cause side effects when amdgpu is loaded.
+**Problem:** `ensure_gpu_on_host()` previously did a PCI remove + full bus rescan
+on `03:00.1` to work around the audio function being stuck in D3cold after VFIO
+passthrough. `echo 1 > /sys/bus/pci/rescan` re-enumerated the entire PCI bus,
+which could cause side effects when amdgpu was loaded.
 
-**Rationale:** The bus reset from Action Item 1 resets both `03:00.0` and
-`03:00.1` via the PCIe link (SBR hits all functions behind the bridge). If the
-audio device comes back in a clean power state after the bus reset, the PCI
-remove/rescan is unnecessary.
-
-**Next steps:**
-- Implement Action Item 1 first
-- Test a VM cycle with the bus reset but without the PCI remove/rescan
-- If `snd_hda_intel` binds cleanly to `03:00.1` after a direct bind (no
-  remove/rescan), remove the remove/rescan block
-- If it still fails (D3cold, failed power transition), keep the remove/rescan
+**Resolution:** The bus reset from Action Item 1 resets both `03:00.0` and
+`03:00.1` via the PCIe link (SBR hits all functions behind the bridge). After
+testing, `snd_hda_intel` binds cleanly to `03:00.1` with a direct bind — no
+PCI remove/rescan needed. The remove/rescan code was deleted from vm-overwatch.
 
 ## 3. Disable Auto HDR — prevent display pipeline mode switching
 
