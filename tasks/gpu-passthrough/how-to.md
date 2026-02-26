@@ -1,4 +1,4 @@
-# Daily Usage
+# How To
 
 **Start gaming**: Click the "Overwatch" desktop shortcut. vm-overwatch stops services (ollama, openrgb, GDM), switches the GPU to vfio-pci, starts the VM, blanks the iGPU (monitor auto-switches to DP), and tunes CPU performance. Takes ~15s from click to Windows desktop.
 

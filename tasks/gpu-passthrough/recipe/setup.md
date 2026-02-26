@@ -1,4 +1,4 @@
-# Rebuild Guide
+# Setup — Phases 1-8: Host Infrastructure
 
 ## Phase 1: BIOS Settings
 
@@ -217,7 +217,7 @@ This prevents libvirt from running any hook logic (which causes deadlocks with s
 
 ### 6.8 Passwordless sudo
 
-The desktop shortcut (Phase 9) runs `sudo systemctl start vm-overwatch` with `Terminal=false`, so there is no terminal to enter a password. The `myuser` user needs passwordless sudo for at least `systemctl`.
+The desktop shortcut (Phase 8) runs `sudo systemctl start vm-overwatch` with `Terminal=false`, so there is no terminal to enter a password. The `myuser` user needs passwordless sudo for at least `systemctl`.
 
 Create `/etc/sudoers.d/vm-overwatch`:
 ```
@@ -239,7 +239,7 @@ On the reinstalled system, this will be on the Samsung 990 PRO `@vms` subvolume 
 
 ### 7.2 Define the VM
 
-Use `virt-install` or import the XML from the VM XML Reference section. Key configuration:
+Use `virt-install` or import the XML from the [VM XML Reference](vm-xml-reference.md). Key configuration:
 
 | Setting | Value |
 |---|---|
@@ -318,24 +318,7 @@ All matched by vendor/product ID only — **no hardcoded bus/device addresses** 
 ```
 
 
-## Phase 8: Install Windows 11 + Overwatch
-
-1. Download the [virtio-win ISO](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso) to `/home/myuser/Downloads/virtio-win.iso` (referenced by VM XML)
-2. Attach a Windows 11 ISO to the VM
-3. Install Windows with UEFI + TPM 2.0
-4. Install AMD GPU drivers (Adrenalin) inside Windows
-5. Install VirtIO drivers (attach virtio-win.iso, install via Device Manager)
-6. Install QEMU Guest Agent (`qemu-ga-x86_64.msi` from virtio-win ISO)
-7. Install Battle.net (~738 MB) and Overwatch (~66 GB)
-8. Set Overwatch aspect ratio to **21:9** in game settings (for 3440x1440)
-9. Apply [Windows VM power settings](windows-configuration.md)
-10. Uninstall AMD HD Audio driver — see [GPU HDA Audio](windows-configuration.md#gpu-hda-audio-atihdasudioservice-removed)
-11. Set up [Defender exclusions](windows-configuration.md#windows-defender-boot-contention-intermittent-tdr)
-12. [Disable AMD telemetry](windows-configuration.md#disable-amd-telemetry-auepmaster)
-13. Disable Auto HDR, Game Bar, and Auto HDR system toast — see [Action Items](action-items.md) 3, 4, and 5
-
-
-## Phase 9: Desktop Shortcut
+## Phase 8: Desktop Shortcut
 
 Create `~/Desktop/start-vm.desktop`:
 ```ini
@@ -351,56 +334,51 @@ Categories=System;
 
 The shortcut starts the vm-overwatch systemd service. If the service is already running, `systemctl start` is a no-op. The service survives GDM stop/restart (no terminal dependency). Uses `sudo` for root operations (see Phase 6.8 for sudoers config).
 
-### 9.2 Windows shutdown signal (scheduled task)
 
-vm-overwatch listens on UDP port 9147 for a shutdown timing signal from the guest. A Windows scheduled task fires on any shutdown (Event ID 1074) and sends the signal automatically — no manual `.bat` shortcut needed.
+## CPU Isolation Architecture
 
-Install the notification script:
-```powershell
-mkdir C:\ProgramData\vm-overwatch -Force
+This is not a numbered phase — CPU isolation is built into vm-overwatch and the
+libvirt XML (Phase 7), not a manual step. Understanding the architecture helps
+with troubleshooting.
+
+vm-overwatch confines all host processes to core 0 during VM runtime, giving
+vCPU cores (1-7) zero host interference. This improves VFIO interrupt delivery
+latency, reduces boot-time TDR frequency, and provides better gaming frame
+consistency.
+
+### Libvirt XML (`cputune`)
+
+```xml
+<iothreads>1</iothreads>
+<cputune>
+  <vcpupin vcpu='0' cpuset='1'/>
+  <!-- ... vcpupin 1-6 on cpuset 2-7 ... -->
+  <emulatorpin cpuset='0'/>
+  <iothreadpin iothread='1' cpuset='0'/>
+</cputune>
 ```
 
-Copy `scripts/notify-host-shutdown.ps1` from this repo to `C:\ProgramData\vm-overwatch\notify-host-shutdown.ps1`. Contents:
-```powershell
-$udp = New-Object System.Net.Sockets.UdpClient
-$bytes = [System.Text.Encoding]::ASCII.GetBytes("shutdown")
-$udp.Send($bytes, $bytes.Length, "192.168.0.100", 9147)
-$udp.Close()
+- **emulatorpin**: Confines QEMU emulator thread to core 0. This thread handles
+  VFIO interrupt injection — pinning it prevents contention on vCPU cores.
+- **iothreadpin**: Confines the IO thread (disk, network) to core 0.
+
+### vm-overwatch: dynamic AllowedCPUs
+
+During VM runtime, `ensure_performance_tuning()` confines all host processes:
+
+```bash
+systemctl set-property --runtime -- system.slice AllowedCPUs=0
+systemctl set-property --runtime -- user.slice AllowedCPUs=0
+systemctl set-property --runtime -- init.scope AllowedCPUs=0
 ```
 
-Create the scheduled task (run in an elevated PowerShell):
-```powershell
-$trigger = New-ScheduledTaskTrigger -AtStartup  # placeholder, replaced by EventTrigger below
-$action = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\vm-overwatch\notify-host-shutdown.ps1"
-$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
-Register-ScheduledTask -TaskName "NotifyHostShutdown" -Action $action -Principal $principal -Force
+On restore, `ensure_cpu_defaults()` lifts the restriction:
 
-# Set the trigger to Event ID 1074 (system shutdown initiated)
-$task = Get-ScheduledTask -TaskName "NotifyHostShutdown"
-$task.Triggers = @(
-    $(New-Object Microsoft.PowerShell.Cmdletization.GeneratedTypes.ScheduledTask.CimTrigger)
-)
-# Use schtasks for the event trigger (PowerShell cmdlets don't support event triggers natively)
-schtasks /Change /TN "NotifyHostShutdown" /XML (
-    [xml]@"
-<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Triggers>
-    <EventTrigger>
-      <Subscription>&lt;QueryList&gt;&lt;Query Id="0"&gt;&lt;Select Path="System"&gt;*[System[EventID=1074]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
-    </EventTrigger>
-  </Triggers>
-  <Actions>
-    <Exec>
-      <Command>powershell.exe</Command>
-      <Arguments>-NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\vm-overwatch\notify-host-shutdown.ps1</Arguments>
-    </Exec>
-  </Actions>
-  <Principals><Principal><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
-  <Settings><Enabled>true</Enabled><AllowStartIfOnBatteries>true</AllowStartIfOnBatteries></Settings>
-</Task>
-"@ | Out-File "$env:TEMP\nhs.xml" -Encoding Unicode; "$env:TEMP\nhs.xml")
+```bash
+systemctl set-property --runtime -- system.slice AllowedCPUs=0-7
+systemctl set-property --runtime -- user.slice AllowedCPUs=0-7
+systemctl set-property --runtime -- init.scope AllowedCPUs=0-7
 ```
 
-Or more simply, create the task via Task Scheduler GUI: trigger on Event Log `System`, Event ID `1074`, action runs the PowerShell script as SYSTEM.
+Combined with IRQ pinning (all IRQs → core 0) and writeback migration, this
+ensures cores 1-7 run only VM vCPU threads during gameplay.

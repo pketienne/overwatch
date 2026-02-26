@@ -1,4 +1,6 @@
-# Windows Configuration
+# Configure — Phases 10-14: Tuning and Integration
+
+## Phase 10: Power Settings & AMD Driver Tuning
 
 GPU passthrough devices are owned by vfio-pci on the host — the Windows guest driver cannot perform actual hardware power transitions. Windows power management causes **BSOD 0x9F (DRIVER_POWER_STATE_FAILURE)** when it sends power IRPs that the guest AMD driver can't complete.
 
@@ -33,7 +35,7 @@ powercfg /setdcvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 94
 powercfg /setactive SCHEME_CURRENT
 ```
 
-## AMD Driver Internal Power Management
+### AMD Driver Internal Power Management
 
 The AMD GPU driver has its own power management independent of the Windows power
 plan. These must be disabled to prevent 0x9F BSODs during shutdown. The GPU is at
@@ -55,7 +57,8 @@ Set-ItemProperty -Path $regpath -Name DisableDrmdmaPowerOff -Value 1
 > **Note:** If Windows Update reinstalls the AMD driver, these values may be
 > reset. Verify after any driver update.
 
-## GPU HDA Audio: AtiHDAudioService Removed
+
+## Phase 11: GPU HDA Audio
 
 The GPU audio function (`03:00.1`) must be passed through to the VM (the AMD
 driver fails with Code 43 without it), but the AMD HD Audio driver
@@ -76,7 +79,10 @@ the SteelSeries Arctis Pro Wireless headset via USB passthrough).
 > **Note:** AMD Adrenalin driver updates may reinstall `AtiHDAudioService`.
 > vm-overwatch boot diagnostics monitor for this (HD Audio section in logs).
 
-## Windows Defender Boot Contention (Intermittent TDR)
+
+## Phase 12: Defender & Telemetry
+
+### Windows Defender Boot Contention (Intermittent TDR)
 
 **Root cause:** Windows Defender *service initialization* (~12s heavy CPU at boot
 for loading ~300MB definition databases, starting scan engines) creates CPU
@@ -99,15 +105,9 @@ dumps occur even at default TDR timeouts (TdrDelay=2, TdrDdiDelay=5).
 
 **Current mitigations (reduce frequency, don't eliminate):**
 
-### Host-side CPU isolation
-
-vm-overwatch confines all host processes to core 0 during VM runtime using
-systemd `AllowedCPUs`. Combined with libvirt `emulatorpin`/`iothreadpin` (core 0)
-and vCPU pinning (cores 1-7), this gives VM cores zero host interference.
-
-Test results: 2/3 clean boots (reduced from ~100% dump rate before mitigations).
-
-See "Host-Side CPU Isolation" section below for implementation.
+Host-side CPU isolation (AllowedCPUs confines host to core 0, emulatorpin/iothreadpin
+on core 0) reduces frequency to ~1 in 3 boots. See [CPU Isolation Architecture](setup.md#cpu-isolation-architecture)
+for implementation details.
 
 ### Defender exclusions for AMD driver paths
 
@@ -136,7 +136,7 @@ contention, but reduces runtime overhead):
 > `ScanAvgCPULoadFactor` which only affects scheduled scans, not the boot-time
 > service initialization that causes the contention.
 
-## Disable AMD Telemetry (AUEPMaster)
+### Disable AMD Telemetry (AUEPMaster)
 
 AMD User Experience Program (AUEPMaster.exe) consumes 30-54s CPU during boot,
 contributing to GPU init contention. It has two independent launch paths that
@@ -153,46 +153,109 @@ Disable-ScheduledTask -TaskName StartAUEP
 > **Note:** Disabling only the service is insufficient — AUEPMaster will still
 > launch via the `\StartAUEP` scheduled task. Check both paths.
 
-## Host-Side CPU Isolation
 
-vm-overwatch confines all host processes to core 0 during VM runtime, giving
-vCPU cores (1-7) zero host interference. This improves VFIO interrupt delivery
-latency, reduces boot-time TDR frequency, and provides better gaming frame
-consistency.
+## Phase 13: Display Configuration
 
-### Libvirt XML (`cputune`)
+### Disable Auto HDR
 
-```xml
-<iothreads>1</iothreads>
-<cputune>
-  <vcpupin vcpu='0' cpuset='1'/>
-  <!-- ... vcpupin 1-6 on cpuset 2-7 ... -->
-  <emulatorpin cpuset='0'/>
-  <iothreadpin iothread='1' cpuset='0'/>
-</cputune>
+Overwatch crashed on first launch with a runtime GPU TDR (WATCHDOG dump).
+Windows Auto HDR (Event ID 4125) dynamically toggles HDR per-application,
+causing display pipeline reconfiguration. During Overwatch's fullscreen + HDR
+initialization, this mode switch triggers a GPU timeout at the default 2-second
+TDR deadline. Second launch succeeds because the display is already configured.
+
+Disable Auto HDR globally while keeping native HDR enabled:
+
+```powershell
+# Registry: HKU\<SID>\SOFTWARE\Microsoft\DirectX\UserGpuPreferences
+# Set global AutoHDREnable=0 (HDR stays on natively, Auto HDR off)
+# Remove any per-app Auto HDR overrides (e.g. Overwatch had AutoHDREnable=2097)
 ```
 
-- **emulatorpin**: Confines QEMU emulator thread to core 0. This thread handles
-  VFIO interrupt injection — pinning it prevents contention on vCPU cores.
-- **iothreadpin**: Confines the IO thread (disk, network) to core 0.
+The registry path is per-user under `DirectXUserGlobalSettings`. The global
+setting `SwapEffectUpgradeEnable=1;AutoHDREnable=0;` keeps HDR on but prevents
+Windows from dynamically toggling it.
 
-### vm-overwatch: dynamic AllowedCPUs
+### Disable Game Bar
 
-During VM runtime, `ensure_performance_tuning()` confines all host processes:
+Xbox Game Bar shows Auto HDR recommendation toasts when launching games with HDR
+available but Auto HDR disabled. Game Bar features (recording, overlay,
+performance monitoring) are unnecessary in a VM.
 
-```bash
-systemctl set-property --runtime -- system.slice AllowedCPUs=0
-systemctl set-property --runtime -- user.slice AllowedCPUs=0
-systemctl set-property --runtime -- init.scope AllowedCPUs=0
+```powershell
+# Machine-wide policy
+New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" -Force
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" -Name "AllowGameDVR" -Value 0 -Type DWord
+
+# User settings
+Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\GameBar" -Name "UseNexusForGameBarEnabled" -Value 0 -Type DWord
+Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" -Name "AppCaptureEnabled" -Value 0 -Type DWord
 ```
 
-On restore, `ensure_cpu_defaults()` lifts the restriction:
+### Disable Auto HDR system toast notification
 
-```bash
-systemctl set-property --runtime -- system.slice AllowedCPUs=0-7
-systemctl set-property --runtime -- user.slice AllowedCPUs=0-7
-systemctl set-property --runtime -- init.scope AllowedCPUs=0-7
+Even with Game Bar disabled, Windows shows an Auto HDR recommendation toast via
+the system notification `Windows.SystemToast.Graphics.AutoHDR`. This is a
+separate notification source from Game Bar.
+
+```powershell
+# Per-user notification setting (use HKU\<SID> for guest agent, HKCU for interactive)
+$path = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.Graphics.AutoHDR"
+New-Item -Path $path -Force
+Set-ItemProperty -Path $path -Name "Enabled" -Value 0 -Type DWord
 ```
 
-Combined with IRQ pinning (all IRQs → core 0) and writeback migration, this
-ensures cores 1-7 run only VM vCPU threads during gameplay.
+
+## Phase 14: Shutdown Signal
+
+vm-overwatch listens on UDP port 9147 for a shutdown timing signal from the guest. A Windows scheduled task fires on any shutdown (Event ID 1074) and sends the signal automatically — no manual `.bat` shortcut needed.
+
+Install the notification script:
+```powershell
+mkdir C:\ProgramData\vm-overwatch -Force
+```
+
+Copy `scripts/notify-host-shutdown.ps1` from this repo to `C:\ProgramData\vm-overwatch\notify-host-shutdown.ps1`. Contents:
+```powershell
+$udp = New-Object System.Net.Sockets.UdpClient
+$bytes = [System.Text.Encoding]::ASCII.GetBytes("shutdown")
+$udp.Send($bytes, $bytes.Length, "192.168.0.100", 9147)
+$udp.Close()
+```
+
+Create the scheduled task (run in an elevated PowerShell):
+```powershell
+$trigger = New-ScheduledTaskTrigger -AtStartup  # placeholder, replaced by EventTrigger below
+$action = New-ScheduledTaskAction -Execute "powershell.exe" `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\vm-overwatch\notify-host-shutdown.ps1"
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+Register-ScheduledTask -TaskName "NotifyHostShutdown" -Action $action -Principal $principal -Force
+
+# Set the trigger to Event ID 1074 (system shutdown initiated)
+$task = Get-ScheduledTask -TaskName "NotifyHostShutdown"
+$task.Triggers = @(
+    $(New-Object Microsoft.PowerShell.Cmdletization.GeneratedTypes.ScheduledTask.CimTrigger)
+)
+# Use schtasks for the event trigger (PowerShell cmdlets don't support event triggers natively)
+schtasks /Change /TN "NotifyHostShutdown" /XML (
+    [xml]@"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <EventTrigger>
+      <Subscription>&lt;QueryList&gt;&lt;Query Id="0"&gt;&lt;Select Path="System"&gt;*[System[EventID=1074]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+    </EventTrigger>
+  </Triggers>
+  <Actions>
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>-NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\vm-overwatch\notify-host-shutdown.ps1</Arguments>
+    </Exec>
+  </Actions>
+  <Principals><Principal><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings><Enabled>true</Enabled><AllowStartIfOnBatteries>true</AllowStartIfOnBatteries></Settings>
+</Task>
+"@ | Out-File "$env:TEMP\nhs.xml" -Encoding Unicode; "$env:TEMP\nhs.xml")
+```
+
+Or more simply, create the task via Task Scheduler GUI: trigger on Event Log `System`, Event ID `1074`, action runs the PowerShell script as SYSTEM.
