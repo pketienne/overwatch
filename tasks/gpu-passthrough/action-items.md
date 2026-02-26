@@ -63,29 +63,49 @@ Three-layer isolation: libvirt `emulatorpin`/`iothreadpin` on core 0, vm-overwat
 
 ---
 
-## 7. Eliminate remaining WATCHDOG TDR dumps (~1 in 3 boots) — Resolved
+## 7. Eliminate remaining WATCHDOG TDR dumps (~1 in 3 boots)
 
-**Status:** Resolved — GPU hot-plug after boot
+**Status:** Open — two options to evaluate
 
 **Problem:** Intermittent non-fatal `VIDEO_DXGKRNL_LIVEDUMP` (0x1B0) WATCHDOG
-dumps at ~T+49s and ~T+78s after boot. Initially attributed to Windows Defender
-(`MsMpEng`) CPU contention, but the actual root cause was DxgKrnl initializing
-the WDDM driver on the VFIO GPU during Windows boot — the GPU was present from
-VM start, so the driver init competed with all other boot-time activity.
+dumps at ~T+49s and ~T+78s after boot. Root cause is DxgKrnl initializing the
+WDDM driver on the VFIO GPU during boot contention (proven by BasicDisplay test
+— not AMD-specific).
 
-**Root cause:** DxgKrnl WDDM init on a GPU that's present at boot time. The
-driver init window (~T+21-49s) overlaps with boot contention regardless of
-Defender — Defender amplifies it but isn't the fundamental cause.
+**Previous attempts:**
+- TdrDelay increase to 25s — dumps persisted (60-120s never tested)
+- Defender exclusions — reduced from 2 dumps to 1, not eliminated
+- Deferred driver load (Disable-PnpDevice/Enable-PnpDevice) — 1/5 dumps, PnP
+  state corruption on repeated cycles
+- GPU hot-plug after boot — 0/5 dumps but **no display output** (WDDM can't
+  register hot-added display adapters). See
+  [case study](../troubleshooting-methodology/case-studies.md#gpu-hot-plug-attempt-method-2).
 
-**Fix:** Hot-plug the GPU after Windows boots instead of including it in the
-persistent VM XML. `vm-overwatch` now:
-1. Starts the VM without GPU hardware (hostdevs removed from persistent config)
-2. Waits for the QEMU guest agent (confirms Windows boot is complete)
-3. Hot-plugs GPU via `virsh attach-device --live`, then GPU audio 1s later
+### 7a. Increase TDR timeout to 60-120s
 
-**Test results:** 0/5 cycles with hot-plug produced WATCHDOG dumps vs 3/5 with
-GPU present at boot. The DxgKrnl init happens post-boot with no contention,
-eliminating the TDR timeout entirely.
+Set `TdrDelay` and `TdrDdiDelay` to 60s (or higher) in the guest registry. The
+dumps are non-fatal livedumps — the GPU recovers on its own. A longer timeout
+gives DxgKrnl more time to complete WDDM init under contention, preventing the
+timeout from firing. No impact on normal boot time (timeout only matters if the
+GPU doesn't respond). Previous testing only went up to 25s; subagent research
+recommended 60-120s but this was never tested.
 
-**Implementation:** `ensure_gpu_hotplugged()` in vm-overwatch.sh. GPU/audio PCI
-hostdevs removed from persistent VM config — managed entirely by vm-overwatch.
+Downside: if the GPU actually hangs during gameplay, recovery takes 60s instead
+of 2s. Acceptable tradeoff given actual hangs are rare.
+
+Registry keys:
+```
+HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\TdrDelay = 60 (DWORD)
+HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\TdrDdiDelay = 60 (DWORD)
+```
+
+### 7b. Combine hot-plug with a display solution
+
+Hot-plug eliminates 100% of dumps (0/5) but WDDM doesn't register hot-added
+display adapters. If a method exists to activate display output on a hot-plugged
+GPU, this would be the ideal fix. Potential avenues:
+- Looking Glass (shared memory framebuffer — host renders guest output)
+- QEMU virtual display + GPU compute-only passthrough
+- Future Windows/WDDM updates that support hot-added display adapters
+
+This is a research item, not an immediate fix.
