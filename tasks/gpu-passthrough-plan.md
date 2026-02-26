@@ -386,6 +386,8 @@ All matched by vendor/product ID only — **no hardcoded bus/device addresses** 
 8. Set Overwatch aspect ratio to **21:9** in game settings (for 3440x1440)
 9. Apply Windows VM power settings (see section below)
 10. Disable GPU HDA audio device (see "Disable GPU HDA Audio Device" section below)
+11. Set up Defender boot deferral (see "Defer Windows Defender During Boot" section below)
+12. Disable AMD telemetry (see "Disable AMD Telemetry" section below)
 
 ---
 
@@ -768,26 +770,95 @@ the SteelSeries Arctis Pro Wireless headset via USB passthrough).
 > **Note:** AMD Adrenalin driver updates may reinstall `AtiHDAudioService`.
 > vm-overwatch boot diagnostics monitor for this (HD Audio section in logs).
 
-### TDR Timeout for GPU Passthrough
+### Defer Windows Defender During Boot (TDR Fix)
 
-The AMD display driver takes longer to initialize after VFIO handoff than a cold
-boot (~5s for DWM first frame composition). The default `TdrDelay` of 2s causes
-`VIDEO_TDR_TIMEOUT_DETECTED` (0x141) live kernel dumps on every boot. Fix:
-increase TDR timeouts in the registry.
+**Root cause:** Windows Defender real-time scanning (MsMpEng, ~45-51s CPU) during
+boot creates enough CPU/IO contention to trigger `VIDEO_DXGKRNL_LIVEDUMP`
+(0x1B0) WATCHDOG dumps during AMD GPU driver initialization. With Defender
+disabled, zero dumps occur even at default TDR timeouts (TdrDelay=2, TdrDdiDelay=5).
+
+**Fix:** Defer Defender real-time monitoring for 90 seconds at boot via registry
+policy, then re-enable automatically.
+
+#### Step 1: Registry policy to disable RT monitoring at boot
+
+The policy key is read by WinDefend at service start, so real-time monitoring is
+off from the very beginning of boot:
 
 ```powershell
-$path = "HKLM:\System\CurrentControlSet\Control\GraphicsDrivers"
-Set-ItemProperty -Path $path -Name TdrDelay -Value 8 -Type DWord
-Set-ItemProperty -Path $path -Name TdrDdiDelay -Value 20 -Type DWord
+New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" -Force
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" `
+    -Name DisableRealtimeMonitoring -Value 1 -Type DWord -Force
 ```
 
-| Key | Value | Default | Why |
-|-----|-------|---------|-----|
-| `TdrDelay` | 8 | 2 | GPU scheduler wait before declaring TDR |
-| `TdrDdiDelay` | 20 | 5 | OS wait for threads inside display driver |
+#### Step 2: Scheduled task to re-enable after 90 seconds
 
-No impact on boot speed (timeouts, not delays). A real GPU hang takes 8s instead
-of 2s before Windows reacts — negligible in practice.
+Create a script at `C:\ProgramData\vm-overwatch\DeferDefenderEnable.ps1`:
+
+```powershell
+Start-Sleep -Seconds 90
+Remove-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" -Force -Recurse -EA SilentlyContinue
+Set-MpPreference -DisableRealtimeMonitoring $false
+Restart-Service WinDefend -Force -EA SilentlyContinue
+```
+
+Register the scheduled task:
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "powershell.exe" `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\vm-overwatch\DeferDefenderEnable.ps1"
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$principal = New-ScheduledTaskPrincipal -UserId SYSTEM -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName "DeferDefenderEnable" -Action $action `
+    -Trigger $trigger -Principal $principal -Settings $settings -Force
+```
+
+#### Step 3: Defender exclusions for AMD driver paths
+
+These reduce Defender scanning of GPU driver files even after real-time
+monitoring is re-enabled:
+
+```powershell
+# Path exclusions
+@("C:\Program Files\AMD",
+  "C:\Windows\System32\amd*", "C:\Windows\SysWOW64\amd*",
+  "C:\Windows\System32\ati*", "C:\Windows\SysWOW64\ati*",
+  "C:\Windows\System32\drivers\amd*",
+  "C:\Windows\System32\DriverStore\FileRepository\u0*"
+) | ForEach-Object { Add-MpPreference -ExclusionPath $_ }
+
+# Process exclusions
+@("amdfendrsr.exe","atiesrxx.exe","atieclxx.exe","RadeonSoftware.exe",
+  "AMDRSServ.exe","AMDRSSrcExt.exe","amdow.exe","cncmd.exe","CPUMetricsServer.exe"
+) | ForEach-Object { Add-MpPreference -ExclusionProcess $_ }
+```
+
+> **Note:** Tamper Protection must be off to set the registry policy
+> programmatically. Re-enable Tamper Protection from Windows Security settings
+> once the fix is confirmed stable. The scheduled task and exclusions work
+> regardless of Tamper Protection state.
+
+> **Security impact:** Minimal. The 90-second window is during headless VM boot
+> with no user interaction — only signed OS services and drivers are executing.
+> Defender resumes full real-time scanning automatically after GPU init completes.
+
+### Disable AMD Telemetry (AUEPMaster)
+
+AMD User Experience Program (AUEPMaster.exe) consumes 30-54s CPU during boot,
+contributing to GPU init contention. It has two independent launch paths that
+must both be disabled:
+
+```powershell
+# Disable the service
+sc.exe config AUEPLauncher start=disabled
+
+# Disable the scheduled task (this is the one that actually launches it)
+Disable-ScheduledTask -TaskName StartAUEP
+```
+
+> **Note:** Disabling only the service is insufficient — AUEPMaster will still
+> launch via the `\StartAUEP` scheduled task. Check both paths.
 
 ---
 
@@ -818,7 +889,7 @@ of 2s before Windows reacts — negligible in practice.
 | Windows BSOD 0x9F DRIVER_POWER_STATE_FAILURE | Windows "Balanced" power plan sends power IRPs to passthrough GPU/USB devices; vfio-pci owns the hardware so guest driver can't complete power transitions | Switch to **High Performance** power plan; disable PCI Express ASPM, USB selective suspend, display timeout, sleep, hybrid sleep (see Windows VM Power Settings section) |
 | Frequent 0x9F BSODs after Windows Update | Windows Update pushed AMD driver 31.0.14000.58004 (Feb 2026) which corrupts GPU state every 2-5 min during gameplay | Roll back via Device Manager -> Display adapters -> Roll Back Driver. Block reinstall: Settings -> Windows Update -> Pause updates, or `wushowhide.diagcab` to hide the driver update. Known-good driver: Radeon Software 32.0.23017.1001 (2026-01-08) |
 | Windows BSOD 0x9F during shutdown specifically | `HDAudBus!HdaController::TransferCodecVerbs` blocks waiting for GPU HDA audio codec to respond during power-down (`IRP_MN_SET_POWER` to D1); codec never responds because it's behind vfio-pci | Uninstall AtiHDAudioService driver (`pnputil /delete-driver oem39.inf /force`); Windows generic HD Audio driver handles the device without triggering the issue. GPU audio PCI function (`03:00.1`) must still be passed through (AMD driver Code 43 without it). Also disable AMD driver power features via registry (see Power Settings section) |
-| WATCHDOG/AMD_WATCHDOG live kernel dumps on every VM boot | AMD display driver init after VFIO handoff takes >2s (default TdrDelay); DWM first frame composition triggers `VIDEO_TDR_TIMEOUT_DETECTED` (0x141) | Set `TdrDelay=8` and `TdrDdiDelay=20` in `HKLM\System\CurrentControlSet\Control\GraphicsDrivers`. Timeouts not delays — no boot speed impact |
+| WATCHDOG/AMD_WATCHDOG live kernel dumps on every VM boot | Windows Defender real-time scanning (~45-51s CPU) during boot creates CPU/IO contention during AMD GPU driver init, triggering `VIDEO_DXGKRNL_LIVEDUMP` (0x1B0). Two dumps per boot at T+49s and T+78s. AUEPMaster telemetry (~30s CPU) compounds the contention. | Defer Defender via registry policy for 90s at boot (see "Defer Windows Defender During Boot" section). Disable AUEPMaster (service + scheduled task). Add Defender exclusions for AMD paths. Default TDR timeouts (TdrDelay=2, TdrDdiDelay=5) work fine with Defender deferred. |
 | amdgpu bind hangs after VM passthrough (`trn=2 ACK should not assert`) | GPU SMU mailbox stuck after heavy GPU usage in VM (e.g. gaming); VFIO release doesn't fully reset the GPU, amdgpu probe loops forever on SMU communication | Reboot required. This is a hardware-level issue — the GPU needs a full PCI bus reset that only a machine reboot provides. Lightweight test cycles may restore fine but extended gaming sessions can leave the GPU in an unrecoverable state |
 | Monitor doesn't auto-switch to DP when VM starts | iGPU HDMI stays active, monitor doesn't detect DP | Blank iGPU framebuffer (`echo 4 > /sys/class/graphics/fbN/blank`) when VM starts; monitor auto-detects to DP. fb matched by PCI device path, not hardcoded number. vm-overwatch handles this |
 
