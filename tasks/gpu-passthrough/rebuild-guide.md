@@ -151,7 +151,7 @@ Source is in this repo at `scripts/vm-overwatch.sh`. The script manages the full
 
 1. **Pre-VM**: Stop services (ollama, openrgb, GDM) → release device FDs (`fuser -k` on DRM and i2c devices) → unbind VT consoles → unbind snd_hda_intel from GPU audio → unbind amdgpu → bind GPU + audio to vfio-pci
 2. **VM running**: Start VM → re-attach USB devices (Kinesis, Tartarus detach/reattach to clear ghost entries) → blank iGPU → set CPU governor to `performance`, pin all IRQs to CPU 0, stop irqbalance, move RCU callbacks to CPU 0
-3. **Post-VM**: Restore CPU governor to `powersave`, restart irqbalance → unbind vfio-pci → rebind VT consoles → bind amdgpu → PCI remove+rescan GPU audio (re-enumerates from D3cold) → disable runtime PM → unblank iGPU → restart services
+3. **Post-VM**: Restore CPU governor to `powersave`, restart irqbalance → unbind vfio-pci → PCIe bus reset (SBR) → rebind VT consoles → bind amdgpu → direct bind snd_hda_intel (no PCI rescan) → disable runtime PM → unblank iGPU → restart services
 
 ### 6.2 vm-overwatch systemd service
 
@@ -328,11 +328,11 @@ All matched by vendor/product ID only — **no hardcoded bus/device addresses** 
 6. Install QEMU Guest Agent (`qemu-ga-x86_64.msi` from virtio-win ISO)
 7. Install Battle.net (~738 MB) and Overwatch (~66 GB)
 8. Set Overwatch aspect ratio to **21:9** in game settings (for 3440x1440)
-9. Apply Windows VM power settings (see section below)
-10. Disable GPU HDA audio device (see "Disable GPU HDA Audio Device" section below)
-11. Set up Defender exclusions (see "Windows Defender Boot Contention" section below)
-12. Disable AMD telemetry (see "Disable AMD Telemetry" section below)
-13. Disable Auto HDR, Game Bar, and Auto HDR system toast (see Action Items 3, 4, and 5)
+9. Apply [Windows VM power settings](windows-configuration.md)
+10. Uninstall AMD HD Audio driver — see [GPU HDA Audio](windows-configuration.md#gpu-hda-audio-atihdasudioservice-removed)
+11. Set up [Defender exclusions](windows-configuration.md#windows-defender-boot-contention-intermittent-tdr)
+12. [Disable AMD telemetry](windows-configuration.md#disable-amd-telemetry-auepmaster)
+13. Disable Auto HDR, Game Bar, and Auto HDR system toast — see [Action Items](action-items.md) 3, 4, and 5
 
 
 ## Phase 9: Desktop Shortcut

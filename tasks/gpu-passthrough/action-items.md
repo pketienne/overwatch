@@ -131,4 +131,4 @@ contributing to boot-time Defender contention.
 **Results:** Reduced WATCHDOG dump frequency from ~100% to ~33% (2/3 clean boots).
 Runtime gaming benefits: cleaner frame delivery, zero host interference on VM cores.
 
-See "Host-Side CPU Isolation" section above for full implementation details.
+See [Host-Side CPU Isolation](windows-configuration.md#host-side-cpu-isolation) for full implementation details.
