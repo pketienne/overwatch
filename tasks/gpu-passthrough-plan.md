@@ -396,8 +396,9 @@ All matched by vendor/product ID only — **no hardcoded bus/device addresses** 
 8. Set Overwatch aspect ratio to **21:9** in game settings (for 3440x1440)
 9. Apply Windows VM power settings (see section below)
 10. Disable GPU HDA audio device (see "Disable GPU HDA Audio Device" section below)
-11. Set up Defender boot deferral (see "Defer Windows Defender During Boot" section below)
+11. Set up Defender boot throttle (see "Defer Windows Defender During Boot" section below)
 12. Disable AMD telemetry (see "Disable AMD Telemetry" section below)
+13. Disable Auto HDR and Game Bar (see Action Items 3 and 4)
 
 ---
 
@@ -787,49 +788,33 @@ boot creates enough CPU/IO contention to trigger `VIDEO_DXGKRNL_LIVEDUMP`
 (0x1B0) WATCHDOG dumps during AMD GPU driver initialization. With Defender
 disabled, zero dumps occur even at default TDR timeouts (TdrDelay=2, TdrDdiDelay=5).
 
-**Fix:** Defer Defender real-time monitoring for 90 seconds at boot via registry
-policy, then re-enable automatically.
+**Fix:** Throttle Defender scan CPU usage during boot, combined with AMD driver
+path exclusions.
 
-#### Step 1: Registry policy to disable RT monitoring at boot
-
-The policy key is read by WinDefend at service start, so real-time monitoring is
-off from the very beginning of boot:
-
-```powershell
-New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" -Force
-Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" `
-    -Name DisableRealtimeMonitoring -Value 1 -Type DWord -Force
-```
-
-#### Step 2: Scheduled task to re-enable after 90 seconds
+#### Step 1: Scheduled task to throttle scans during boot
 
 Create a script at `C:\ProgramData\vm-overwatch\DeferDefenderEnable.ps1`:
 
 ```powershell
-# Defer Defender real-time monitoring during boot to prevent GPU TDR
-# Policy value 1 = disabled at boot. After 90s, flip to 0, restart service, then re-arm to 1.
+# DeferDefenderEnable.ps1 — Throttle Defender CPU during boot GPU init window
+# Reduces scan CPU load to 1% for 90s, then restores default (50%).
 
-$policyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection"
-
+Set-MpPreference -ScanAvgCPULoadFactor 1 -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 90
-
-# Re-enable Defender: set policy to 0 (allow), restart service
-Set-ItemProperty -Path $policyPath -Name DisableRealtimeMonitoring -Value 0 -Type DWord
-Restart-Service WinDefend -Force -ErrorAction SilentlyContinue
-
-# Wait for service to pick up the new policy
-Start-Sleep -Seconds 10
-
-# Re-arm for next boot: set policy back to 1 (disable)
-# WinDefend already started with value=0, so this only takes effect on next service start
-Set-ItemProperty -Path $policyPath -Name DisableRealtimeMonitoring -Value 1 -Type DWord
+Set-MpPreference -ScanAvgCPULoadFactor 50 -ErrorAction SilentlyContinue
 ```
 
-> **Important**: The script toggles the policy value rather than removing the key.
-> This ensures the policy is always armed (value=1) at rest, so subsequent boots
-> start with Defender deferred. The running WinDefend service does not re-read the
-> policy mid-session, so setting it back to 1 after restart has no effect until the
-> next boot.
+> **Note:** `ScanAvgCPULoadFactor` controls scheduled/on-demand scan CPU usage.
+> Real-time protection (on-access scanning) is not directly throttled by this
+> setting, but combined with the AMD path exclusions below it significantly
+> reduces Defender's boot-time CPU footprint.
+>
+> **Why not use `DisableRealtimeMonitoring` policy?** The registry policy approach
+> (`HKLM:\...\Real-Time Protection\DisableRealtimeMonitoring=1`) has a catch-22:
+> it requires Tamper Protection off to write programmatically, but with Tamper
+> Protection off, once RTP is disabled at boot it becomes sticky for the session
+> — no combination of policy removal, service restart, gpupdate, or
+> `Set-MpPreference` re-enables it without a reboot.
 
 Register the scheduled task:
 
@@ -843,10 +828,9 @@ Register-ScheduledTask -TaskName "DeferDefenderEnable" -Action $action `
     -Trigger $trigger -Principal $principal -Settings $settings -Force
 ```
 
-#### Step 3: Defender exclusions for AMD driver paths
+#### Step 2: Defender exclusions for AMD driver paths
 
-These reduce Defender scanning of GPU driver files even after real-time
-monitoring is re-enabled:
+These reduce real-time protection scanning of GPU driver files:
 
 ```powershell
 # Path exclusions
@@ -863,14 +847,9 @@ monitoring is re-enabled:
 ) | ForEach-Object { Add-MpPreference -ExclusionProcess $_ }
 ```
 
-> **Note:** Tamper Protection must be off to set the registry policy
-> programmatically. Re-enable Tamper Protection from Windows Security settings
-> once the fix is confirmed stable. The scheduled task and exclusions work
-> regardless of Tamper Protection state.
-
-> **Security impact:** Minimal. The 90-second window is during headless VM boot
-> with no user interaction — only signed OS services and drivers are executing.
-> Defender resumes full real-time scanning automatically after GPU init completes.
+> **Security:** Tamper Protection should be ON. The `ScanAvgCPULoadFactor` setting
+> and exclusions work regardless of Tamper Protection state. Defender real-time
+> protection stays fully enabled throughout boot — only scan CPU is throttled.
 
 ### Disable AMD Telemetry (AUEPMaster)
 
@@ -918,7 +897,7 @@ Disable-ScheduledTask -TaskName StartAUEP
 | Windows BSOD 0x9F DRIVER_POWER_STATE_FAILURE | Windows "Balanced" power plan sends power IRPs to passthrough GPU/USB devices; vfio-pci owns the hardware so guest driver can't complete power transitions | Switch to **High Performance** power plan; disable PCI Express ASPM, USB selective suspend, display timeout, sleep, hybrid sleep (see Windows VM Power Settings section) |
 | Frequent 0x9F BSODs after Windows Update | Windows Update pushed AMD driver 31.0.14000.58004 (Feb 2026) which corrupts GPU state every 2-5 min during gameplay | Roll back via Device Manager -> Display adapters -> Roll Back Driver. Block reinstall: Settings -> Windows Update -> Pause updates, or `wushowhide.diagcab` to hide the driver update. Known-good driver: Radeon Software 32.0.23017.1001 (2026-01-08) |
 | Windows BSOD 0x9F during shutdown specifically | `HDAudBus!HdaController::TransferCodecVerbs` blocks waiting for GPU HDA audio codec to respond during power-down (`IRP_MN_SET_POWER` to D1); codec never responds because it's behind vfio-pci | Uninstall AtiHDAudioService driver (`pnputil /delete-driver oem39.inf /force`); Windows generic HD Audio driver handles the device without triggering the issue. GPU audio PCI function (`03:00.1`) must still be passed through (AMD driver Code 43 without it). Also disable AMD driver power features via registry (see Power Settings section) |
-| WATCHDOG/AMD_WATCHDOG live kernel dumps on every VM boot | Windows Defender real-time scanning (~45-51s CPU) during boot creates CPU/IO contention during AMD GPU driver init, triggering `VIDEO_DXGKRNL_LIVEDUMP` (0x1B0). Two dumps per boot at T+49s and T+78s. AUEPMaster telemetry (~30s CPU) compounds the contention. | Defer Defender via registry policy for 90s at boot (see "Defer Windows Defender During Boot" section). Disable AUEPMaster (service + scheduled task). Add Defender exclusions for AMD paths. Default TDR timeouts (TdrDelay=2, TdrDdiDelay=5) work fine with Defender deferred. |
+| WATCHDOG/AMD_WATCHDOG live kernel dumps on every VM boot | Windows Defender real-time scanning (~45-51s CPU) during boot creates CPU/IO contention during AMD GPU driver init, triggering `VIDEO_DXGKRNL_LIVEDUMP` (0x1B0). Two dumps per boot at T+49s and T+78s. AUEPMaster telemetry (~30s CPU) compounds the contention. | Throttle Defender scan CPU to 1% for 90s at boot (see "Defer Windows Defender During Boot" section). Disable AUEPMaster (service + scheduled task). Add Defender exclusions for AMD paths. Default TDR timeouts (TdrDelay=2, TdrDdiDelay=5) work fine with Defender throttled. |
 | amdgpu bind hangs after VM passthrough (`trn=2 ACK should not assert`) | GPU SMU mailbox stuck after heavy GPU usage in VM (e.g. gaming); VFIO release doesn't fully reset the GPU, amdgpu probe loops forever on SMU communication | Reboot required. This is a hardware-level issue — the GPU needs a full PCI bus reset that only a machine reboot provides. Lightweight test cycles may restore fine but extended gaming sessions can leave the GPU in an unrecoverable state |
 | Monitor doesn't auto-switch to DP when VM starts | iGPU HDMI stays active, monitor doesn't detect DP | Blank iGPU framebuffer (`echo 4 > /sys/class/graphics/fbN/blank`) when VM starts; monitor auto-detects to DP. fb matched by PCI device path, not hardcoded number. vm-overwatch handles this |
 
@@ -979,35 +958,48 @@ remove/rescan is unnecessary.
   remove/rescan), remove the remove/rescan block
 - If it still fails (D3cold, failed power transition), keep the remove/rescan
 
-### 3. Test: disable Auto HDR to isolate hiccup root cause
+### 3. Disable Auto HDR — prevent display pipeline mode switching
 
-**Status:** Pending
+**Status:** Done
 
-**Problem:** Overwatch gameplay hiccups (brief screen freezes) occur most reliably
-at match→menu transitions. Display event instrumentation shows Windows Auto HDR
-(Event ID 4125) activating every session. Each HDR mode switch reconfigures the
-display pipeline, which in exclusive fullscreen can cause a visible stall. Alt+tab
-instantly fixes the hiccup (forces a clean fullscreen exit/re-entry).
+**Problem:** Overwatch crashed on first launch with a runtime GPU TDR (WATCHDOG
+dump). Windows Auto HDR (Event ID 4125) dynamically toggles HDR per-application,
+causing display pipeline reconfiguration. During Overwatch's fullscreen + HDR
+initialization, this mode switch triggers a GPU timeout at the default 2-second
+TDR deadline. Second launch succeeds because the display is already configured.
 
-**Goal:** Determine whether Auto HDR mode switching is the root cause. This is a
-diagnostic test only — HDR should remain enabled in the final configuration.
+**Fix:** Disable Auto HDR globally while keeping native HDR enabled. This
+eliminates per-app mode switching while preserving HDR output.
 
-**Test:** Windows Settings → System → Display → HDR → turn off Auto HDR. Play
-several matches and observe whether match→menu hiccups still occur. Re-enable
-Auto HDR after testing.
+```powershell
+# Registry: HKU\<SID>\SOFTWARE\Microsoft\DirectX\UserGpuPreferences
+# Set global AutoHDREnable=0 (HDR stays on natively, Auto HDR off)
+# Remove any per-app Auto HDR overrides (e.g. Overwatch had AutoHDREnable=2097)
+```
 
-### 4. Test: force HDR always-on to prevent mode switching
+The registry path is per-user under `DirectXUserGlobalSettings`. The global
+setting `SwapEffectUpgradeEnable=1;AutoHDREnable=0;` keeps HDR on but prevents
+Windows from dynamically toggling it.
 
-**Status:** Pending — test after Action Item 3 confirms HDR is the cause
+### 4. Disable Game Bar — suppress game overlay and toasts
 
-**Problem:** If Action Item 3 confirms HDR mode switching causes the hiccups, the
-fix is to keep HDR always-on rather than letting Windows toggle it per-app. This
-avoids the display pipeline reconfiguration while preserving HDR output.
+**Status:** Done
 
-**Test:** Windows Settings → System → Display → HDR → keep HDR enabled, disable
-Auto HDR. Ensure Overwatch uses HDR natively (Video settings → HDR Display). Play
-several matches and observe whether match→menu hiccups still occur with HDR
-permanently active.
+**Problem:** Xbox Game Bar shows Auto HDR recommendation toasts when launching
+games with HDR available but Auto HDR disabled. Game Bar features (recording,
+overlay, performance monitoring) are unnecessary in a VM.
+
+**Fix:** Disable Game Bar entirely:
+
+```powershell
+# Machine-wide policy
+New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" -Force
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" -Name "AllowGameDVR" -Value 0 -Type DWord
+
+# User settings
+Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\GameBar" -Name "UseNexusForGameBarEnabled" -Value 0 -Type DWord
+Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" -Name "AppCaptureEnabled" -Value 0 -Type DWord
+```
 
 ---
 
