@@ -331,6 +331,36 @@ where the audio device was in D3cold with no driver managing it. The fix
 (PCI remove + rescan to re-enumerate in a clean state) specifically targeted
 that window.
 
+### Example: Boot-Time TDR Dump Investigation
+
+Two WATCHDOG live kernel dumps appeared every boot at T+49s and T+78s. Event
+logs showed no corresponding errors — just WER `LiveKernelEvent` entries with
+bugcheck `0x1B0` (`VIDEO_DXGKRNL_LIVEDUMP`). The binary dumps required WinDbg
+to decode, but the *timing* was diagnostic on its own.
+
+Building a process timeline via `Get-Process | Sort-Object StartTime` with CPU
+consumption revealed:
+
+```
+Boot: 19:14:51
+T+21s  AMD kernel services: amdfendrsr, atiesrxx, atieclxx (0.2-0.4s CPU)
+T+23s  AUEPMaster (AMD telemetry) — 30.5s CPU
+T+23s  MsMpEng (Defender) — 51.2s CPU
+T+43s  RadeonSoftware — 2.1s CPU
+T+49s  *** WATCHDOG dump 1 ***  (GPU driver init under heavy contention)
+T+77s  ctfmon (text services)
+T+78s  *** WATCHDOG dump 2 ***  (display pipeline initialization)
+T+82s  dwm (Desktop Window Manager starts)
+T+83s  AMDRSServ (AMD Radeon Settings)
+```
+
+The two TDR dumps correlated with the GPU driver being initialized while
+AUEPMaster (30.5s CPU) and MsMpEng (51.2s CPU) were hammering the system.
+The dumps weren't caused by a single bad component — they were caused by
+*contention during GPU initialization*. This led to disabling AUEPMaster
+(freeing 30s of boot CPU) and identified Defender as the next-largest
+contributor.
+
 ### The principle
 
 **When a failure crosses system boundaries, build a unified timeline.** Use
@@ -486,6 +516,22 @@ actual root cause.
 The iGPU blanking removal assumed the monitor would auto-switch. It didn't.
 The code had to be restored. Always test assumptions with reversible changes.
 
+### 6. Assuming one disable path is sufficient (Windows)
+
+AMD's AUEPMaster telemetry process had two independent launch paths: the
+`AUEPLauncher` Windows service *and* a `\StartAUEP` scheduled task. Disabling
+the service via `sc.exe config AUEPLauncher start=disabled` appeared to work
+— the service was confirmed Disabled/Stopped — but AUEPMaster kept appearing
+every boot with 30+ seconds of CPU usage.
+
+The fix was also disabling the scheduled task:
+`Disable-ScheduledTask -TaskName StartAUEP`.
+
+**When disabling a Windows component, check all launch paths:** services
+(`Get-Service`), scheduled tasks (`Get-ScheduledTask`), startup folder,
+`Run`/`RunOnce` registry keys, and COM surrogate registrations. AMD software
+in particular uses multiple redundant launch mechanisms.
+
 ---
 
 ## Checklist for Future Hardware Passthrough Debugging
@@ -517,6 +563,18 @@ The code had to be restored. Always test assumptions with reversible changes.
 - [ ] Guest device manager: is the GPU in Error state? (Code 43 = missing
   multifunction peer; Code 10 = driver failed to start)
 - [ ] Did both PCI functions (GPU + audio) get passed through?
+
+### For live kernel dumps (WATCHDOG / VIDEO_DXGKRNL_LIVEDUMP)
+- [ ] Check `C:\Windows\LiveKernelReports\WATCHDOG\` for dump files + timestamps
+- [ ] Check WER events: `Get-WinEvent -FilterHashtable @{LogName='Application';
+  ProviderName='Windows Error Reporting'}` for `LiveKernelEvent` entries with
+  bugcheck parameters (P1=0x1B0 = VIDEO_DXGKRNL_LIVEDUMP)
+- [ ] Build a boot process timeline: `Get-Process | Sort-Object StartTime` with
+  CPU consumption to identify what was running at the dump timestamp
+- [ ] Check for heavy boot-time CPU consumers: Defender (MsMpEng), AMD
+  telemetry (AUEPMaster), Razer, etc. — GPU init TDRs are often contention
+- [ ] If disabling a component doesn't help, check all launch paths: services,
+  scheduled tasks (`Get-ScheduledTask`), startup folder, Run/RunOnce registry
 
 ### For performance / timing issues
 - [ ] Add measurement before adding fixes
