@@ -60,3 +60,43 @@ Disabled `Windows.SystemToast.Graphics.AutoHDR` notification (separate from Game
 ## 6. Host-side CPU isolation — Implemented
 
 Three-layer isolation: libvirt `emulatorpin`/`iothreadpin` on core 0, vm-overwatch `AllowedCPUs=0` on system/user/init slices, IRQ pinning. Reduced WATCHDOG dump frequency from ~100% to ~33%. See [CPU Isolation Architecture](recipe/setup.md#cpu-isolation-architecture).
+
+---
+
+## 7. Eliminate remaining WATCHDOG TDR dumps (~1 in 3 boots)
+
+**Status:** Open — investigating options
+
+**Problem:** Intermittent non-fatal `VIDEO_DXGKRNL_LIVEDUMP` (0x1B0) WATCHDOG
+dumps at ~T+49s and ~T+78s after boot. Root cause is Windows Defender
+(`MsMpEng`, ~51s CPU) contending with AMD GPU driver init. Disabling Defender
+eliminates dumps entirely, but Tamper Protection prevents programmatic disable
+of real-time scanning.
+
+**Options to evaluate:**
+
+### 7a. Expand Defender process/path exclusions
+
+Add AMD driver paths and GPU-heavy processes to Defender's exclusion list.
+Already have some AMD exclusions; check whether they cover the driver binaries
+active during the T+21-49s init window. Low risk, easy to test.
+
+### 7b. Install lightweight third-party AV
+
+Windows auto-disables Defender's real-time engine when it detects a compatible
+AV. A minimal AV (e.g., ESET) would cause Defender to step aside entirely.
+Eliminates the contention but adds a permanent dependency.
+
+### 7c. Increase TDR timeouts
+
+Raise `TdrDelay` and `TdrDdiDelay` registry values to give the GPU driver more
+time to init under contention. Doesn't fix the contention but may provide
+enough margin — zero dumps occur with Defender disabled even at default
+timeouts. Low risk, reversible.
+
+### 7d. Defer AMD driver service startup
+
+Delay AMD services (`atiesrxx`, `atieclxx`) via
+`sc.exe config ... start=delayed-auto` so they start after Defender's initial
+CPU burst passes. The case study showed contention is specifically about timing
+overlap at T+21-49s. Most targeted fix if the timing shift is sufficient.
