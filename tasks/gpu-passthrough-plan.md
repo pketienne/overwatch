@@ -33,6 +33,9 @@ One-click GPU passthrough for Overwatch 2 on myhost. The RX 7900 XTX is switchab
 - IVRS ACPI table override to fix VFIO container setup
 - One-click desktop shortcut: click -> play -> shut down Windows -> back to desktop
 - Lock file prevents concurrent vm-overwatch instances
+- Host-side CPU isolation: vCPU cores (1-7) get zero host interference; emulator/IO pinned to core 0
+- Auto HDR disabled (native HDR on), Game Bar disabled, AMD telemetry disabled
+- **Known issue:** intermittent non-fatal WATCHDOG dump (~1 in 3 boots) from Defender service init contention — cannot be eliminated with Tamper Protection on
 
 ### Kernel Parameters
 
@@ -311,8 +314,10 @@ Use `virt-install` or import the XML from the VM XML Reference section. Key conf
 | Setting | Value |
 |---|---|
 | **Name** | `overwatch` |
-| **vCPUs** | 7, pinned to cores 1-7 (core 0 reserved for host) |
+| **vCPUs** | 7, pinned to cores 1-7 (core 0 reserved for host + emulator + IO) |
 | **Topology** | 1 socket, 7 cores, 1 thread |
+| **IO threads** | 1 dedicated IO thread, pinned to core 0 |
+| **Emulator** | Pinned to core 0 (prevents VFIO interrupt injection contention on vCPU cores) |
 | **RAM** | 16 GB |
 | **CPU** | host-passthrough, cache passthrough |
 | **Firmware** | OVMF (UEFI) with TPM 2.0 (tpm-crb, emulator backend) |
@@ -396,9 +401,9 @@ All matched by vendor/product ID only — **no hardcoded bus/device addresses** 
 8. Set Overwatch aspect ratio to **21:9** in game settings (for 3440x1440)
 9. Apply Windows VM power settings (see section below)
 10. Disable GPU HDA audio device (see "Disable GPU HDA Audio Device" section below)
-11. Set up Defender boot throttle (see "Defer Windows Defender During Boot" section below)
+11. Set up Defender exclusions (see "Windows Defender Boot Contention" section below)
 12. Disable AMD telemetry (see "Disable AMD Telemetry" section below)
-13. Disable Auto HDR and Game Bar (see Action Items 3 and 4)
+13. Disable Auto HDR, Game Bar, and Auto HDR system toast (see Action Items 3, 4, and 5)
 
 ---
 
@@ -495,6 +500,7 @@ Full XML from `virsh dumpxml overwatch`:
   <memory unit='KiB'>16777216</memory>
   <currentMemory unit='KiB'>16777216</currentMemory>
   <vcpu placement='static'>7</vcpu>
+  <iothreads>1</iothreads>
   <cputune>
     <vcpupin vcpu='0' cpuset='1'/>
     <vcpupin vcpu='1' cpuset='2'/>
@@ -503,6 +509,8 @@ Full XML from `virsh dumpxml overwatch`:
     <vcpupin vcpu='4' cpuset='5'/>
     <vcpupin vcpu='5' cpuset='6'/>
     <vcpupin vcpu='6' cpuset='7'/>
+    <emulatorpin cpuset='0'/>
+    <iothreadpin iothread='1' cpuset='0'/>
   </cputune>
   <resource>
     <partition>/machine</partition>
@@ -781,56 +789,43 @@ the SteelSeries Arctis Pro Wireless headset via USB passthrough).
 > **Note:** AMD Adrenalin driver updates may reinstall `AtiHDAudioService`.
 > vm-overwatch boot diagnostics monitor for this (HD Audio section in logs).
 
-### Defer Windows Defender During Boot (TDR Fix)
+### Windows Defender Boot Contention (Intermittent TDR)
 
-**Root cause:** Windows Defender real-time scanning (MsMpEng, ~45-51s CPU) during
-boot creates enough CPU/IO contention to trigger `VIDEO_DXGKRNL_LIVEDUMP`
-(0x1B0) WATCHDOG dumps during AMD GPU driver initialization. With Defender
-disabled, zero dumps occur even at default TDR timeouts (TdrDelay=2, TdrDdiDelay=5).
+**Root cause:** Windows Defender *service initialization* (~12s heavy CPU at boot
+for loading ~300MB definition databases, starting scan engines) creates CPU
+contention during AMD GPU driver initialization, triggering
+`VIDEO_DXGKRNL_LIVEDUMP` (0x1B0) WATCHDOG dumps. With Defender disabled, zero
+dumps occur even at default TDR timeouts (TdrDelay=2, TdrDdiDelay=5).
 
-**Fix:** Throttle Defender scan CPU usage during boot, combined with AMD driver
-path exclusions.
+**What doesn't work:**
+- **DisableRealtimeMonitoring policy** — catch-22: requires Tamper Protection off
+  to write, but with TP off, once RTP is disabled at boot it's sticky for the
+  session (can't re-enable without reboot)
+- **ScanAvgCPULoadFactor throttle** — only controls scheduled/on-demand scans,
+  not real-time protection or service initialization CPU
+- **C:\ path exclusion** — tested adding entire C:\ as exclusion; WATCHDOG dump
+  still occurred. This proved the contention is from Defender's service
+  initialization, not file scanning
+- **Delaying/stopping WinDefend** — protected by 4 independent layers (WdBoot.sys
+  ELAM, WdFilter.sys kernel minifilter, Tamper Protection, Protected Process
+  Light). No viable way to delay, stop, or modify its startup with TP on.
 
-#### Step 1: Scheduled task to throttle scans during boot
+**Current mitigations (reduce frequency, don't eliminate):**
 
-Create a script at `C:\ProgramData\vm-overwatch\DeferDefenderEnable.ps1`:
+#### Host-side CPU isolation
 
-```powershell
-# DeferDefenderEnable.ps1 — Throttle Defender CPU during boot GPU init window
-# Reduces scan CPU load to 1% for 90s, then restores default (50%).
+vm-overwatch confines all host processes to core 0 during VM runtime using
+systemd `AllowedCPUs`. Combined with libvirt `emulatorpin`/`iothreadpin` (core 0)
+and vCPU pinning (cores 1-7), this gives VM cores zero host interference.
 
-Set-MpPreference -ScanAvgCPULoadFactor 1 -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 90
-Set-MpPreference -ScanAvgCPULoadFactor 50 -ErrorAction SilentlyContinue
-```
+Test results: 2/3 clean boots (reduced from ~100% dump rate before mitigations).
 
-> **Note:** `ScanAvgCPULoadFactor` controls scheduled/on-demand scan CPU usage.
-> Real-time protection (on-access scanning) is not directly throttled by this
-> setting, but combined with the AMD path exclusions below it significantly
-> reduces Defender's boot-time CPU footprint.
->
-> **Why not use `DisableRealtimeMonitoring` policy?** The registry policy approach
-> (`HKLM:\...\Real-Time Protection\DisableRealtimeMonitoring=1`) has a catch-22:
-> it requires Tamper Protection off to write programmatically, but with Tamper
-> Protection off, once RTP is disabled at boot it becomes sticky for the session
-> — no combination of policy removal, service restart, gpupdate, or
-> `Set-MpPreference` re-enables it without a reboot.
+See "Host-Side CPU Isolation" section below for implementation.
 
-Register the scheduled task:
+#### Defender exclusions for AMD driver paths
 
-```powershell
-$action = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\vm-overwatch\DeferDefenderEnable.ps1"
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$principal = New-ScheduledTaskPrincipal -UserId SYSTEM -RunLevel Highest
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName "DeferDefenderEnable" -Action $action `
-    -Trigger $trigger -Principal $principal -Settings $settings -Force
-```
-
-#### Step 2: Defender exclusions for AMD driver paths
-
-These reduce real-time protection scanning of GPU driver files:
+These reduce real-time protection scanning of GPU driver files (doesn't fix boot
+contention, but reduces runtime overhead):
 
 ```powershell
 # Path exclusions
@@ -847,9 +842,12 @@ These reduce real-time protection scanning of GPU driver files:
 ) | ForEach-Object { Add-MpPreference -ExclusionProcess $_ }
 ```
 
-> **Security:** Tamper Protection should be ON. The `ScanAvgCPULoadFactor` setting
-> and exclusions work regardless of Tamper Protection state. Defender real-time
-> protection stays fully enabled throughout boot — only scan CPU is throttled.
+> **Note:** Tamper Protection should be ON. Exclusions are not protected by
+> Tamper Protection on standalone (non-domain) devices (`TPExclusions=0`).
+> Defender real-time protection stays fully enabled. The DeferDefenderEnable
+> scheduled task still exists but is effectively inert — it sets
+> `ScanAvgCPULoadFactor` which only affects scheduled scans, not the boot-time
+> service initialization that causes the contention.
 
 ### Disable AMD Telemetry (AUEPMaster)
 
@@ -867,6 +865,50 @@ Disable-ScheduledTask -TaskName StartAUEP
 
 > **Note:** Disabling only the service is insufficient — AUEPMaster will still
 > launch via the `\StartAUEP` scheduled task. Check both paths.
+
+### Host-Side CPU Isolation
+
+vm-overwatch confines all host processes to core 0 during VM runtime, giving
+vCPU cores (1-7) zero host interference. This improves VFIO interrupt delivery
+latency, reduces boot-time TDR frequency, and provides better gaming frame
+consistency.
+
+#### Libvirt XML (`cputune`)
+
+```xml
+<iothreads>1</iothreads>
+<cputune>
+  <vcpupin vcpu='0' cpuset='1'/>
+  <!-- ... vcpupin 1-6 on cpuset 2-7 ... -->
+  <emulatorpin cpuset='0'/>
+  <iothreadpin iothread='1' cpuset='0'/>
+</cputune>
+```
+
+- **emulatorpin**: Confines QEMU emulator thread to core 0. This thread handles
+  VFIO interrupt injection — pinning it prevents contention on vCPU cores.
+- **iothreadpin**: Confines the IO thread (disk, network) to core 0.
+
+#### vm-overwatch: dynamic AllowedCPUs
+
+During VM runtime, `ensure_performance_tuning()` confines all host processes:
+
+```bash
+systemctl set-property --runtime -- system.slice AllowedCPUs=0
+systemctl set-property --runtime -- user.slice AllowedCPUs=0
+systemctl set-property --runtime -- init.scope AllowedCPUs=0
+```
+
+On restore, `ensure_cpu_defaults()` lifts the restriction:
+
+```bash
+systemctl set-property --runtime -- system.slice AllowedCPUs=0-7
+systemctl set-property --runtime -- user.slice AllowedCPUs=0-7
+systemctl set-property --runtime -- init.scope AllowedCPUs=0-7
+```
+
+Combined with IRQ pinning (all IRQs → core 0) and writeback migration, this
+ensures cores 1-7 run only VM vCPU threads during gameplay.
 
 ---
 
@@ -897,7 +939,7 @@ Disable-ScheduledTask -TaskName StartAUEP
 | Windows BSOD 0x9F DRIVER_POWER_STATE_FAILURE | Windows "Balanced" power plan sends power IRPs to passthrough GPU/USB devices; vfio-pci owns the hardware so guest driver can't complete power transitions | Switch to **High Performance** power plan; disable PCI Express ASPM, USB selective suspend, display timeout, sleep, hybrid sleep (see Windows VM Power Settings section) |
 | Frequent 0x9F BSODs after Windows Update | Windows Update pushed AMD driver 31.0.14000.58004 (Feb 2026) which corrupts GPU state every 2-5 min during gameplay | Roll back via Device Manager -> Display adapters -> Roll Back Driver. Block reinstall: Settings -> Windows Update -> Pause updates, or `wushowhide.diagcab` to hide the driver update. Known-good driver: Radeon Software 32.0.23017.1001 (2026-01-08) |
 | Windows BSOD 0x9F during shutdown specifically | `HDAudBus!HdaController::TransferCodecVerbs` blocks waiting for GPU HDA audio codec to respond during power-down (`IRP_MN_SET_POWER` to D1); codec never responds because it's behind vfio-pci | Uninstall AtiHDAudioService driver (`pnputil /delete-driver oem39.inf /force`); Windows generic HD Audio driver handles the device without triggering the issue. GPU audio PCI function (`03:00.1`) must still be passed through (AMD driver Code 43 without it). Also disable AMD driver power features via registry (see Power Settings section) |
-| WATCHDOG/AMD_WATCHDOG live kernel dumps on every VM boot | Windows Defender real-time scanning (~45-51s CPU) during boot creates CPU/IO contention during AMD GPU driver init, triggering `VIDEO_DXGKRNL_LIVEDUMP` (0x1B0). Two dumps per boot at T+49s and T+78s. AUEPMaster telemetry (~30s CPU) compounds the contention. | Throttle Defender scan CPU to 1% for 90s at boot (see "Defer Windows Defender During Boot" section). Disable AUEPMaster (service + scheduled task). Add Defender exclusions for AMD paths. Default TDR timeouts (TdrDelay=2, TdrDdiDelay=5) work fine with Defender throttled. |
+| WATCHDOG/AMD_WATCHDOG live kernel dumps on VM boot (intermittent) | Windows Defender service initialization (~12s heavy CPU loading definition databases) creates CPU contention during AMD GPU driver init, triggering `VIDEO_DXGKRNL_LIVEDUMP` (0x1B0). Root cause is Defender service init, not file scanning (proven by C:\ exclusion test). Cannot be fully eliminated with Tamper Protection on — WinDefend is protected by 4 layers (ELAM, WdFilter, TP, PPL). | Host-side CPU isolation (AllowedCPUs confines host to core 0, emulatorpin/iothreadpin on core 0) reduces frequency to ~1 in 3 boots. AUEPMaster disabled. AMD path/process exclusions added. Dumps are non-fatal (live kernel dumps, not BSODs). See "Windows Defender Boot Contention" section. |
 | amdgpu bind hangs after VM passthrough (`trn=2 ACK should not assert`) | GPU SMU mailbox stuck after heavy GPU usage in VM (e.g. gaming); VFIO release doesn't fully reset the GPU, amdgpu probe loops forever on SMU communication | Reboot required. This is a hardware-level issue — the GPU needs a full PCI bus reset that only a machine reboot provides. Lightweight test cycles may restore fine but extended gaming sessions can leave the GPU in an unrecoverable state |
 | Monitor doesn't auto-switch to DP when VM starts | iGPU HDMI stays active, monitor doesn't detect DP | Blank iGPU framebuffer (`echo 4 > /sys/class/graphics/fbN/blank`) when VM starts; monitor auto-detects to DP. fb matched by PCI device path, not hardcoded number. vm-overwatch handles this |
 
@@ -1000,6 +1042,43 @@ Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" -Name
 Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\GameBar" -Name "UseNexusForGameBarEnabled" -Value 0 -Type DWord
 Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" -Name "AppCaptureEnabled" -Value 0 -Type DWord
 ```
+
+### 5. Disable Auto HDR system toast notification
+
+**Status:** Done
+
+**Problem:** Even with Game Bar disabled, Windows shows an Auto HDR recommendation
+toast via the system notification `Windows.SystemToast.Graphics.AutoHDR`. This is
+a separate notification source from Game Bar.
+
+**Fix:** Disable the system toast notification:
+
+```powershell
+# Per-user notification setting (use HKU\<SID> for guest agent, HKCU for interactive)
+$path = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.Graphics.AutoHDR"
+New-Item -Path $path -Force
+Set-ItemProperty -Path $path -Name "Enabled" -Value 0 -Type DWord
+```
+
+### 6. Host-side CPU isolation — reduce boot TDR and improve runtime performance
+
+**Status:** Implemented
+
+**Problem:** Host processes (systemd services, kernel threads, irqbalance) share
+CPU cores with VM vCPU threads, causing interrupt delivery latency and
+contributing to boot-time Defender contention.
+
+**Fix:** Three-layer isolation:
+1. **Libvirt XML**: `emulatorpin cpuset='0'`, `iothreadpin cpuset='0'` — pins
+   QEMU housekeeping to core 0
+2. **vm-overwatch**: `AllowedCPUs=0` on system.slice, user.slice, init.scope —
+   confines all host processes to core 0 during VM runtime
+3. **IRQ pinning**: All IRQs → core 0, irqbalance stopped, writeback migrated
+
+**Results:** Reduced WATCHDOG dump frequency from ~100% to ~33% (2/3 clean boots).
+Runtime gaming benefits: cleaner frame delivery, zero host interference on VM cores.
+
+See "Host-Side CPU Isolation" section above for full implementation details.
 
 ---
 

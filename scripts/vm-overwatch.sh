@@ -353,6 +353,10 @@ set_igpu_blank() {
 
 ensure_performance_tuning() {
     log "Applying VM performance tuning..."
+    # Confine all host processes to HOST_CPU — VM cores get zero host interference
+    systemctl set-property --runtime -- system.slice AllowedCPUs=$HOST_CPU 2>/dev/null || true
+    systemctl set-property --runtime -- user.slice AllowedCPUs=$HOST_CPU 2>/dev/null || true
+    systemctl set-property --runtime -- init.scope AllowedCPUs=$HOST_CPU 2>/dev/null || true
     # Set CPU governor to performance on all cores
     for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
         echo performance > "$gov" 2>/dev/null || true
@@ -362,7 +366,7 @@ ensure_performance_tuning() {
     for irq_dir in /proc/irq/*/; do
         echo $HOST_CPU > "${irq_dir}smp_affinity_list" 2>/dev/null || true
     done
-    # Move RCU callbacks to host CPU
+    # Move RCU callbacks and writeback to host CPU
     echo 1 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
 }
 
@@ -536,6 +540,10 @@ ensure_vm_stopped() {
 
 ensure_cpu_defaults() {
     log "Restoring CPU defaults..."
+    # Restore host access to all cores
+    systemctl set-property --runtime -- system.slice AllowedCPUs=0-7 2>/dev/null || true
+    systemctl set-property --runtime -- user.slice AllowedCPUs=0-7 2>/dev/null || true
+    systemctl set-property --runtime -- init.scope AllowedCPUs=0-7 2>/dev/null || true
     # Governor back to powersave
     for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
         echo powersave > "$g" 2>/dev/null || true
