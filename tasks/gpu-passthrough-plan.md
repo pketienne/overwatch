@@ -64,6 +64,7 @@ GRUB_EARLY_INITRD_LINUX_CUSTOM="acpi-ivrs-override.img"
 - [Build Recipe](gpu-passthrough/recipe.md) — From-scratch host and guest setup
 - [Troubleshooting](gpu-passthrough/troubleshooting.md) — Problem/cause/solution reference
 - [Action Items](gpu-passthrough/action-items.md) — Completed fixes and changelog
+- [Instrumentation](gpu-passthrough/instrumentation.md) — Monitoring and diagnostics inventory
 - [Troubleshooting Methodology](troubleshooting-methodology.md) — Generalizable debugging lessons
   - [Principles](troubleshooting-methodology/principles.md) — 10 methods + 7 anti-patterns
   - [Case Studies](troubleshooting-methodology/case-studies.md) — Project timeline and detailed investigations

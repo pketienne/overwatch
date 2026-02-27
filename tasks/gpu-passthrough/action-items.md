@@ -129,3 +129,34 @@ is encoding overhead and added complexity.
 **Future WDDM updates** — not actionable, just noting the possibility.
 
 This is a research item, not an immediate fix.
+
+---
+
+## 8. Host-side runtime performance monitoring
+
+**Status:** Open
+
+**Problem:** No CPU, disk I/O, or memory metrics collected during VM runtime.
+When gameplay stuttering occurs, there's no data to distinguish host-side
+contention (core 0 saturation, qcow2 latency, memory pressure) from
+guest-side issues.
+
+**Proposed:** Add a background monitoring function to vm-overwatch that
+samples `mpstat -P ALL`, `iostat -x`, and `vmstat` at ~5s intervals during
+VM runtime. Log to journald with a prefix (e.g., `PERF_HOST`) for easy
+filtering. Start when VM enters running state, stop on shutdown.
+
+## 9. Guest-side runtime performance monitoring
+
+**Status:** Open
+
+**Problem:** No GPU utilization, clock speed, temperature, or VRAM usage data
+during gameplay. Can't determine if stuttering is thermal throttling, driver
+stalls, or resource exhaustion.
+
+**Proposed:** Two tiers:
+1. **Zero-effort**: Use Overwatch's built-in overlay (Ctrl+Shift+N) to
+   observe frame time, render time, and network latency during gameplay.
+2. **Automated**: Periodic PowerShell WMI queries via guest agent during
+   runtime, or install GPU-Z with CLI sensor logging to a file that can be
+   retrieved post-session.
