@@ -5,7 +5,7 @@ Requires=libvirtd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/vm-overwatch start
+ExecStart=/usr/local/bin/overwatch start
 TimeoutStartSec=infinity
 TimeoutStopSec=120
 Restart=no

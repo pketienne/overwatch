@@ -2,7 +2,7 @@
 Type=Application
 Name=Overwatch
 Comment=Start the Overwatch Windows VM with GPU passthrough
-Exec=bash -c "sudo systemctl start vm-overwatch"
+Exec=bash -c "sudo systemctl start overwatch"
 Icon=computer
 Terminal=false
 Categories=System;

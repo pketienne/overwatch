@@ -41,7 +41,7 @@ Check for OS updates, driver changes, firmware updates, configuration drift.
 
 The most impactful discovery — that Windows Update silently installed a
 broken AMD driver — came from querying the guest OS's event history, not from
-reading vm-overwatch code or kernel logs. See
+reading overwatch code or kernel logs. See
 [Broken AMD Driver](case-studies.md#broken-amd-driver-method-3).
 
 ---
@@ -145,7 +145,7 @@ actions.
 Many bugs in this project crossed the host/guest boundary. Correlate
 timestamps between:
 
-- **Host journald** (`journalctl -u vm-overwatch`) — script actions, driver
+- **Host journald** (`journalctl -u overwatch`) — script actions, driver
   bind/unbind, service start/stop
 - **Host dmesg** — kernel messages for amdgpu, vfio-pci, PCI subsystem,
   i2c, soft lockups

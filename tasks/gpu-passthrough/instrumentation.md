@@ -10,7 +10,7 @@ organized by side (host/guest) and phase (startup/runtime/shutdown).
 - **do_status()** (lines 88–144) — on-demand query: GPU/audio driver, VM
   state, services, CPU governor, IRQ balance, iGPU blank state. Derives
   overall state (host-ready, vm-running, transitioning). Run via
-  `vm-overwatch status`.
+  `overwatch status`.
 - **log_state()** (lines 183–190) — checkpoint logging at transitions
   (post_unbind, vfio_bind_failed, post_vfio_unbind, vm_running, vm_shutdown,
   on_error). Logs GPU driver, audio driver, and VM domain state.
@@ -40,7 +40,7 @@ organized by side (host/guest) and phase (startup/runtime/shutdown).
 ### Shutdown Timing — Implemented
 
 - **UDP shutdown signal** (lines 870–880) — Python listener on port 9147.
-  Receives timestamp from Windows `notify-host-shutdown.ps1` (triggered by
+  Receives timestamp from Windows `overwatch.ps1` (triggered by
   Event ID 1074 scheduled task). Writes timestamp to temp file for delta
   calculation.
 - **QEMU process state tracking** (lines 886–903) — reads
@@ -58,7 +58,7 @@ organized by side (host/guest) and phase (startup/runtime/shutdown).
 ### Runtime Performance Monitoring — Implemented (monitor_host_perf, lines 526–552)
 
 Background subshell samples every 30s while VM is running. Tagged `PERF_HOST`
-for `journalctl -u vm-overwatch | grep PERF_HOST`. Launched in `_do_start()`,
+for `journalctl -u overwatch | grep PERF_HOST`. Launched in `_do_start()`,
 killed on shutdown alongside other background jobs.
 
 | Metric | Tool | What it diagnoses |
@@ -97,7 +97,7 @@ Background subshell samples every 60s via QEMU guest agent (`qga`/`run_ps`
 pattern, same as `log_guest_diagnostics`). Queries LibreHardwareMonitor WMI
 (`root\LibreHardwareMonitor` namespace, requires LHM v0.9.4 net472 running
 as SYSTEM on guest). Tagged `PERF_GUEST` for
-`journalctl -u vm-overwatch | grep PERF_GUEST`. Launched in `_do_start()`,
+`journalctl -u overwatch | grep PERF_GUEST`. Launched in `_do_start()`,
 killed on shutdown.
 
 | Metric | Tool | What it diagnoses |

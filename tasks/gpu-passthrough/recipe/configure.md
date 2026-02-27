@@ -77,7 +77,7 @@ no PnP watchdog events. HDMI/DP audio is unused (all audio goes through
 the SteelSeries Arctis Pro Wireless headset via USB passthrough).
 
 > **Note:** AMD Adrenalin driver updates may reinstall `AtiHDAudioService`.
-> vm-overwatch boot diagnostics monitor for this (HD Audio section in logs).
+> overwatch boot diagnostics monitor for this (HD Audio section in logs).
 
 
 ## Phase 12: Defender & Telemetry
@@ -208,14 +208,14 @@ Set-ItemProperty -Path $path -Name "Enabled" -Value 0 -Type DWord
 
 ## Phase 14: Shutdown Signal
 
-vm-overwatch listens on UDP port 9147 for a shutdown timing signal from the guest. A Windows scheduled task fires on any shutdown (Event ID 1074) and sends the signal automatically — no manual `.bat` shortcut needed.
+overwatch listens on UDP port 9147 for a shutdown timing signal from the guest. A Windows scheduled task fires on any shutdown (Event ID 1074) and sends the signal automatically — no manual `.bat` shortcut needed.
 
 Install the notification script:
 ```powershell
-mkdir C:\ProgramData\vm-overwatch -Force
+mkdir C:\ProgramData\overwatch -Force
 ```
 
-Copy `scripts/notify-host-shutdown.ps1` from this repo to `C:\ProgramData\vm-overwatch\notify-host-shutdown.ps1`. Contents:
+Copy `scripts/overwatch.ps1` from this repo to `C:\ProgramData\overwatch\overwatch.ps1`. Contents:
 ```powershell
 $udp = New-Object System.Net.Sockets.UdpClient
 $bytes = [System.Text.Encoding]::ASCII.GetBytes("shutdown")
@@ -227,7 +227,7 @@ Create the scheduled task (run in an elevated PowerShell):
 ```powershell
 $trigger = New-ScheduledTaskTrigger -AtStartup  # placeholder, replaced by EventTrigger below
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\vm-overwatch\notify-host-shutdown.ps1"
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\overwatch\overwatch.ps1"
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
 Register-ScheduledTask -TaskName "NotifyHostShutdown" -Action $action -Principal $principal -Force
 
@@ -249,7 +249,7 @@ schtasks /Change /TN "NotifyHostShutdown" /XML (
   <Actions>
     <Exec>
       <Command>powershell.exe</Command>
-      <Arguments>-NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\vm-overwatch\notify-host-shutdown.ps1</Arguments>
+      <Arguments>-NoProfile -ExecutionPolicy Bypass -File C:\ProgramData\overwatch\overwatch.ps1</Arguments>
     </Exec>
   </Actions>
   <Principals><Principal><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>

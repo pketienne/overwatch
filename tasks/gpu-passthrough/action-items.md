@@ -2,7 +2,7 @@
 
 ## 1. Add PCIe bus reset before amdgpu rebind
 
-**Status:** Implemented (`gpu_bus_reset()` in vm-overwatch.sh, called from `ensure_gpu_on_host()`)
+**Status:** Implemented (`gpu_bus_reset()` in overwatch.sh, called from `ensure_gpu_on_host()`)
 
 **Problem:** After VFIO releases the GPU, `ensure_gpu_on_host()` binds amdgpu
 directly with no hardware reset. The GPU is still in whatever state the Windows
@@ -43,7 +43,7 @@ which could cause side effects when amdgpu was loaded.
 **Resolution:** The bus reset from Action Item 1 resets both `03:00.0` and
 `03:00.1` via the PCIe link (SBR hits all functions behind the bridge). After
 testing, `snd_hda_intel` binds cleanly to `03:00.1` with a direct bind — no
-PCI remove/rescan needed. The remove/rescan code was deleted from vm-overwatch.
+PCI remove/rescan needed. The remove/rescan code was deleted from overwatch.
 
 ## 3. Disable Auto HDR — Done
 
@@ -60,7 +60,7 @@ Disabled `Windows.SystemToast.Graphics.AutoHDR` notification (separate from Game
 ## 6. Host-side CPU isolation — Implemented
 
 Three-layer isolation: libvirt `emulatorpin`/`iothreadpin` on cores 0–1,
-vm-overwatch `AllowedCPUs=0-1` on system/user/init slices, IRQ pinning.
+overwatch `AllowedCPUs=0-1` on system/user/init slices, IRQ pinning.
 Originally single-core (cpu0) but expanded to 2 cores after PERF_HOST
 monitoring showed cpu0 at 100% during gameplay — QEMU emulator thread
 competing with VS Code/Claude/node for USB audio isochronous transfers,
@@ -140,7 +140,7 @@ This is a research item, not an immediate fix.
 
 ## 8. Host-side runtime performance monitoring
 
-**Status:** Implemented (`monitor_host_perf()` in vm-overwatch.sh)
+**Status:** Implemented (`monitor_host_perf()` in overwatch.sh)
 
 **Problem:** No CPU, disk I/O, or memory metrics collected during VM runtime.
 When gameplay stuttering occurs, there's no data to distinguish host-side
@@ -153,12 +153,12 @@ guest-side issues.
 - `iostat -x` — NVMe r_await, w_await, %util
 - `/proc/meminfo` — free, available memory, swap usage
 
-Logs tagged `PERF_HOST` for `journalctl -u vm-overwatch | grep PERF_HOST`.
+Logs tagged `PERF_HOST` for `journalctl -u overwatch | grep PERF_HOST`.
 Launched in `_do_start()`, killed on shutdown alongside other background jobs.
 
 ## 9. Guest-side runtime performance monitoring
 
-**Status:** Implemented (`monitor_guest_perf()` in vm-overwatch.sh)
+**Status:** Implemented (`monitor_guest_perf()` in overwatch.sh)
 
 **Problem:** No GPU utilization, clock speed, temperature, or VRAM usage data
 during gameplay. Can't determine if stuttering is thermal throttling, driver
@@ -171,7 +171,7 @@ net472 running as SYSTEM on guest):
 - GPU core load, temps (core/hotspot/memory), clocks (core/memory)
 - GPU package power, VRAM used/total
 
-Logs tagged `PERF_GUEST` for `journalctl -u vm-overwatch | grep PERF_GUEST`.
+Logs tagged `PERF_GUEST` for `journalctl -u overwatch | grep PERF_GUEST`.
 Uses same `qga`/`run_ps` pattern as `log_guest_diagnostics()`. Launched in
 `_do_start()`, killed on shutdown.
 
@@ -183,7 +183,7 @@ that the guest agent can't capture.
 
 ## 10. Suspend dGPU framebuffer before amdgpu unbind
 
-**Status:** Implemented (`ensure_gpu_unbound_from_host()` in vm-overwatch.sh)
+**Status:** Implemented (`ensure_gpu_unbound_from_host()` in overwatch.sh)
 
 **Problem:** Sysfs amdgpu unbind deadlocks ~1.5% of the time (2 out of ~133
 cycles). `drm_fb_helper_fini` calls `cancel_work_sync(&damage_work)` during

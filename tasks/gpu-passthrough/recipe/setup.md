@@ -140,27 +140,27 @@ sudo cp 272613.rom /usr/share/qemu/gpu-rom.bin
 
 ## Phase 6: Install Support Files
 
-### 6.1 vm-overwatch lifecycle script
+### 6.1 overwatch lifecycle script
 
 ```bash
-sudo cp scripts/vm-overwatch.sh /usr/local/bin/vm-overwatch
-sudo chmod +x /usr/local/bin/vm-overwatch
+sudo cp scripts/overwatch.sh /usr/local/bin/overwatch
+sudo chmod +x /usr/local/bin/overwatch
 ```
 
-Source is in this repo at `scripts/vm-overwatch.sh`. The script manages the full GPU passthrough lifecycle:
+Source is in this repo at `scripts/overwatch.sh`. The script manages the full GPU passthrough lifecycle:
 
 1. **Pre-VM**: Stop services (ollama, openrgb, GDM) → release device FDs (`fuser -k` on DRM and i2c devices) → unbind VT consoles → unbind snd_hda_intel from GPU audio → unbind amdgpu → bind GPU + audio to vfio-pci
 2. **VM running**: Start VM → re-attach USB devices (Kinesis, Tartarus detach/reattach to clear ghost entries) → blank iGPU → set CPU governor to `performance`, pin all IRQs to CPU 0, stop irqbalance, move RCU callbacks to CPU 0
 3. **Post-VM**: Restore CPU governor to `powersave`, restart irqbalance → unbind vfio-pci → PCIe bus reset (SBR) → rebind VT consoles → bind amdgpu → direct bind snd_hda_intel (no PCI rescan) → disable runtime PM → unblank iGPU → restart services
 
-### 6.2 vm-overwatch systemd service
+### 6.2 overwatch systemd service
 
 ```bash
-sudo cp scripts/vm-overwatch.service /etc/systemd/system/vm-overwatch.service
+sudo cp scripts/overwatch.service /etc/systemd/system/overwatch.service
 sudo systemctl daemon-reload
 ```
 
-Source is in this repo at `scripts/vm-overwatch.service`. The service wraps `vm-overwatch start` with proper lifecycle management: `Type=simple` (long-running foreground process), `TimeoutStartSec=infinity` (VM sessions last hours), `TimeoutStopSec=120` (graceful shutdown + host restore). `systemctl stop` sends SIGTERM, which triggers the script's cleanup handler.
+Source is in this repo at `scripts/overwatch.service`. The service wraps `overwatch start` with proper lifecycle management: `Type=simple` (long-running foreground process), `TimeoutStartSec=infinity` (VM sessions last hours), `TimeoutStopSec=120` (graceful shutdown + host restore). `systemctl stop` sends SIGTERM, which triggers the script's cleanup handler.
 
 ### 6.3 udev rules — seat prevention
 
@@ -213,15 +213,15 @@ exit 0
 sudo chmod +x /etc/libvirt/hooks/qemu
 ```
 
-This prevents libvirt from running any hook logic (which causes deadlocks with systemctl/virsh). All lifecycle management is handled by the vm-overwatch wrapper.
+This prevents libvirt from running any hook logic (which causes deadlocks with systemctl/virsh). All lifecycle management is handled by the overwatch wrapper.
 
 ### 6.8 Passwordless sudo
 
-The desktop shortcut (Phase 8) runs `sudo systemctl start vm-overwatch` with `Terminal=false`, so there is no terminal to enter a password. The `myuser` user needs passwordless sudo for at least `systemctl`.
+The desktop shortcut (Phase 8) runs `sudo systemctl start overwatch` with `Terminal=false`, so there is no terminal to enter a password. The `myuser` user needs passwordless sudo for at least `systemctl`.
 
-Create `/etc/sudoers.d/vm-overwatch`:
+Create `/etc/sudoers.d/overwatch`:
 ```
-myuser ALL=(ALL) NOPASSWD: /usr/bin/systemctl start vm-overwatch, /usr/bin/systemctl stop vm-overwatch
+myuser ALL=(ALL) NOPASSWD: /usr/bin/systemctl start overwatch, /usr/bin/systemctl stop overwatch
 ```
 
 Or, if the user already has blanket NOPASSWD (`myuser ALL=(ALL) NOPASSWD: ALL`), no additional configuration is needed.
@@ -258,7 +258,7 @@ Use `virt-install` or import the XML from the [VM XML Reference](vm-xml-referenc
 ### 7.3 GPU passthrough devices
 
 ```xml
-<!-- GPU: managed=no (vm-overwatch handles driver binding) -->
+<!-- GPU: managed=no (overwatch handles driver binding) -->
 <hostdev mode="subsystem" type="pci" managed="no">
   <driver name="vfio"/>
   <source><address domain="0x0000" bus="0x03" slot="0x00" function="0x0"/></source>
@@ -320,28 +320,28 @@ All matched by vendor/product ID only — **no hardcoded bus/device addresses** 
 
 ## Phase 8: Desktop Shortcut
 
-Create `~/Desktop/start-vm.desktop`:
+Create `~/Desktop/overwatch.desktop`:
 ```ini
 [Desktop Entry]
 Type=Application
 Name=Overwatch
 Comment=Start the Overwatch Windows VM with GPU passthrough
-Exec=bash -c "sudo systemctl start vm-overwatch"
+Exec=bash -c "sudo systemctl start overwatch"
 Icon=computer
 Terminal=false
 Categories=System;
 ```
 
-The shortcut starts the vm-overwatch systemd service. If the service is already running, `systemctl start` is a no-op. The service survives GDM stop/restart (no terminal dependency). Uses `sudo` for root operations (see Phase 6.8 for sudoers config).
+The shortcut starts the overwatch systemd service. If the service is already running, `systemctl start` is a no-op. The service survives GDM stop/restart (no terminal dependency). Uses `sudo` for root operations (see Phase 6.8 for sudoers config).
 
 
 ## CPU Isolation Architecture
 
-This is not a numbered phase — CPU isolation is built into vm-overwatch and the
+This is not a numbered phase — CPU isolation is built into overwatch and the
 libvirt XML (Phase 7), not a manual step. Understanding the architecture helps
 with troubleshooting.
 
-vm-overwatch confines all host processes to core 0 during VM runtime, giving
+overwatch confines all host processes to core 0 during VM runtime, giving
 vCPU cores (1-7) zero host interference. This improves VFIO interrupt delivery
 latency, reduces boot-time TDR frequency, and provides better gaming frame
 consistency.
@@ -362,7 +362,7 @@ consistency.
   VFIO interrupt injection — pinning it prevents contention on vCPU cores.
 - **iothreadpin**: Confines the IO thread (disk, network) to core 0.
 
-### vm-overwatch: dynamic AllowedCPUs
+### overwatch: dynamic AllowedCPUs
 
 During VM runtime, `ensure_performance_tuning()` confines all host processes:
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# vm-overwatch — Declarative state reconciler for GPU passthrough VM lifecycle
+# overwatch — Declarative state reconciler for GPU passthrough VM lifecycle
 # Manages myhost through: host-mode ↔ vfio ↔ vm-running
 #
 # Subcommands:
@@ -7,10 +7,10 @@
 #   stop    Inspect current state, do minimum work to reach host-mode (idempotent)
 #   status  Print current system state across all dimensions
 #
-# Runs as a systemd service: systemctl start vm-overwatch
-# Log: journalctl -u vm-overwatch
+# Runs as a systemd service: systemctl start overwatch
+# Log: journalctl -u overwatch
 #
-# Usage: vm-overwatch [--verbose] start|stop|status
+# Usage: overwatch [--verbose] start|stop|status
 
 set -uo pipefail
 
@@ -19,7 +19,7 @@ GPU_AUDIO="0000:03:00.1"
 IGPU="0000:74:00.0"
 HOST_CPUS="0-1"     # CPUs reserved for host tasks + QEMU emulator/IO
 SHUTDOWN_SIGNAL_PORT=9147   # UDP port for Windows shutdown signal
-LOCK_FILE="/run/vm-overwatch.lock"
+LOCK_FILE="/run/overwatch.lock"
 
 # USB devices that need detach/reattach after VM start to clear ghost entries.
 # Disabled — reattach breaks Razer Synapse profile loading. Ghost entries
@@ -151,7 +151,7 @@ fi
 # --- Usage ---
 
 if [ "$CMD" != "start" ] && [ "$CMD" != "stop" ]; then
-    echo "Usage: vm-overwatch [--verbose] start|stop|status"
+    echo "Usage: overwatch [--verbose] start|stop|status"
     echo ""
     echo "  start   Prepare host, start VM, wait for shutdown, restore host"
     echo "  stop    Inspect state and restore host-mode (idempotent, safe to re-run)"
@@ -194,7 +194,7 @@ log_state() {
 acquire_lock() {
     exec 9>"$LOCK_FILE"
     if ! flock -n 9; then
-        log "ERROR: Another vm-overwatch instance is already running (lock: $LOCK_FILE)"
+        log "ERROR: Another overwatch instance is already running (lock: $LOCK_FILE)"
         exit 1
     fi
     trap 'on_error $LINENO "$BASH_COMMAND" $?; flock -u 9; rm -f "$LOCK_FILE"' ERR
@@ -811,7 +811,7 @@ _do_start() {
 
     # Refuse if VM already running
     if virsh domstate overwatch 2>/dev/null | grep -q "running"; then
-        log "ERROR: VM is already running. Use 'vm-overwatch stop' to stop it."
+        log "ERROR: VM is already running. Use 'overwatch stop' to stop it."
         exit 1
     fi
 
@@ -867,7 +867,7 @@ _do_start() {
     local diag_pid=$!
 
     # Listen for shutdown signal from guest (user clicks "Shutdown VM" shortcut)
-    local shutdown_ts_file="/tmp/.vm-overwatch-shutdown-ts"
+    local shutdown_ts_file="/tmp/.overwatch-shutdown-ts"
     rm -f "$shutdown_ts_file"
     python3 -c "
 import socket, time

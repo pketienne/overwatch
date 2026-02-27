@@ -1,4 +1,4 @@
-# vm-overwatch
+# overwatch
 
 GPU passthrough orchestrator for running a Windows 11 VM with dedicated graphics on a Linux host. Dynamically switches a discrete GPU between host and guest without rebooting, enabling one-click gaming (Overwatch 2) while preserving full host functionality.
 
@@ -45,16 +45,16 @@ Transitions are handled by idempotent `ensure_*` functions that check current st
 
 ```bash
 # Start the VM (or use the desktop shortcut)
-sudo systemctl start vm-overwatch
+sudo systemctl start overwatch
 
 # Stop and restore host
-sudo systemctl stop vm-overwatch
+sudo systemctl stop overwatch
 
 # Check current state
-sudo vm-overwatch status
+sudo overwatch status
 
 # Watch live logs
-journalctl -u vm-overwatch -f
+journalctl -u overwatch -f
 ```
 
 ## Runtime Monitoring
@@ -72,10 +72,10 @@ Post-boot guest diagnostics query Windows Event Log for previous shutdown durati
 
 ```
 scripts/
-  vm-overwatch.sh            # Main orchestrator (~950 lines bash + embedded Python)
-  vm-overwatch.service        # systemd unit
-  start-vm.desktop            # Desktop shortcut
-  notify-host-shutdown.ps1    # Windows guest shutdown notifier (UDP)
+  overwatch.sh            # Main orchestrator (~950 lines bash + embedded Python)
+  overwatch.service        # systemd unit
+  overwatch.desktop            # Desktop shortcut
+  overwatch.ps1    # Windows guest shutdown notifier (UDP)
 
 tasks/
   gpu-passthrough-plan.md     # Project goals and hardware summary
@@ -101,8 +101,8 @@ tasks/
 
 | File | Purpose |
 |------|---------|
-| `/usr/local/bin/vm-overwatch` | Installed orchestrator script |
-| `/etc/systemd/system/vm-overwatch.service` | Service unit |
+| `/usr/local/bin/overwatch` | Installed orchestrator script |
+| `/etc/systemd/system/overwatch.service` | Service unit |
 | `/etc/default/grub` | `amd_iommu=on`, IVRS override initrd |
 | `/boot/acpi-ivrs-override.img` | Patched IVRS ACPI table |
 | `/usr/share/qemu/gpu-rom.bin` | RX 7900 XTX VBIOS |

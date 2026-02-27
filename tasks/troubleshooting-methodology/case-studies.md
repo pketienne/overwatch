@@ -36,7 +36,7 @@ about without data. Four measurement channels made every subsequent
 investigation possible:
 
 **UDP listener + PowerShell sender**: A 15-line UDP listener + 4-line
-PowerShell sender (`notify-host-shutdown.ps1`) gave exact millisecond
+PowerShell sender (`overwatch.ps1`) gave exact millisecond
 timestamps. This immediately revealed that the 104-second "clean" shutdown
 after the ULPS fix was still pathologically slow — it wasn't fixed, just
 masked.
@@ -156,9 +156,9 @@ two days.
 Cross-boundary timestamp correlation revealed a 100ms race window:
 
 ```
-T+0.0s  vm-overwatch: "Binding amdgpu..."
+T+0.0s  overwatch: "Binding amdgpu..."
 T+0.2s  dmesg: amdgpu probed successfully
-T+0.3s  vm-overwatch: "Re-enumerating GPU audio..."
+T+0.3s  overwatch: "Re-enumerating GPU audio..."
 T+0.4s  dmesg: snd_hda_intel probe on 03:00.1
 T+0.5s  dmesg: "Unable to change power state from D3cold to D0"
 T+0.6s  dmesg: "CORB timeout, GPU codec unreachable"
@@ -214,10 +214,10 @@ cycles vs 3/5 with GPU present at boot. This motivated a full implementation.
 
 ### What was built
 
-`ensure_gpu_hotplugged()` in vm-overwatch.sh: wait for guest agent (confirms
+`ensure_gpu_hotplugged()` in overwatch.sh: wait for guest agent (confirms
 Windows boot complete), then hot-plug GPU and audio PCI hostdevs via
 `virsh attach-device --live`. GPU/audio hostdevs removed from persistent VM
-config — managed entirely by vm-overwatch.
+config — managed entirely by overwatch.
 
 Deployed, started VM. Hot-plug succeeded — guest agent ready in ~8s, both
 devices attached, AMD GPU showed `Status: OK` in PnP, AMD driver loaded.
@@ -322,7 +322,7 @@ work to return immediately instead of trying to access dying hardware.
 
 ### Fix
 
-Added to `ensure_gpu_unbound_from_host()` in vm-overwatch: find the dGPU's
+Added to `ensure_gpu_unbound_from_host()` in overwatch: find the dGPU's
 framebuffer by PCI device path and set `state=1` before the amdgpu unbind
 echo. One-line sysfs write that directly closes the race window.
 
