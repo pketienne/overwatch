@@ -65,7 +65,7 @@ Three-layer isolation: libvirt `emulatorpin`/`iothreadpin` on core 0, vm-overwat
 
 ## 7. Eliminate remaining WATCHDOG TDR dumps (~1 in 3 boots)
 
-**Status:** Open — two options to evaluate
+**Status:** Resolved — TDR timeout increase to 60s (option 7a)
 
 **Problem:** Intermittent non-fatal `VIDEO_DXGKRNL_LIVEDUMP` (0x1B0) WATCHDOG
 dumps at ~T+49s and ~T+78s after boot. Root cause is DxgKrnl initializing the
@@ -99,11 +99,12 @@ HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\TdrDelay = 60 (DWORD)
 HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\TdrDdiDelay = 60 (DWORD)
 ```
 
-**Test results (2026-02-26):** 0/3 WATCHDOG dumps with TdrDelay=60,
-TdrDdiDelay=60. Cycle 1 GPU status OK; cycles 2-3 GPU status `Unknown` (may be
-PnP query timing during rapid test cycling — needs investigation). Compared to
-baseline ~60% dump rate (3/5) and previous TdrDelay=25 which still produced
-dumps.
+**Test results (2026-02-26):** 0/4 WATCHDOG dumps with TdrDelay=60,
+TdrDdiDelay=60. Three automated test cycles (cycle 1 GPU status OK; cycles 2-3
+GPU status `Unknown` — attributed to PnP query timing during rapid test
+cycling) plus one full gameplay session (Overwatch, clean boot after host
+reboot, GPU status OK, 25s clean shutdown). Compared to baseline ~60% dump rate
+(3/5) and previous TdrDelay=25 which still produced dumps.
 
 ### 7b. Combine hot-plug with a display solution
 
