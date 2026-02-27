@@ -242,15 +242,17 @@ else:
     regpath = display_class + "\\" + amd_idx
     log(f"AMD GPU driver at registry index {amd_idx}")
 
-    # Check current values
+    # Check current values ('N/A' distinguishes missing from 0)
     vals = run_ps(
         "$p = '" + regpath + "'; "
-        "$ulps = (Get-ItemProperty -Path $p -Name EnableUlps -EA SilentlyContinue).EnableUlps; "
-        "$sclk = (Get-ItemProperty -Path $p -Name PP_SclkDeepSleepDisable -EA SilentlyContinue).PP_SclkDeepSleepDisable; "
-        "$drm = (Get-ItemProperty -Path $p -Name DisableDrmdmaPowerOff -EA SilentlyContinue).DisableDrmdmaPowerOff; "
-        "Write-Output \"$ulps|$sclk|$drm\""
+        "$names = 'EnableUlps','PP_SclkDeepSleepDisable','DisableDrmdmaPowerOff'; "
+        "$vals = foreach($n in $names){ "
+        "  $v = (Get-ItemProperty -Path $p -Name $n -EA SilentlyContinue).$n; "
+        "  if($null -eq $v){ 'N/A' } else { $v } "
+        "}; "
+        "$vals -join '|'"
     )
-    parts = (vals or "||").split("|")
+    parts = (vals or "N/A|N/A|N/A").split("|")
     ulps, sclk, drm = parts[0].strip(), parts[1].strip(), parts[2].strip()
 
     if ulps == "0" and sclk == "1" and drm == "1":
@@ -260,13 +262,28 @@ else:
         if DRY_RUN:
             log("[dry-run] Would set EnableUlps=0, PP_SclkDeepSleepDisable=1, DisableDrmdmaPowerOff=1")
         else:
+            # New-ItemProperty -Force creates or overwrites with explicit DWORD type
             run_ps(
                 "$p = '" + regpath + "'; "
-                "Set-ItemProperty -Path $p -Name EnableUlps -Value 0; "
-                "Set-ItemProperty -Path $p -Name PP_SclkDeepSleepDisable -Value 1; "
-                "Set-ItemProperty -Path $p -Name DisableDrmdmaPowerOff -Value 1"
+                "New-ItemProperty -Path $p -Name EnableUlps -Value 0 -PropertyType DWord -Force | Out-Null; "
+                "New-ItemProperty -Path $p -Name PP_SclkDeepSleepDisable -Value 1 -PropertyType DWord -Force | Out-Null; "
+                "New-ItemProperty -Path $p -Name DisableDrmdmaPowerOff -Value 1 -PropertyType DWord -Force | Out-Null"
             )
-            log("AMD driver PM disabled")
+            # Verify write
+            check = run_ps(
+                "$p = '" + regpath + "'; "
+                "$names = 'EnableUlps','PP_SclkDeepSleepDisable','DisableDrmdmaPowerOff'; "
+                "$vals = foreach($n in $names){ "
+                "  $v = (Get-ItemProperty -Path $p -Name $n -EA SilentlyContinue).$n; "
+                "  if($null -eq $v){ 'N/A' } else { $v } "
+                "}; "
+                "$vals -join '|'"
+            )
+            cparts = (check or "").split("|")
+            if len(cparts) == 3 and cparts[0].strip() == "0" and cparts[1].strip() == "1" and cparts[2].strip() == "1":
+                log("AMD driver PM disabled (verified)")
+            else:
+                log(f"WARNING: AMD driver PM write may have failed — read back: {check}")
 PYEOF
 }
 
@@ -610,16 +627,19 @@ if idx_out:
     regpath = display_class + "\\" + idx_out.strip()
     vals = run_ps(
         "$p = '" + regpath + "'; "
-        "$ulps = (Get-ItemProperty -Path $p -Name EnableUlps -EA SilentlyContinue).EnableUlps; "
-        "$sclk = (Get-ItemProperty -Path $p -Name PP_SclkDeepSleepDisable -EA SilentlyContinue).PP_SclkDeepSleepDisable; "
-        "$drm = (Get-ItemProperty -Path $p -Name DisableDrmdmaPowerOff -EA SilentlyContinue).DisableDrmdmaPowerOff; "
-        "Write-Output \"$ulps|$sclk|$drm\""
+        "$names = 'EnableUlps','PP_SclkDeepSleepDisable','DisableDrmdmaPowerOff'; "
+        "$vals = foreach($n in $names){ "
+        "  $v = (Get-ItemProperty -Path $p -Name $n -EA SilentlyContinue).$n; "
+        "  if($null -eq $v){ 'N/A' } else { $v } "
+        "}; "
+        "$vals -join '|'"
     )
-    parts = (vals or "||").split("|")
-    if parts[0].strip() == "0" and parts[1].strip() == "1" and parts[2].strip() == "1":
+    parts = (vals or "N/A|N/A|N/A").split("|")
+    ulps, sclk, drm = parts[0].strip(), parts[1].strip(), parts[2].strip()
+    if ulps == "0" and sclk == "1" and drm == "1":
         log(f"AMD driver PM: OK (index {idx_out.strip()})")
     else:
-        log(f"AMD driver PM: EnableUlps={parts[0]}, SclkDeepSleep={parts[1]}, DrmdmaPowerOff={parts[2]}")
+        log(f"AMD driver PM: EnableUlps={ulps}, SclkDeepSleep={sclk}, DrmdmaPowerOff={drm}")
         ok = False
 else:
     log("AMD GPU driver: not found in registry")
