@@ -17,15 +17,15 @@ set -uo pipefail
 GPU="0000:03:00.0"
 GPU_AUDIO="0000:03:00.1"
 IGPU="0000:74:00.0"
-HOST_CPU=0          # CPU reserved for host tasks
+HOST_CPUS="0-1"     # CPUs reserved for host tasks + QEMU emulator/IO
 SHUTDOWN_SIGNAL_PORT=9147   # UDP port for Windows shutdown signal
 LOCK_FILE="/run/vm-overwatch.lock"
 
-# USB devices that need detach/reattach after VM start to clear ghost entries
-USB_DEVICES=(
-    "0x29ea:0x0102:Kinesis Keyboard"
-    "0x1532:0x022b:Tartarus V2"
-)
+# USB devices that need detach/reattach after VM start to clear ghost entries.
+# Disabled — reattach breaks Razer Synapse profile loading. Ghost entries
+# haven't recurred since the VM XML switched to VID:PID-only matching
+# (no hardcoded bus addresses). Re-enable if ghost entries return.
+USB_DEVICES=()
 
 # --- Parse arguments ---
 
@@ -365,21 +365,21 @@ set_igpu_blank() {
 
 ensure_performance_tuning() {
     log "Applying VM performance tuning..."
-    # Confine all host processes to HOST_CPU — VM cores get zero host interference
-    systemctl set-property --runtime -- system.slice AllowedCPUs=$HOST_CPU 2>/dev/null || true
-    systemctl set-property --runtime -- user.slice AllowedCPUs=$HOST_CPU 2>/dev/null || true
-    systemctl set-property --runtime -- init.scope AllowedCPUs=$HOST_CPU 2>/dev/null || true
+    # Confine all host processes to HOST_CPUS — VM cores get zero host interference
+    systemctl set-property --runtime -- system.slice AllowedCPUs=$HOST_CPUS 2>/dev/null || true
+    systemctl set-property --runtime -- user.slice AllowedCPUs=$HOST_CPUS 2>/dev/null || true
+    systemctl set-property --runtime -- init.scope AllowedCPUs=$HOST_CPUS 2>/dev/null || true
     # Set CPU governor to performance on all cores
     for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
         echo performance > "$gov" 2>/dev/null || true
     done
-    # Pin all IRQs to host CPU so VM cores get no interrupt overhead
+    # Pin all IRQs to host CPUs so VM cores get no interrupt overhead
     systemctl stop irqbalance 2>/dev/null || true
     for irq_dir in /proc/irq/*/; do
-        echo $HOST_CPU > "${irq_dir}smp_affinity_list" 2>/dev/null || true
+        echo $HOST_CPUS > "${irq_dir}smp_affinity_list" 2>/dev/null || true
     done
-    # Move RCU callbacks and writeback to host CPU
-    echo 1 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
+    # Move RCU callbacks and writeback to host CPUs
+    echo 3 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
 }
 
 # --- Guest diagnostics (queries Windows via QEMU guest agent) ---
@@ -517,6 +517,124 @@ out = run_ps(
 if out:
     print("DISPLAY_EVENTS")
     print(out)
+PYEOF
+}
+
+# --- Runtime performance monitors (background, killed on shutdown) ---
+
+# Host-side: CPU, disk I/O, memory every 30s. Tagged PERF_HOST for journalctl grep.
+monitor_host_perf() {
+    while true; do
+        # CPU: one-shot mpstat, per-core %usr+%sys+%guest, only cores >50% load
+        local cpu_line
+        cpu_line=$(mpstat -P ALL 1 1 2>/dev/null | awk '
+            /^Average:/ && $2 ~ /^[0-9]+$/ {
+                load = $3 + $5 + $10
+                if (load > 50) printf "cpu%s=%.0f%% ", $2, load
+            }')
+        [ -n "$cpu_line" ] && log "PERF_HOST cpu: $cpu_line"
+
+        # Disk: one-shot iostat for the VM's NVMe
+        local io_line
+        io_line=$(iostat -x 1 1 2>/dev/null | awk '
+            /^nvme1n1/ { printf "r_await=%.1fms w_await=%.1fms util=%.0f%%", $6, $12, $NF }')
+        [ -n "$io_line" ] && log "PERF_HOST disk: $io_line"
+
+        # Memory: free, available, swap from /proc/meminfo
+        local mem_free mem_avail swap_used
+        mem_free=$(awk '/^MemFree:/ {printf "%.0fG", $2/1048576}' /proc/meminfo)
+        mem_avail=$(awk '/^MemAvailable:/ {printf "%.0fG", $2/1048576}' /proc/meminfo)
+        swap_used=$(awk '/^SwapTotal:/ {t=$2} /^SwapFree:/ {printf "%.0fM", (t-$2)/1024}' /proc/meminfo)
+        log "PERF_HOST mem: free=$mem_free avail=$mem_avail swap=$swap_used"
+
+        sleep 30
+    done
+}
+
+# Guest-side: GPU sensors every 60s via QEMU guest agent + LibreHardwareMonitor WMI.
+# Tagged PERF_GUEST for journalctl grep. Requires LHM running on guest (scheduled
+# task "LibreHardwareMonitor" as SYSTEM). Duplicates qga/run_ps helpers from
+# log_guest_diagnostics (embedded in heredoc — sharing isn't practical).
+monitor_guest_perf() {
+    python3 << 'PYEOF'
+import subprocess, json, base64, time, sys
+
+sys.stdout.reconfigure(line_buffering=True)
+
+def qga(payload):
+    try:
+        r = subprocess.run(
+            ["virsh", "qemu-agent-command", "overwatch", json.dumps(payload)],
+            capture_output=True, text=True, timeout=10)
+        return json.loads(r.stdout) if r.returncode == 0 else None
+    except Exception:
+        return None
+
+def run_ps(cmd):
+    result = qga({"execute": "guest-exec", "arguments": {
+        "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "arg": ["-Command", cmd],
+        "capture-output": True}})
+    if not result:
+        return ""
+    pid = result["return"]["pid"]
+    time.sleep(5)
+    status = qga({"execute": "guest-exec-status", "arguments": {"pid": pid}})
+    if not status:
+        return ""
+    r = status["return"]
+    if not r.get("exited"):
+        time.sleep(5)
+        status = qga({"execute": "guest-exec-status", "arguments": {"pid": pid}})
+        if status:
+            r = status["return"]
+    if r.get("out-data"):
+        return base64.b64decode(r["out-data"]).decode().strip()
+    return ""
+
+# Wait for guest agent (up to 60s)
+for _ in range(30):
+    if qga({"execute": "guest-ping"}):
+        break
+    time.sleep(2)
+else:
+    sys.exit(0)
+
+# Wait for LHM WMI namespace (may take a few seconds after boot)
+for attempt in range(10):
+    out = run_ps(
+        "Get-CimInstance -Namespace root\\LibreHardwareMonitor "
+        "-ClassName Sensor -EA SilentlyContinue | Select-Object -First 1 Name"
+    )
+    if out:
+        break
+    time.sleep(6)
+else:
+    print("PERF_GUEST LHM WMI not available — skipping guest monitoring")
+    sys.exit(0)
+
+while True:
+    out = run_ps(
+        "$s = Get-CimInstance -Namespace root\\LibreHardwareMonitor -ClassName Sensor "
+        "-Filter \"Parent LIKE '/gpu%'\" -EA SilentlyContinue; "
+        "$val = @{}; foreach ($x in $s) { $val[\"$($x.Name)|$($x.SensorType)\"] = $x.Value }; "
+        "$core_t = [math]::Round($val['GPU Core|Temperature'], 0); "
+        "$hot_t = [math]::Round($val['GPU Hot Spot|Temperature'], 0); "
+        "$mem_t = [math]::Round($val['GPU Memory|Temperature'], 0); "
+        "$core_clk = [math]::Round($val['GPU Core|Clock'], 0); "
+        "$mem_clk = [math]::Round($val['GPU Memory|Clock'], 0); "
+        "$load = [math]::Round($val['GPU Core|Load'], 0); "
+        "$pwr = [math]::Round($val['GPU Package|Power'], 0); "
+        "$vram_used = [math]::Round($val['GPU Memory Used|SmallData'], 0); "
+        "$vram_total = [math]::Round($val['GPU Memory Total|SmallData'], 0); "
+        "Write-Output \"load=${load}% temp=${core_t}/${hot_t}/${mem_t}C "
+        "clk=${core_clk}/${mem_clk}MHz pwr=${pwr}W "
+        "vram=${vram_used}/${vram_total}MB\""
+    )
+    if out:
+        print(f"PERF_GUEST {out}")
+
+    time.sleep(60)
 PYEOF
 }
 
@@ -706,14 +824,22 @@ _do_start() {
     ensure_vm_running || { log "ERROR: VM start failed"; _do_stop; exit 1; }
 
     # Post-VM-start setup (non-critical, continue on failure)
-    ensure_usb_reattached
     set_igpu_blank 4 blank || true
     ensure_performance_tuning
 
     log_state "vm_running"
     log "VM running. Waiting for shutdown..."
 
-    # Query guest diagnostics from Windows in background (non-blocking)
+    # Background performance monitors (non-blocking)
+    monitor_host_perf &
+    local perf_host_pid=$!
+    monitor_guest_perf &
+    local perf_guest_pid=$!
+
+    # Query guest diagnostics + deferred USB reattach in background.
+    # USB reattach is deferred until after guest agent is up so that
+    # Razer Synapse (and similar) is running and applies device profiles
+    # correctly. Doing it immediately after VM start causes profile loss.
     (
         output=$(log_guest_diagnostics 2>/dev/null) || true
         if [ -n "$output" ]; then
@@ -735,6 +861,8 @@ _do_start() {
                 esac
             done <<< "$output"
         fi
+        # Guest agent is up — Synapse should be loaded. Reattach USB now.
+        ensure_usb_reattached
     ) &
     local diag_pid=$!
 
@@ -795,11 +923,15 @@ open('${shutdown_ts_file}', 'w').write(str(int(time.time())))
         fi
         sleep 2
     done
-    # Clean up listener and diagnostics background job
+    # Clean up background jobs
     kill "$listener_pid" 2>/dev/null || true
     wait "$listener_pid" 2>/dev/null || true
     kill "$diag_pid" 2>/dev/null || true
     wait "$diag_pid" 2>/dev/null || true
+    kill "$perf_host_pid" 2>/dev/null || true
+    wait "$perf_host_pid" 2>/dev/null || true
+    kill "$perf_guest_pid" 2>/dev/null || true
+    wait "$perf_guest_pid" 2>/dev/null || true
 
     log "VM shut down detected."
     if [ -f "$shutdown_ts_file" ]; then

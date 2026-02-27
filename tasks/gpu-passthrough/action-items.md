@@ -59,7 +59,13 @@ Disabled `Windows.SystemToast.Graphics.AutoHDR` notification (separate from Game
 
 ## 6. Host-side CPU isolation — Implemented
 
-Three-layer isolation: libvirt `emulatorpin`/`iothreadpin` on core 0, vm-overwatch `AllowedCPUs=0` on system/user/init slices, IRQ pinning. Reduced WATCHDOG dump frequency from ~100% to ~33%. See [CPU Isolation Architecture](recipe/setup.md#cpu-isolation-architecture).
+Three-layer isolation: libvirt `emulatorpin`/`iothreadpin` on cores 0–1,
+vm-overwatch `AllowedCPUs=0-1` on system/user/init slices, IRQ pinning.
+Originally single-core (cpu0) but expanded to 2 cores after PERF_HOST
+monitoring showed cpu0 at 100% during gameplay — QEMU emulator thread
+competing with VS Code/Claude/node for USB audio isochronous transfers,
+causing headset static. 6 vCPUs on cores 2–7 (was 7 on cores 1–7).
+See [CPU Isolation Architecture](recipe/setup.md#cpu-isolation-architecture).
 
 ---
 
@@ -134,32 +140,43 @@ This is a research item, not an immediate fix.
 
 ## 8. Host-side runtime performance monitoring
 
-**Status:** Open
+**Status:** Implemented (`monitor_host_perf()` in vm-overwatch.sh)
 
 **Problem:** No CPU, disk I/O, or memory metrics collected during VM runtime.
 When gameplay stuttering occurs, there's no data to distinguish host-side
 contention (core 0 saturation, qcow2 latency, memory pressure) from
 guest-side issues.
 
-**Proposed:** Add a background monitoring function to vm-overwatch that
-samples `mpstat -P ALL`, `iostat -x`, and `vmstat` at ~5s intervals during
-VM runtime. Log to journald with a prefix (e.g., `PERF_HOST`) for easy
-filtering. Start when VM enters running state, stop on shutdown.
+**Fix:** Background subshell samples every 30s during VM runtime:
+
+- `mpstat -P ALL` — per-core CPU load (only cores >50% logged)
+- `iostat -x` — NVMe r_await, w_await, %util
+- `/proc/meminfo` — free, available memory, swap usage
+
+Logs tagged `PERF_HOST` for `journalctl -u vm-overwatch | grep PERF_HOST`.
+Launched in `_do_start()`, killed on shutdown alongside other background jobs.
 
 ## 9. Guest-side runtime performance monitoring
 
-**Status:** Open
+**Status:** Implemented (`monitor_guest_perf()` in vm-overwatch.sh)
 
 **Problem:** No GPU utilization, clock speed, temperature, or VRAM usage data
 during gameplay. Can't determine if stuttering is thermal throttling, driver
 stalls, or resource exhaustion.
 
-**Proposed:** Two tiers:
-1. **Zero-effort**: Use Overwatch's built-in overlay (Ctrl+Shift+N) to
-   observe frame time, render time, and network latency during gameplay.
-2. **Automated**: Periodic PowerShell WMI queries via guest agent during
-   runtime, or install GPU-Z with CLI sensor logging to a file that can be
-   retrieved post-session.
+**Fix:** Background subshell samples every 60s via QEMU guest agent:
+
+- GPU 3D engine utilization via `Get-Counter`
+- GPU temperature and clock speed via AMD WMI (graceful fallback)
+- Video controller status and VRAM from `Win32_VideoController`
+
+Logs tagged `PERF_GUEST` for `journalctl -u vm-overwatch | grep PERF_GUEST`.
+Uses same `qga`/`run_ps` pattern as `log_guest_diagnostics()`. Launched in
+`_do_start()`, killed on shutdown.
+
+**Note:** For frame-level analysis, Overwatch's built-in overlay
+(Ctrl+Shift+N) still provides frame time, render time, and network latency
+that the guest agent can't capture.
 
 ---
 

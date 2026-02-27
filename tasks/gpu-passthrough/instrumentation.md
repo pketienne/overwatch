@@ -18,9 +18,10 @@ organized by side (host/guest) and phase (startup/runtime/shutdown).
 ### CPU Isolation & Tuning — Implemented
 
 - **ensure_performance_tuning()** (lines 366–383) — cgroup confinement
-  (system.slice, user.slice, init.scope) to CPU 0, governor=performance on
-  all cores, IRQ pinning to host CPU, writeback affinity. Runs once after VM
-  enters running state.
+  (system.slice, user.slice, init.scope) to CPUs 0–1, governor=performance
+  on all cores, IRQ pinning to host CPUs, writeback affinity. Expanded from
+  single core after PERF_HOST monitoring revealed cpu0 saturation causing
+  USB audio drops. Runs once after VM enters running state.
 
 ### GPU Hardware — Implemented
 
@@ -54,18 +55,17 @@ organized by side (host/guest) and phase (startup/runtime/shutdown).
 - **ERR trap** (lines 167–172) — traps ERR signal, logs failing line number,
   command text, and exit code. Calls `log_state("on_error")` for context.
 
-### Runtime Performance Monitoring — Gap
+### Runtime Performance Monitoring — Implemented (monitor_host_perf, lines 526–552)
 
-No host-side metrics collected during VM runtime. When gameplay stuttering
-occurs, there is no data to distinguish host-side contention from guest-side
-issues.
+Background subshell samples every 30s while VM is running. Tagged `PERF_HOST`
+for `journalctl -u vm-overwatch | grep PERF_HOST`. Launched in `_do_start()`,
+killed on shutdown alongside other background jobs.
 
-| Metric | Tool | What it would diagnose |
+| Metric | Tool | What it diagnoses |
 |---|---|---|
-| Per-core CPU utilization | `mpstat -P ALL` | Core 0 saturation, host interference on vCPU cores 1–7 |
-| Disk I/O latency | `iostat -x` | qcow2 read/write latency, I/O wait |
-| Memory pressure | `vmstat` | Swapping, page faults, free memory depletion |
-| Kernel errors | `dmesg -w` | VFIO/IOMMU errors, PCIe AER during gameplay |
+| Per-core CPU utilization | `mpstat -P ALL` (cores >50% only) | Core 0 saturation, host interference on vCPU cores 1–7 |
+| Disk I/O latency | `iostat -x` (nvme1n1) | qcow2 read/write await, utilization |
+| Memory pressure | `/proc/meminfo` | Free/available memory, swap usage |
 
 See [Action Item 8](action-items.md#8-host-side-runtime-performance-monitoring).
 
@@ -91,16 +91,20 @@ Waits up to 60s for guest agent, then queries five data sources:
   providers. Shows mini-TDR recoveries (Event 4101), display config changes,
   and GPU stalls.
 
-### Runtime Performance Monitoring — Gap
+### Runtime Performance Monitoring — Implemented (monitor_guest_perf, lines 557–626)
 
-No GPU utilization, clock speed, temperature, or VRAM usage data during
-gameplay. Can't determine if stuttering is thermal throttling, driver stalls,
-or resource exhaustion.
+Background subshell samples every 60s via QEMU guest agent (`qga`/`run_ps`
+pattern, same as `log_guest_diagnostics`). Tagged `PERF_GUEST` for
+`journalctl -u vm-overwatch | grep PERF_GUEST`. Launched in `_do_start()`,
+killed on shutdown.
 
-| Metric | Tool | What it would diagnose |
+| Metric | Tool | What it diagnoses |
 |---|---|---|
-| GPU clocks, temps, utilization, VRAM | PowerShell WMI, GPU-Z CLI, or HWiNFO | Thermal throttling, clock drops, VRAM exhaustion |
-| Guest CPU usage | `Get-Counter` or Task Manager | CPU bottleneck inside VM |
-| Frame time | Overwatch overlay (Ctrl+Shift+N) | Render stalls, network latency, frame pacing |
+| GPU 3D engine utilization | `Get-Counter` GPU Engine perf counters | GPU load during gameplay |
+| GPU temperature, clock speed | AMD WMI (`AMD_ACPI`) with graceful fallback | Thermal throttling, clock drops |
+| Video controller status, VRAM | `Win32_VideoController` | Driver status, VRAM availability |
+
+Frame time and render stalls are not capturable via guest agent — use
+Overwatch's built-in overlay (Ctrl+Shift+N) for those.
 
 See [Action Item 9](action-items.md#9-guest-side-runtime-performance-monitoring).
