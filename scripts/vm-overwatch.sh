@@ -262,6 +262,18 @@ ensure_gpu_unbound_from_host() {
     fi
 
     if [ "$gpu_drv" = "amdgpu" ]; then
+        # Suspend the dGPU framebuffer before unbinding. drm_fb_helper has a
+        # damage_work worker that blits shadow→VRAM; if it's in-flight during
+        # teardown, cancel_work_sync in drm_fb_helper_fini deadlocks because
+        # the GPU hardware is being removed. Setting state=1 (FBINFO_STATE_SUSPENDED)
+        # causes damage_work to bail out immediately. ~1.5% hit rate without this.
+        for fb in /sys/class/graphics/fb*/; do
+            if readlink -f "${fb}device" 2>/dev/null | grep -q "$GPU"; then
+                echo 1 > "${fb}state" 2>/dev/null || true
+                log "Suspended framebuffer $(basename "$fb")"
+                break
+            fi
+        done
         log "Unbinding GPU from amdgpu..."
         echo "$GPU" > /sys/bus/pci/drivers/amdgpu/unbind
         sleep 2

@@ -160,3 +160,22 @@ stalls, or resource exhaustion.
 2. **Automated**: Periodic PowerShell WMI queries via guest agent during
    runtime, or install GPU-Z with CLI sensor logging to a file that can be
    retrieved post-session.
+
+---
+
+## 10. Suspend dGPU framebuffer before amdgpu unbind
+
+**Status:** Implemented (`ensure_gpu_unbound_from_host()` in vm-overwatch.sh)
+
+**Problem:** Sysfs amdgpu unbind deadlocks ~1.5% of the time (2 out of ~133
+cycles). `drm_fb_helper_fini` calls `cancel_work_sync(&damage_work)` during
+driver removal, but the damage worker is already running and stuck trying to
+blit to VRAM on dying hardware. Process enters D-state (uninterruptible
+sleep), requiring a hard power cycle.
+
+**Fix:** Set `/sys/class/graphics/fbN/state` to `1` (`FBINFO_STATE_SUSPENDED`)
+before the amdgpu unbind. The damage worker checks this state and returns
+immediately instead of attempting the VRAM blit. The dGPU framebuffer is found
+by PCI device path (not hardcoded fb number).
+
+See [case study](../troubleshooting-methodology/case-studies.md#drm_fb_helper_fini-deadlock-method-2).

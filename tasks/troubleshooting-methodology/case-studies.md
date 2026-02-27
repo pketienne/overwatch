@@ -267,6 +267,75 @@ through guest agent — driver loads post-boot with zero contention.
 
 ---
 
+## drm_fb_helper_fini Deadlock (Method 2)
+
+The amdgpu sysfs unbind hung in D-state, requiring a hard power cycle. This
+was the second occurrence across ~133 unbind cycles (~1.5% hit rate) — rare
+enough to not be obvious, but a hard failure when it hits.
+
+### Kernel stack trace
+
+```
+__flush_work
+cancel_work_sync
+drm_fb_helper_fini
+drm_fbdev_ttm_fb_destroy
+put_fb_info
+unregister_framebuffer
+drm_fb_helper_unregister_info
+drm_fbdev_client_unregister
+drm_client_dev_unregister
+drm_dev_unregister
+drm_dev_unplug
+amdgpu_pci_remove          ← triggered by sysfs unbind
+```
+
+### Root cause
+
+`drm_fb_helper` has a `damage_work` worker that blits the shadow framebuffer
+to VRAM (`drm_fb_helper_damage_work` → `drm_fbdev_ttm_damage_blit`). During
+driver removal, `drm_fb_helper_fini` calls `cancel_work_sync(&damage_work)`
+to wait for any in-flight work to complete. But the work was already running
+and trying to access GPU VRAM via TTM buffer mapping — the GPU hardware was
+being torn down concurrently by `amdgpu_pci_remove`, so the buffer operation
+hung on dead hardware. `cancel_work_sync` waited forever.
+
+This is **not** a `console_lock` deadlock (the damage worker doesn't touch
+`console_lock`). It's a race between a queued framebuffer dirty operation and
+device removal.
+
+### The early-out
+
+The damage worker has a guard:
+
+```c
+static void drm_fb_helper_damage_work(struct work_struct *work) {
+    if (helper->info->state != FBINFO_STATE_RUNNING)
+        return;                    // bails immediately
+    drm_fb_helper_fb_dirty(helper);
+}
+```
+
+Setting `/sys/class/graphics/fbN/state` to `1` (`FBINFO_STATE_SUSPENDED`)
+before initiating the unbind causes any in-flight or newly-scheduled damage
+work to return immediately instead of trying to access dying hardware.
+
+### Fix
+
+Added to `ensure_gpu_unbound_from_host()` in vm-overwatch: find the dGPU's
+framebuffer by PCI device path and set `state=1` before the amdgpu unbind
+echo. One-line sysfs write that directly closes the race window.
+
+### Key insight
+
+VT console unbinding (`echo 0 > vtcon*/bind`) was already done before the
+GPU unbind, but that only detaches the console *input* — it doesn't prevent
+the DRM fbdev client from scheduling damage work for pending
+redraws. The framebuffer and the VT console are separate subsystems with
+separate lifecycle management.
+
+---
+
 ## Build/Remove Cycle (Method 5)
 
 The script grew from 212 to 967 lines through iterative problem-solving:
