@@ -17,13 +17,18 @@ organized by side (host/guest) and phase (startup/runtime/shutdown).
 
 ### CPU Isolation & Tuning — Implemented
 
-- **ensure_performance_tuning()** (lines 354–371) — cgroup confinement
+- **ensure_performance_tuning()** (lines 366–383) — cgroup confinement
   (system.slice, user.slice, init.scope) to CPU 0, governor=performance on
   all cores, IRQ pinning to host CPU, writeback affinity. Runs once after VM
   enters running state.
 
 ### GPU Hardware — Implemented
 
+- **Framebuffer suspend** (lines 268–275) — sets dGPU framebuffer state to
+  `FBINFO_STATE_SUSPENDED` via sysfs before amdgpu unbind. Prevents
+  `drm_fb_helper_fini` deadlock where `cancel_work_sync(&damage_work)` waits
+  forever on a blit to dying hardware (~1.5% hit rate without this). Finds
+  framebuffer by PCI device path. Runs in `ensure_gpu_unbound_from_host()`.
 - **gpu_bus_reset()** (lines 55–70) — PCIe Secondary Bus Reset via sysfs +
   vendor ID readiness poll (setpci, 100ms intervals, 2s timeout). Called at
   VFIO bind (clean guest handoff) and host rebind (post-VFIO).
@@ -33,14 +38,14 @@ organized by side (host/guest) and phase (startup/runtime/shutdown).
 
 ### Shutdown Timing — Implemented
 
-- **UDP shutdown signal** (lines 729–740) — Python listener on port 9147.
+- **UDP shutdown signal** (lines 741–752) — Python listener on port 9147.
   Receives timestamp from Windows `notify-host-shutdown.ps1` (triggered by
   Event ID 1074 scheduled task). Writes timestamp to temp file for delta
   calculation.
-- **QEMU process state tracking** (lines 747–764) — reads
+- **QEMU process state tracking** (lines 759–776) — reads
   `/proc/<pid>/status` State field, logs transitions (S→D→exited). Only
   active after shutdown signal received to avoid noise.
-- **Libvirt domain state polling** (lines 749–785) — `virsh domstate` every
+- **Libvirt domain state polling** (lines 761–797) — `virsh domstate` every
   2s. Detects clean shutdown, orphaned QEMU (domain-not-found 3x), and
   calculates shutdown duration from signal to VM stop.
 
@@ -66,7 +71,7 @@ See [Action Item 8](action-items.md#8-host-side-runtime-performance-monitoring).
 
 ## Guest-Side
 
-### Post-Boot Diagnostics — Implemented (log_guest_diagnostics, lines 380–509)
+### Post-Boot Diagnostics — Implemented (log_guest_diagnostics, lines 392–521)
 
 Runs via QEMU guest agent after VM boot. Non-blocking (background subshell).
 Waits up to 60s for guest agent, then queries five data sources:
