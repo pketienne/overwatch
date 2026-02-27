@@ -25,7 +25,7 @@ organized by side (host/guest) and phase (startup/runtime/shutdown).
 
 ### GPU Hardware — Implemented
 
-- **Framebuffer suspend** (lines 268–275) — sets dGPU framebuffer state to
+- **Framebuffer suspend** (lines 265–276) — sets dGPU framebuffer state to
   `FBINFO_STATE_SUSPENDED` via sysfs before amdgpu unbind. Prevents
   `drm_fb_helper_fini` deadlock where `cancel_work_sync(&damage_work)` waits
   forever on a blit to dying hardware (~1.5% hit rate without this). Finds
@@ -39,14 +39,14 @@ organized by side (host/guest) and phase (startup/runtime/shutdown).
 
 ### Shutdown Timing — Implemented
 
-- **UDP shutdown signal** (lines 741–752) — Python listener on port 9147.
+- **UDP shutdown signal** (lines 870–880) — Python listener on port 9147.
   Receives timestamp from Windows `notify-host-shutdown.ps1` (triggered by
   Event ID 1074 scheduled task). Writes timestamp to temp file for delta
   calculation.
-- **QEMU process state tracking** (lines 759–776) — reads
+- **QEMU process state tracking** (lines 886–903) — reads
   `/proc/<pid>/status` State field, logs transitions (S→D→exited). Only
   active after shutdown signal received to avoid noise.
-- **Libvirt domain state polling** (lines 761–797) — `virsh domstate` every
+- **Libvirt domain state polling** (lines 883–924) — `virsh domstate` every
   2s. Detects clean shutdown, orphaned QEMU (domain-not-found 3x), and
   calculates shutdown duration from signal to VM stop.
 
@@ -91,18 +91,22 @@ Waits up to 60s for guest agent, then queries five data sources:
   providers. Shows mini-TDR recoveries (Event 4101), display config changes,
   and GPU stalls.
 
-### Runtime Performance Monitoring — Implemented (monitor_guest_perf, lines 557–626)
+### Runtime Performance Monitoring — Implemented (monitor_guest_perf, lines 558–639)
 
 Background subshell samples every 60s via QEMU guest agent (`qga`/`run_ps`
-pattern, same as `log_guest_diagnostics`). Tagged `PERF_GUEST` for
+pattern, same as `log_guest_diagnostics`). Queries LibreHardwareMonitor WMI
+(`root\LibreHardwareMonitor` namespace, requires LHM v0.9.4 net472 running
+as SYSTEM on guest). Tagged `PERF_GUEST` for
 `journalctl -u vm-overwatch | grep PERF_GUEST`. Launched in `_do_start()`,
 killed on shutdown.
 
 | Metric | Tool | What it diagnoses |
 |---|---|---|
-| GPU 3D engine utilization | `Get-Counter` GPU Engine perf counters | GPU load during gameplay |
-| GPU temperature, clock speed | AMD WMI (`AMD_ACPI`) with graceful fallback | Thermal throttling, clock drops |
-| Video controller status, VRAM | `Win32_VideoController` | Driver status, VRAM availability |
+| GPU core load | LHM `GPU Core\|Load` | GPU utilization during gameplay |
+| GPU temps (core/hotspot/memory) | LHM `GPU Core\|Temperature` etc. | Thermal throttling |
+| GPU clocks (core/memory) | LHM `GPU Core\|Clock`, `GPU Memory\|Clock` | Clock drops, idle vs boost |
+| GPU power | LHM `GPU Package\|Power` | Power limit throttling |
+| VRAM used/total | LHM `GPU Memory Used\|SmallData` etc. | VRAM exhaustion |
 
 Frame time and render stalls are not capturable via guest agent — use
 Overwatch's built-in overlay (Ctrl+Shift+N) for those.

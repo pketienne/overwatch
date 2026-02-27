@@ -164,11 +164,12 @@ Launched in `_do_start()`, killed on shutdown alongside other background jobs.
 during gameplay. Can't determine if stuttering is thermal throttling, driver
 stalls, or resource exhaustion.
 
-**Fix:** Background subshell samples every 60s via QEMU guest agent:
+**Fix:** Background subshell samples every 60s via QEMU guest agent +
+LibreHardwareMonitor WMI (`root\LibreHardwareMonitor`, requires LHM v0.9.4
+net472 running as SYSTEM on guest):
 
-- GPU 3D engine utilization via `Get-Counter`
-- GPU temperature and clock speed via AMD WMI (graceful fallback)
-- Video controller status and VRAM from `Win32_VideoController`
+- GPU core load, temps (core/hotspot/memory), clocks (core/memory)
+- GPU package power, VRAM used/total
 
 Logs tagged `PERF_GUEST` for `journalctl -u vm-overwatch | grep PERF_GUEST`.
 Uses same `qga`/`run_ps` pattern as `log_guest_diagnostics()`. Launched in
