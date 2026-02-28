@@ -917,7 +917,6 @@ _do_start() {
                 esac
             done <<< "$output"
         fi
-        # Guest agent is up — Synapse should be loaded. Reattach USB now.
         ensure_usb_reattached
     ) &
     local diag_pid=$!
