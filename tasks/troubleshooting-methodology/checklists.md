@@ -7,6 +7,7 @@ reasoning behind each item, see [principles](principles.md) and
 ---
 
 ## Before you start
+- [ ] **Verify Tamper Protection is ON** (`TamperProtection=0x5` in `HKLM\SOFTWARE\Microsoft\Windows Defender\Features`). Never disable it — see [Phase 12](../gpu-passthrough/recipe/configure.md#phase-12-defender--telemetry)
 - [ ] What changed recently? (OS updates, driver updates, firmware, config)
 - [ ] Can you reproduce reliably? How often?
 - [ ] What's your measurement? (timestamps, logs, counters)

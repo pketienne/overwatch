@@ -129,12 +129,15 @@ contention, but reduces runtime overhead):
 ) | ForEach-Object { Add-MpPreference -ExclusionProcess $_ }
 ```
 
-> **Note:** Tamper Protection should be ON. Exclusions are not protected by
-> Tamper Protection on standalone (non-domain) devices (`TPExclusions=0`).
-> Defender real-time protection stays fully enabled. The DeferDefenderEnable
-> scheduled task still exists but is effectively inert — it sets
-> `ScanAvgCPULoadFactor` which only affects scheduled scans, not the boot-time
-> service initialization that causes the contention.
+> **CRITICAL: Tamper Protection must ALWAYS remain ON.** Turning it off disables
+> multiple Windows security layers (WdBoot ELAM, WdFilter minifilter, Protected
+> Process Light) and makes DisableRealtimeMonitoring sticky for the session —
+> Defender cannot be re-enabled without a reboot. There is no scenario where
+> disabling Tamper Protection is acceptable for this VM. If a future change
+> appears to require it, find another approach.
+>
+> Exclusions are not protected by Tamper Protection on standalone (non-domain)
+> devices (`TPExclusions=0`). Defender real-time protection stays fully enabled.
 
 ### Disable AMD Telemetry (AUEPMaster)
 
