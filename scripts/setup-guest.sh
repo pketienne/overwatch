@@ -656,8 +656,40 @@ if not approved_ok:
         else:
             log(f"WARNING: StartupApproved write may have failed — read back: {check}")
 
-# --- 2. Create RazerSynapseDelayed scheduled task ---
-# 15s logon delay gives USB devices time to enumerate before Synapse scans.
+# --- 2. Write start-synapse.ps1 restart script ---
+# Synapse must be killed and relaunched to apply device settings.
+# The script launches Synapse, waits 30s, kills it, then relaunches.
+synapse_script = (
+    '# start-synapse.ps1 - Launch Synapse, wait, restart to apply device settings\r\n'
+    '$synapse = "C:\\Program Files\\Razer\\RazerAppEngine\\RazerAppEngine.exe"\r\n'
+    '$argList = "--url-params=apps=synapse,chroma-app '
+    '--launch-force-hidden=synapse,chroma-app --autoStart=1"\r\n'
+    '\r\n'
+    '# First launch\r\n'
+    'Start-Process -FilePath $synapse -ArgumentList $argList -WindowStyle Minimized\r\n'
+    'Start-Sleep -Seconds 30\r\n'
+    '\r\n'
+    '# Kill all Synapse processes\r\n'
+    'Get-Process -Name RazerAppEngine -ErrorAction SilentlyContinue | Stop-Process -Force\r\n'
+    'Start-Sleep -Seconds 5\r\n'
+    '\r\n'
+    '# Relaunch - settings now apply to already-enumerated USB devices\r\n'
+    'Start-Process -FilePath $synapse -ArgumentList $argList -WindowStyle Minimized\r\n'
+)
+
+run_ps(r"New-Item -ItemType Directory -Path 'C:\ProgramData\overwatch' -Force | Out-Null")
+
+if DRY_RUN:
+    log("[dry-run] Would write C:\\ProgramData\\overwatch\\start-synapse.ps1")
+else:
+    if guest_file_write(r"C:\ProgramData\overwatch\start-synapse.ps1", synapse_script):
+        log("Wrote start-synapse.ps1")
+    else:
+        log("ERROR: Failed to write start-synapse.ps1")
+        sys.exit(1)
+
+# --- 3. Create RazerSynapseDelayed scheduled task ---
+# 15s logon delay gives USB devices time to enumerate before the restart script runs.
 task_out = run_ps(
     "$t = Get-ScheduledTask -TaskName RazerSynapseDelayed -EA SilentlyContinue; "
     "if($t){ $t.State } else { 'MISSING' }"
@@ -670,7 +702,7 @@ else:
     if DRY_RUN:
         log("[dry-run] Would create RazerSynapseDelayed scheduled task (15s logon delay)")
     else:
-        # Write task XML via guest-file API, then import with schtasks
+        # Task runs the restart script in the user's logon session
         task_xml = (
             '<?xml version="1.0"?>\r\n'
             '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\r\n'
@@ -682,12 +714,9 @@ else:
             '  </Triggers>\r\n'
             '  <Actions>\r\n'
             '    <Exec>\r\n'
-            '      <Command>cmd</Command>\r\n'
-            '      <Arguments>/c start /min "" '
-            '"C:\\Program Files\\Razer\\RazerAppEngine\\RazerAppEngine.exe" '
-            '--url-params=apps=synapse,chroma-app '
-            '--launch-force-hidden=synapse,chroma-app '
-            '--autoStart=1</Arguments>\r\n'
+            '      <Command>powershell.exe</Command>\r\n'
+            '      <Arguments>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden '
+            '-File C:\\ProgramData\\overwatch\\start-synapse.ps1</Arguments>\r\n'
             '    </Exec>\r\n'
             '  </Actions>\r\n'
             '  <Principals>\r\n'
