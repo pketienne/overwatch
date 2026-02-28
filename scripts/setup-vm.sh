@@ -44,7 +44,7 @@ VIRTIO_ISO="/home/myuser/Downloads/virtio-win.iso"
 USB_DEVICES=(
     "0x29ea:0x0102:Kinesis Advantage2"
     "0x1532:0x00a7:Razer Naga V2 Pro"
-    "0x1532:0x022b:Razer Tartarus V2"
+    # Tartarus V2 omitted — attached at runtime by overwatch.sh after Synapse is running
     "0x1532:0x0c05:Razer Strider Chroma"
     "0x1038:0x1294:SteelSeries Arctis Pro Wireless"
 )

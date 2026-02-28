@@ -13,7 +13,7 @@
 #   telemetry  Phase 12: Disable AMD telemetry (AUEPMaster)
 #   display    Phase 13: Auto HDR off, Game Bar off, toast off
 #   shutdown   Phase 14: Install shutdown signal script and scheduled task
-#   synapse    Synapse delayed start (prevents windows, ensures Tartarus detection)
+#   synapse    Synapse delayed start (prevents windows on boot)
 #   verify     Query all settings and report current vs expected
 #   boot-timing  Show boot timing log from guest
 #
@@ -68,7 +68,7 @@ if [ -z "$CMD" ]; then
     echo "  telemetry  Phase 12: Disable AMD telemetry (AUEPMaster)"
     echo "  display    Phase 13: Auto HDR off, Game Bar off, toast off"
     echo "  shutdown   Phase 14: Shutdown signal script and scheduled task"
-    echo "  synapse    Synapse delayed start (prevents windows, ensures Tartarus)"
+    echo "  synapse    Synapse delayed start (prevents windows on boot)"
     echo "  verify     Query all settings and report status"
     echo "  boot-timing  Show boot timing log from guest"
     exit 1
@@ -598,7 +598,9 @@ PYEOF
 }
 
 # ============================================================
-# Synapse: Delayed start (prevents windows + ensures Tartarus detection)
+# Synapse: Delayed start (prevents windows on boot)
+# Tartarus profile detection is handled by host-side deferred
+# USB attach in overwatch.sh (attach_tartarus_deferred).
 # ============================================================
 
 ensure_synapse_delayed() {
@@ -658,11 +660,13 @@ if not approved_ok:
         else:
             log(f"WARNING: StartupApproved write may have failed — read back: {check}")
 
-# --- 2. Write start-synapse.ps1 restart script ---
-# Synapse must be killed and relaunched to apply device settings.
-# The script launches Synapse, waits 30s, kills it, then relaunches.
+# --- 2. Write start-synapse.ps1 launch script ---
+# Tartarus profile detection is handled by host-side deferred USB attach
+# (attach_tartarus_deferred in overwatch.sh), so no kill/restart needed.
 synapse_script = (
-    '# start-synapse.ps1 - Launch Synapse, wait, restart to apply device settings\r\n'
+    '# start-synapse.ps1 - Launch Synapse after desktop is ready\r\n'
+    '# Tartarus is attached by the host after Synapse is running,\r\n'
+    '# so Synapse applies profiles on hot-plug (no restart needed).\r\n'
     '\r\n'
     '# --- Timing helper ---\r\n'
     'function Write-Timing($phase) {\r\n'
@@ -687,17 +691,7 @@ synapse_script = (
     '}\r\n'
     'Write-Timing "shell-ready"\r\n'
     '\r\n'
-    '# First launch\r\n'
-    'Start-Process -FilePath $synapse -ArgumentList $argList -WindowStyle Minimized\r\n'
-    'Write-Timing "first-launch"\r\n'
-    'Start-Sleep -Seconds 30\r\n'
-    '\r\n'
-    '# Kill all Synapse processes\r\n'
-    'Get-Process -Name RazerAppEngine -ErrorAction SilentlyContinue | Stop-Process -Force\r\n'
-    'Write-Timing "kill"\r\n'
-    'Start-Sleep -Seconds 5\r\n'
-    '\r\n'
-    '# Relaunch - settings now apply to already-enumerated USB devices\r\n'
+    '# Launch Synapse\r\n'
     'Start-Process -FilePath $synapse -ArgumentList $argList -WindowStyle Minimized\r\n'
     'Write-Timing "complete"\r\n'
 )

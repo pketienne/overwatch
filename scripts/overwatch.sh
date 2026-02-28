@@ -443,6 +443,61 @@ log_boot_timing() {
     log "BOOT_TIMING guest agent not responsive after ${elapsed}s"
 }
 
+# Attach Tartarus V2 after Synapse is running so it applies profiles on hot-plug.
+# Tartarus is omitted from the VM XML (setup-vm.sh) to avoid the old kill/restart
+# cycle in start-synapse.ps1. This replaces that ~35s workaround.
+attach_tartarus_deferred() {
+    local start_epoch=$1
+    local elapsed
+
+    # Wait for guest agent (up to 120s)
+    for i in $(seq 1 60); do
+        if virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+            break
+        fi
+        sleep 2
+    done
+
+    # Poll for RazerAppEngine process (up to 120s)
+    for i in $(seq 1 60); do
+        local ps_out
+        ps_out=$(virsh qemu-agent-command overwatch \
+            '{"execute":"guest-exec","arguments":{"path":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","arg":["-Command","if(Get-Process RazerAppEngine -EA SilentlyContinue){\"RUNNING\"}else{\"WAITING\"}"],"capture-output":true}}' 2>/dev/null) || true
+        if [ -n "$ps_out" ]; then
+            local pid
+            pid=$(echo "$ps_out" | python3 -c "import sys,json; print(json.load(sys.stdin)['return']['pid'])" 2>/dev/null) || true
+            if [ -n "$pid" ]; then
+                sleep 3
+                local status_out
+                status_out=$(virsh qemu-agent-command overwatch \
+                    "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}" 2>/dev/null) || true
+                if echo "$status_out" | python3 -c "
+import sys,json,base64
+r=json.load(sys.stdin)['return']
+if r.get('out-data'):
+    print(base64.b64decode(r['out-data']).decode().strip())
+" 2>/dev/null | grep -q "RUNNING"; then
+                    break
+                fi
+            fi
+        fi
+        sleep 2
+    done
+
+    # Give Synapse a moment to finish initializing
+    sleep 5
+
+    # Attach Tartarus via virsh
+    local usb_xml="<hostdev mode='subsystem' type='usb' managed='yes'><source><vendor id='0x1532'/><product id='0x022b'/></source></hostdev>"
+    if virsh attach-device overwatch /dev/stdin --live <<< "$usb_xml" 2>/dev/null; then
+        elapsed=$(( $(date +%s) - start_epoch ))
+        log "BOOT_TIMING tartarus attached after ${elapsed}s"
+    else
+        elapsed=$(( $(date +%s) - start_epoch ))
+        log "BOOT_TIMING tartarus attach FAILED after ${elapsed}s"
+    fi
+}
+
 # --- Guest diagnostics (queries Windows via QEMU guest agent) ---
 
 # Queries three data sources after VM boot:
@@ -933,6 +988,8 @@ _do_start() {
     local perf_guest_pid=$!
     log_boot_timing "$VM_START_EPOCH" &
     local boot_timing_pid=$!
+    attach_tartarus_deferred "$VM_START_EPOCH" &
+    local tartarus_pid=$!
 
     # Query guest diagnostics + deferred USB reattach in background.
     # USB reattach is deferred until after guest agent is up so that
@@ -1032,6 +1089,8 @@ open('${shutdown_ts_file}', 'w').write(str(int(time.time())))
     wait "$perf_guest_pid" 2>/dev/null || true
     kill "$boot_timing_pid" 2>/dev/null || true
     wait "$boot_timing_pid" 2>/dev/null || true
+    kill "$tartarus_pid" 2>/dev/null || true
+    wait "$tartarus_pid" 2>/dev/null || true
 
     log "VM shut down detected."
     if [ -f "$shutdown_ts_file" ]; then
