@@ -15,6 +15,7 @@
 #   shutdown   Phase 14: Install shutdown signal script and scheduled task
 #   synapse    Synapse delayed start (prevents windows, ensures Tartarus detection)
 #   verify     Query all settings and report current vs expected
+#   boot-timing  Show boot timing log from guest
 #
 # Usage: setup-guest [--dry-run] [--verbose] <subcommand>
 
@@ -69,6 +70,7 @@ if [ -z "$CMD" ]; then
     echo "  shutdown   Phase 14: Shutdown signal script and scheduled task"
     echo "  synapse    Synapse delayed start (prevents windows, ensures Tartarus)"
     echo "  verify     Query all settings and report status"
+    echo "  boot-timing  Show boot timing log from guest"
     exit 1
 fi
 
@@ -661,20 +663,43 @@ if not approved_ok:
 # The script launches Synapse, waits 30s, kills it, then relaunches.
 synapse_script = (
     '# start-synapse.ps1 - Launch Synapse, wait, restart to apply device settings\r\n'
+    '\r\n'
+    '# --- Timing helper ---\r\n'
+    'function Write-Timing($phase) {\r\n'
+    '    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"\r\n'
+    '    $dir = "C:\\ProgramData\\overwatch"\r\n'
+    '    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }\r\n'
+    '    Add-Content -Path "$dir\\boot-timing.log" -Value "$ts SYNAPSE $phase"\r\n'
+    '}\r\n'
+    '\r\n'
     '$synapse = "C:\\Program Files\\Razer\\RazerAppEngine\\RazerAppEngine.exe"\r\n'
     '$argList = "--url-params=apps=synapse,chroma-app '
     '--launch-force-hidden=synapse,chroma-app --autoStart=1"\r\n'
     '\r\n'
+    'Write-Timing "script-start"\r\n'
+    '\r\n'
+    '# Wait for explorer shell (interactive desktop ready)\r\n'
+    'for ($i = 0; $i -lt 30; $i++) {\r\n'
+    '    $shell = Get-Process explorer -ErrorAction SilentlyContinue '
+    '| Where-Object { $_.MainWindowHandle -ne 0 }\r\n'
+    '    if ($shell) { break }\r\n'
+    '    Start-Sleep -Seconds 1\r\n'
+    '}\r\n'
+    'Write-Timing "shell-ready"\r\n'
+    '\r\n'
     '# First launch\r\n'
     'Start-Process -FilePath $synapse -ArgumentList $argList -WindowStyle Minimized\r\n'
+    'Write-Timing "first-launch"\r\n'
     'Start-Sleep -Seconds 30\r\n'
     '\r\n'
     '# Kill all Synapse processes\r\n'
     'Get-Process -Name RazerAppEngine -ErrorAction SilentlyContinue | Stop-Process -Force\r\n'
+    'Write-Timing "kill"\r\n'
     'Start-Sleep -Seconds 5\r\n'
     '\r\n'
     '# Relaunch - settings now apply to already-enumerated USB devices\r\n'
     'Start-Process -FilePath $synapse -ArgumentList $argList -WindowStyle Minimized\r\n'
+    'Write-Timing "complete"\r\n'
 )
 
 run_ps(r"New-Item -ItemType Directory -Path 'C:\ProgramData\overwatch' -Force | Out-Null")
@@ -744,6 +769,26 @@ else:
             log(f"WARNING: schtasks returned: {out}")
         else:
             log("Created RazerSynapseDelayed scheduled task")
+PYEOF
+}
+
+# ============================================================
+# Boot timing log
+# ============================================================
+
+show_boot_timing() {
+    log "=== Boot timing log ==="
+    guest_python << 'PYEOF'
+out = run_ps(
+    r"if(Test-Path 'C:\ProgramData\overwatch\boot-timing.log'){"
+    r"Get-Content 'C:\ProgramData\overwatch\boot-timing.log' -Tail 20"
+    r"} else { 'No boot-timing.log found' }"
+)
+if out:
+    for line in out.splitlines():
+        log(line)
+else:
+    log("No output from guest")
 PYEOF
 }
 
@@ -942,7 +987,7 @@ do_all() {
 }
 
 case "$CMD" in
-    all|power|hda-audio|defender|telemetry|display|shutdown|synapse)
+    all|power|hda-audio|defender|telemetry|display|shutdown|synapse|boot-timing)
         ensure_guest_agent
         ;;&
     all)       do_all ;;
@@ -953,6 +998,7 @@ case "$CMD" in
     display)   ensure_display_config ;;
     shutdown)  ensure_shutdown_signal ;;
     synapse)   ensure_synapse_delayed ;;
+    boot-timing) show_boot_timing ;;
     verify)    ensure_guest_agent && verify_guest ;;
     *)
         log "ERROR: Unknown subcommand '$CMD'"

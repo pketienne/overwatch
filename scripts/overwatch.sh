@@ -426,6 +426,23 @@ ensure_performance_tuning() {
     echo 3 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
 }
 
+# Poll guest agent after VM start and log time to first response.
+# Runs as background job; caller passes epoch seconds when VM was started.
+log_boot_timing() {
+    local start_epoch=$1
+    local elapsed
+    for i in $(seq 1 60); do
+        if virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+            elapsed=$(( $(date +%s) - start_epoch ))
+            log "BOOT_TIMING guest agent responsive after ${elapsed}s"
+            return 0
+        fi
+        sleep 2
+    done
+    elapsed=$(( $(date +%s) - start_epoch ))
+    log "BOOT_TIMING guest agent not responsive after ${elapsed}s"
+}
+
 # --- Guest diagnostics (queries Windows via QEMU guest agent) ---
 
 # Queries three data sources after VM boot:
@@ -560,6 +577,28 @@ out = run_ps(
 )
 if out:
     print("DISPLAY_EVENTS")
+    print(out)
+
+# 6. Boot performance diagnostics (Event ID 100) — kernel-measured boot timing
+out = run_ps(
+    "$e = Get-WinEvent -FilterHashtable @{"
+    "LogName='Microsoft-Windows-Diagnostics-Performance/Operational';"
+    "Id=100} -MaxEvents 1 -EA SilentlyContinue; "
+    "if($e){"
+    "$xml = [xml]$e.ToXml(); "
+    "$d = $xml.Event.EventData.Data; "
+    "$get = { param($n) ($d | Where-Object Name -eq $n).'#text' }; "
+    "$main = & $get 'MainPathBootTime'; "
+    "$post = & $get 'BootPostBootTime'; "
+    "$drv  = & $get 'BootDriverInitTime'; "
+    "$deg  = & $get 'BootIsDegradation'; "
+    "Write-Output(\"MainPathBootTime=${main}ms "
+    "BootPostBootTime=${post}ms "
+    "BootDriverInitTime=${drv}ms "
+    "BootIsDegradation=$deg\")}"
+)
+if out:
+    print("BOOT_DIAG")
     print(out)
 PYEOF
 }
@@ -878,6 +917,7 @@ _do_start() {
     ensure_gpu_unbound_from_host
     ensure_gpu_on_vfio || { log "ERROR: VFIO bind failed"; _do_stop; exit 1; }
     ensure_vm_running || { log "ERROR: VM start failed"; _do_stop; exit 1; }
+    VM_START_EPOCH=$(date +%s)
 
     # Post-VM-start setup (non-critical, continue on failure)
     set_igpu_blank 4 blank || true
@@ -891,6 +931,8 @@ _do_start() {
     local perf_host_pid=$!
     monitor_guest_perf &
     local perf_guest_pid=$!
+    log_boot_timing "$VM_START_EPOCH" &
+    local boot_timing_pid=$!
 
     # Query guest diagnostics + deferred USB reattach in background.
     # USB reattach is deferred until after guest agent is up so that
@@ -907,6 +949,7 @@ _do_start() {
                     GPU_DRIVER)    section="driver";   log "GPU driver:" ;;
                     HD_AUDIO)      section="audio";    log "HD Audio:" ;;
                     DISPLAY_EVENTS) section="display"; log "Display events (previous session):" ;;
+                    BOOT_DIAG)     section="boot";    log "BOOT_TIMING Windows boot diagnostics:" ;;
                     "") ;;
                     *)
                         log "  $line"
@@ -987,6 +1030,8 @@ open('${shutdown_ts_file}', 'w').write(str(int(time.time())))
     wait "$perf_host_pid" 2>/dev/null || true
     kill "$perf_guest_pid" 2>/dev/null || true
     wait "$perf_guest_pid" 2>/dev/null || true
+    kill "$boot_timing_pid" 2>/dev/null || true
+    wait "$boot_timing_pid" 2>/dev/null || true
 
     log "VM shut down detected."
     if [ -f "$shutdown_ts_file" ]; then
