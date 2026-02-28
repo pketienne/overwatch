@@ -15,6 +15,9 @@ GPU-passthrough Windows gaming VM on a Linux host (myhost).
 - `sudo overwatch start` — must go through systemd for proper lifecycle
 - `virsh undefine --nvram overwatch` — destroys UEFI NVRAM (Secure Boot keys, boot entries). Only appropriate when intentionally rebuilding the VM from scratch (fresh Windows install). To update VM XML, use `virsh define <file>` which overwrites in place preserving NVRAM.
 
+**Before modifying VM XML or NVRAM, back up the NVRAM file:**
+`sudo cp /var/lib/libvirt/qemu/nvram/overwatch_VARS.fd /var/lib/libvirt/qemu/nvram/overwatch_VARS.fd.bak`
+
 **Host and guest configurations must stay in sync.** Any change that could prevent the VM from booting normally (NVRAM, VM XML, boot-critical guest config) risks a host kernel panic — a failed boot leaves the GPU held via vfio with no functioning guest to release it. Before making changes that affect VM boot or runtime, verify both sides will remain compatible.
 
 **When the guest appears frozen (black/grey screen, unresponsive peripherals):**
