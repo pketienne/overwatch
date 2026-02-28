@@ -18,6 +18,9 @@ GPU-passthrough Windows gaming VM on a Linux host (myhost).
 **Before modifying VM XML or NVRAM, back up the NVRAM file:**
 `sudo cp /var/lib/libvirt/qemu/nvram/overwatch_VARS.fd /var/lib/libvirt/qemu/nvram/overwatch_VARS.fd.bak`
 
+**There are no qcow2 disk snapshots or backups.** Destructive changes to the guest (driver removal, registry corruption, failed installs) cannot be rolled back. Take a qcow2 snapshot before risky guest operations:
+`sudo virsh snapshot-create-as overwatch --name <label> --disk-only`
+
 **Host and guest configurations must stay in sync.** Any change that could prevent the VM from booting normally (NVRAM, VM XML, boot-critical guest config) risks a host kernel panic — a failed boot leaves the GPU held via vfio with no functioning guest to release it. Before making changes that affect VM boot or runtime, verify both sides will remain compatible.
 
 **When the guest appears frozen (black/grey screen, unresponsive peripherals):**
