@@ -13,6 +13,7 @@
 #   telemetry  Phase 12: Disable AMD telemetry (AUEPMaster)
 #   display    Phase 13: Auto HDR off, Game Bar off, toast off
 #   shutdown   Phase 14: Install shutdown signal script and scheduled task
+#   synapse    Synapse delayed start (prevents windows, ensures Tartarus detection)
 #   verify     Query all settings and report current vs expected
 #
 # Usage: setup-guest [--dry-run] [--verbose] <subcommand>
@@ -66,6 +67,7 @@ if [ -z "$CMD" ]; then
     echo "  telemetry  Phase 12: Disable AMD telemetry (AUEPMaster)"
     echo "  display    Phase 13: Auto HDR off, Game Bar off, toast off"
     echo "  shutdown   Phase 14: Shutdown signal script and scheduled task"
+    echo "  synapse    Synapse delayed start (prevents windows, ensures Tartarus)"
     echo "  verify     Query all settings and report status"
     exit 1
 fi
@@ -594,6 +596,129 @@ PYEOF
 }
 
 # ============================================================
+# Synapse: Delayed start (prevents windows + ensures Tartarus detection)
+# ============================================================
+
+ensure_synapse_delayed() {
+    log "=== Synapse: Delayed start ==="
+    guest_python << 'PYEOF'
+# Find the logged-in user's SID for HKU registry access
+sid_out = run_ps(
+    "$p = Get-CimInstance Win32_UserProfile "
+    "| Where-Object { -not $_.Special -and $_.Loaded } "
+    "| Select-Object -First 1; "
+    "if($p){ $p.SID } else { 'NONE' }"
+)
+if not sid_out or sid_out == "NONE":
+    log("WARNING: No loaded user profile found — skipping Synapse configuration")
+    log("Log in to the Windows guest interactively, then re-run")
+    sys.exit(1)
+
+sid = sid_out.strip()
+log(f"User SID: {sid}")
+
+# --- 1. Disable RazerAppEngine Run key via StartupApproved ---
+# This is the same mechanism Task Manager's Startup tab uses.
+# Synapse recreates the Run key on launch, but StartupApproved keeps it disabled.
+approved_path = f"HKU\\{sid}\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"
+
+# Check current state: 03 prefix = disabled, 02 prefix = enabled
+approved_out = run_ps(
+    'reg query "' + approved_path + '" /v RazerAppEngine 2>&1'
+)
+
+approved_ok = False
+if approved_out and "RazerAppEngine" in approved_out:
+    # Value exists — check if it starts with 03 (disabled)
+    if "0300000000000000" in approved_out.replace(" ", ""):
+        approved_ok = True
+        log("StartupApproved\\Run\\RazerAppEngine: already disabled")
+    else:
+        log(f"StartupApproved\\Run\\RazerAppEngine: exists but not disabled")
+else:
+    log("StartupApproved\\Run\\RazerAppEngine: not set")
+
+if not approved_ok:
+    if DRY_RUN:
+        log("[dry-run] Would disable RazerAppEngine in StartupApproved\\Run")
+    else:
+        run_ps(
+            'reg add "' + approved_path + '" '
+            '/v RazerAppEngine /t REG_BINARY '
+            '/d 030000000000000000000000 /f'
+        )
+        # Verify
+        check = run_ps(
+            'reg query "' + approved_path + '" /v RazerAppEngine 2>&1'
+        )
+        if check and "0300000000000000" in check.replace(" ", ""):
+            log("StartupApproved\\Run\\RazerAppEngine: disabled (verified)")
+        else:
+            log(f"WARNING: StartupApproved write may have failed — read back: {check}")
+
+# --- 2. Create RazerSynapseDelayed scheduled task ---
+# 15s logon delay gives USB devices time to enumerate before Synapse scans.
+task_out = run_ps(
+    "$t = Get-ScheduledTask -TaskName RazerSynapseDelayed -EA SilentlyContinue; "
+    "if($t){ $t.State } else { 'MISSING' }"
+)
+
+if "MISSING" not in (task_out or "MISSING"):
+    log(f"RazerSynapseDelayed task: already exists (state={task_out})")
+else:
+    log("RazerSynapseDelayed task: not found — creating")
+    if DRY_RUN:
+        log("[dry-run] Would create RazerSynapseDelayed scheduled task (15s logon delay)")
+    else:
+        # Write task XML via guest-file API, then import with schtasks
+        task_xml = (
+            '<?xml version="1.0"?>\r\n'
+            '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\r\n'
+            '  <Triggers>\r\n'
+            '    <LogonTrigger>\r\n'
+            '      <Delay>PT15S</Delay>\r\n'
+            '      <Enabled>true</Enabled>\r\n'
+            '    </LogonTrigger>\r\n'
+            '  </Triggers>\r\n'
+            '  <Actions>\r\n'
+            '    <Exec>\r\n'
+            '      <Command>cmd</Command>\r\n'
+            '      <Arguments>/c start /min "" '
+            '"C:\\Program Files\\Razer\\RazerAppEngine\\RazerAppEngine.exe" '
+            '--url-params=apps=synapse,chroma-app '
+            '--launch-force-hidden=synapse,chroma-app '
+            '--autoStart=1</Arguments>\r\n'
+            '    </Exec>\r\n'
+            '  </Actions>\r\n'
+            '  <Principals>\r\n'
+            '    <Principal>\r\n'
+            '      <GroupId>S-1-5-32-545</GroupId>\r\n'
+            '      <RunLevel>LeastPrivilege</RunLevel>\r\n'
+            '    </Principal>\r\n'
+            '  </Principals>\r\n'
+            '  <Settings>\r\n'
+            '    <Enabled>true</Enabled>\r\n'
+            '    <AllowStartIfOnBatteries>true</AllowStartIfOnBatteries>\r\n'
+            '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n'
+            '  </Settings>\r\n'
+            '</Task>\r\n'
+        )
+        guest_file_write(r"C:\ProgramData\overwatch\synapse-task.xml", task_xml)
+        out = run_ps(
+            r"schtasks /Create /TN 'RazerSynapseDelayed' /XML 'C:\ProgramData\overwatch\synapse-task.xml' /F 2>&1"
+        )
+        run_ps(r"Remove-Item 'C:\ProgramData\overwatch\synapse-task.xml' -EA SilentlyContinue")
+
+        if out and "SUCCESS" in out.upper():
+            log("Created RazerSynapseDelayed scheduled task (15s logon delay)")
+        elif out and "ERROR" in out.upper():
+            log(f"WARNING: schtasks returned: {out}")
+        else:
+            log("Created RazerSynapseDelayed scheduled task")
+PYEOF
+}
+
+# ============================================================
 # Verify all guest settings
 # ============================================================
 
@@ -721,8 +846,27 @@ if sid_out and sid_out != "NONE":
     else:
         log(f"Game Bar policy: AllowGameDVR={out or 'not set'}")
         ok = False
+    # Synapse StartupApproved
+    approved_path = f"HKU\\{sid}\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"
+    out = run_ps('reg query "' + approved_path + '" /v RazerAppEngine 2>&1')
+    if out and "0300000000000000" in out.replace(" ", ""):
+        log("Synapse StartupApproved: disabled")
+    else:
+        log(f"Synapse StartupApproved: not disabled ({out or 'not set'})")
+        ok = False
 else:
-    log("Display config: no loaded user profile — cannot verify per-user settings")
+    log("Display/Synapse config: no loaded user profile — cannot verify per-user settings")
+    ok = False
+
+# --- Synapse delayed task ---
+synapse_task = run_ps(
+    "$t = Get-ScheduledTask -TaskName RazerSynapseDelayed -EA SilentlyContinue; "
+    "if($t){ $t.State } else { 'MISSING' }"
+)
+if "MISSING" not in (synapse_task or "MISSING"):
+    log(f"Synapse delayed task: {synapse_task}")
+else:
+    log("Synapse delayed task: not registered")
     ok = False
 
 # --- Shutdown signal ---
@@ -764,11 +908,12 @@ do_all() {
     ensure_telemetry_disabled
     ensure_display_config
     ensure_shutdown_signal
+    ensure_synapse_delayed
     log "=== Guest configuration complete ==="
 }
 
 case "$CMD" in
-    all|power|hda-audio|defender|telemetry|display|shutdown)
+    all|power|hda-audio|defender|telemetry|display|shutdown|synapse)
         ensure_guest_agent
         ;;&
     all)       do_all ;;
@@ -778,6 +923,7 @@ case "$CMD" in
     telemetry) ensure_telemetry_disabled ;;
     display)   ensure_display_config ;;
     shutdown)  ensure_shutdown_signal ;;
+    synapse)   ensure_synapse_delayed ;;
     verify)    ensure_guest_agent && verify_guest ;;
     *)
         log "ERROR: Unknown subcommand '$CMD'"

@@ -19,8 +19,21 @@ VM_NAME="overwatch"
 VM_DISK="/var/lib/libvirt/images/overwatch.qcow2"
 VM_DISK_SIZE="200G"
 VM_RAM_KIB="16777216"       # 16 GB
-VM_VCPUS="7"
+VM_VCPUS="6"
 VM_MAC="52:54:00:67:c7:3e"
+
+# SMBIOS strings — match the real host hardware to avoid anti-cheat fingerprinting.
+# These override QEMU defaults ("QEMU", "Standard PC") which are trivially detectable
+# via wmic baseboard / Get-WmiObject Win32_BaseBoard.
+SMBIOS_BIOS_VENDOR="American Megatrends International, LLC."
+SMBIOS_BIOS_VERSION="1.A80"
+SMBIOS_BIOS_DATE="01/08/2026"
+SMBIOS_SYS_MANUFACTURER="Micro-Star International Co., Ltd."
+SMBIOS_SYS_PRODUCT="MS-7E49"
+SMBIOS_SYS_VERSION="1.0"
+SMBIOS_BOARD_MANUFACTURER="Micro-Star International Co., Ltd."
+SMBIOS_BOARD_PRODUCT="MPG X870E CARBON WIFI (MS-7E49)"
+SMBIOS_BOARD_VERSION="1.0"
 
 GPU="0000:03:00.0"
 GPU_AUDIO="0000:03:00.1"
@@ -33,8 +46,7 @@ USB_DEVICES=(
     "0x1532:0x00a7:Razer Naga V2 Pro"
     "0x1532:0x022b:Razer Tartarus V2"
     "0x1532:0x0c05:Razer Strider Chroma"
-    "0x1038:0x1290:SteelSeries Arctis Pro Wireless (1)"
-    "0x1038:0x1294:SteelSeries Arctis Pro Wireless (2)"
+    "0x1038:0x1294:SteelSeries Arctis Pro Wireless"
 )
 
 # --- Parse arguments ---
@@ -191,12 +203,12 @@ ensure_vm_defined() {
 
     if [ "$DRY_RUN" = true ]; then
         log "  [dry-run] Would define VM '$VM_NAME' with:"
-        log "    vCPUs: $VM_VCPUS (pinned 1-7, emulator on 0)"
+        log "    vCPUs: $VM_VCPUS (pinned 2-7, emulator/IO on 0-1)"
         log "    RAM: $((VM_RAM_KIB / 1024))M"
         log "    Disk: $VM_DISK (VirtIO)"
         log "    GPU: $GPU (VFIO, ROM: $GPU_ROM)"
         log "    GPU audio: $GPU_AUDIO (VFIO)"
-        log "    Network: bridged (MAC $VM_MAC)"
+        log "    Network: bridge br0 (MAC $VM_MAC)"
         log "    USB devices: ${#USB_DEVICES[@]}"
         return 0
     fi
@@ -204,6 +216,39 @@ ensure_vm_defined() {
     log "  Writing VM XML..."
     local xml_file
     xml_file=$(mktemp)
+
+    # ------------------------------------------------------------------
+    # Anti-cheat detection vectors (Ricochet, EAC, BattlEye, etc.)
+    #
+    # The following VM features prevent anti-cheat from identifying the
+    # guest as a virtual machine. All five vectors must be addressed:
+    #
+    # 1. CPUID hypervisor leaf (CRITICAL)
+    #    <kvm><hidden state='on'/> suppresses CPUID 0x40000000 "KVMKVMKVM"
+    #    signature. Without this, any CPUID query instantly reveals KVM.
+    #
+    # 2. Hyper-V vendor ID
+    #    <hyperv><vendor_id value='AuthenticAMD'/> overrides the default
+    #    "Microsoft Hv" string in the Hyper-V CPUID leaf.
+    #
+    # 3. CPU model
+    #    <cpu mode='host-passthrough'> passes the real CPU model/features
+    #    to the guest. Without this, CPUID returns "QEMU Virtual CPU".
+    #
+    # 4. SMBIOS/DMI strings
+    #    <sysinfo type='smbios'> overrides QEMU defaults (manufacturer=
+    #    "QEMU", product="Standard PC") with real motherboard strings.
+    #    Detectable via wmic, Get-WmiObject, or Win32_BaseBoard.
+    #
+    # 5. GPU passthrough
+    #    Real GPU via vfio-pci. Virtual display adapters (QXL, virtio-gpu)
+    #    are trivially identifiable in Device Manager.
+    #
+    # Accepted risk: VirtIO disk/NIC drivers are VM-specific and visible
+    # in Device Manager, but current anti-cheat engines do not flag them.
+    # Switching to SATA/e1000e emulation would degrade I/O performance
+    # with no demonstrated benefit. Revisit if this changes.
+    # ------------------------------------------------------------------
 
     cat > "$xml_file" <<EOF
 <domain type='kvm'>
@@ -213,16 +258,33 @@ ensure_vm_defined() {
   <vcpu placement='static'>$VM_VCPUS</vcpu>
   <iothreads>1</iothreads>
   <cputune>
-    <vcpupin vcpu='0' cpuset='1'/>
-    <vcpupin vcpu='1' cpuset='2'/>
-    <vcpupin vcpu='2' cpuset='3'/>
-    <vcpupin vcpu='3' cpuset='4'/>
-    <vcpupin vcpu='4' cpuset='5'/>
-    <vcpupin vcpu='5' cpuset='6'/>
-    <vcpupin vcpu='6' cpuset='7'/>
-    <emulatorpin cpuset='0'/>
-    <iothreadpin iothread='1' cpuset='0'/>
+    <vcpupin vcpu='0' cpuset='2'/>
+    <vcpupin vcpu='1' cpuset='3'/>
+    <vcpupin vcpu='2' cpuset='4'/>
+    <vcpupin vcpu='3' cpuset='5'/>
+    <vcpupin vcpu='4' cpuset='6'/>
+    <vcpupin vcpu='5' cpuset='7'/>
+    <emulatorpin cpuset='0-1'/>
+    <iothreadpin iothread='1' cpuset='0-1'/>
   </cputune>
+  <!-- Vector 4: SMBIOS — real motherboard strings -->
+  <sysinfo type='smbios'>
+    <bios>
+      <entry name='vendor'>$SMBIOS_BIOS_VENDOR</entry>
+      <entry name='version'>$SMBIOS_BIOS_VERSION</entry>
+      <entry name='date'>$SMBIOS_BIOS_DATE</entry>
+    </bios>
+    <system>
+      <entry name='manufacturer'>$SMBIOS_SYS_MANUFACTURER</entry>
+      <entry name='product'>$SMBIOS_SYS_PRODUCT</entry>
+      <entry name='version'>$SMBIOS_SYS_VERSION</entry>
+    </system>
+    <baseBoard>
+      <entry name='manufacturer'>$SMBIOS_BOARD_MANUFACTURER</entry>
+      <entry name='product'>$SMBIOS_BOARD_PRODUCT</entry>
+      <entry name='version'>$SMBIOS_BOARD_VERSION</entry>
+    </baseBoard>
+  </sysinfo>
   <os firmware='efi'>
     <type arch='x86_64' machine='pc-q35-noble'>hvm</type>
     <firmware>
@@ -232,22 +294,26 @@ ensure_vm_defined() {
     <loader readonly='yes' secure='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE_4M.ms.fd</loader>
     <nvram template='/usr/share/OVMF/OVMF_VARS_4M.ms.fd'>/var/lib/libvirt/qemu/nvram/${VM_NAME}_VARS.fd</nvram>
     <boot dev='hd'/>
+    <smbios mode='sysinfo'/>
   </os>
   <features>
     <acpi/>
     <apic/>
+    <!-- Vector 2: Hyper-V vendor ID — spoof to avoid "Microsoft Hv" -->
     <hyperv mode='custom'>
       <relaxed state='on'/>
       <vapic state='on'/>
       <spinlocks state='on' retries='8191'/>
       <vendor_id state='on' value='AuthenticAMD'/>
     </hyperv>
+    <!-- Vector 1: Hide KVM CPUID leaf 0x40000000 -->
     <kvm>
       <hidden state='on'/>
     </kvm>
     <vmport state='off'/>
     <smm state='on'/>
   </features>
+  <!-- Vector 3: Real CPU model via host-passthrough -->
   <cpu mode='host-passthrough' check='none' migratable='off'>
     <topology sockets='1' dies='1' cores='$VM_VCPUS' threads='1'/>
     <cache mode='passthrough'/>
@@ -278,9 +344,9 @@ $cdrom_xml
     <controller type='pci' index='0' model='pcie-root'/>
     <controller type='sata' index='0'/>
     <controller type='virtio-serial' index='0'/>
-    <interface type='network'>
+    <interface type='bridge'>
       <mac address='$VM_MAC'/>
-      <source network='bridged'/>
+      <source bridge='br0'/>
       <model type='virtio'/>
     </interface>
     <channel type='unix'>
@@ -294,6 +360,7 @@ $cdrom_xml
       <backend type='emulator' version='2.0'/>
     </tpm>
     <audio id='1' type='none'/>
+    <!-- Vector 5: Real GPU via VFIO passthrough -->
     <hostdev mode='subsystem' type='pci' managed='no'>
       <driver name='vfio'/>
       <source>
@@ -397,7 +464,7 @@ verify_vm() {
 
     # Network
     local net
-    net=$(echo "$xml" | grep "source network=" | sed "s/.*network='\([^']*\)'.*/\1/") || true
+    net=$(echo "$xml" | grep -oP "source (bridge|network)='[^']*'" | sed "s/source //;s/'//g") || true
     log "  Network: ${net:-none}"
 
     # Guest agent channel
@@ -414,16 +481,54 @@ verify_vm() {
         log "  WARNING: TPM not configured"
     fi
 
-    # Anti-cheat features
+    # Anti-cheat detection vectors (all 5 must pass)
+    log "  --- Anti-cheat vectors ---"
+
+    # Vector 1: KVM CPUID hidden
     if echo "$xml" | grep -q "hidden state='on'"; then
-        log "  KVM hidden: yes"
+        log "  [1] KVM hidden: yes"
     else
-        log "  WARNING: KVM hidden not set (anti-cheat may detect VM)"
+        log "  [1] WARNING: KVM hidden not set — CPUID exposes 'KVMKVMKVM'"
     fi
-    if echo "$xml" | grep -q "vendor_id"; then
-        log "  Hyper-V vendor_id: spoofed"
+
+    # Vector 2: Hyper-V vendor ID spoofed
+    if echo "$xml" | grep -q "vendor_id state='on'"; then
+        local vid
+        vid=$(echo "$xml" | grep "vendor_id" | sed "s/.*value='\([^']*\)'.*/\1/")
+        log "  [2] Hyper-V vendor_id: '$vid'"
     else
-        log "  WARNING: Hyper-V vendor_id not set"
+        log "  [2] WARNING: Hyper-V vendor_id not set — defaults to 'Microsoft Hv'"
+    fi
+
+    # Vector 3: CPU host-passthrough
+    if echo "$xml" | grep -q "mode='host-passthrough'"; then
+        log "  [3] CPU model: host-passthrough"
+    else
+        log "  [3] WARNING: CPU not host-passthrough — guest sees 'QEMU Virtual CPU'"
+    fi
+
+    # Vector 4: SMBIOS strings
+    if echo "$xml" | grep -q "<sysinfo type='smbios'" && echo "$xml" | grep -q "smbios mode='sysinfo'"; then
+        local smbios_product
+        smbios_product=$(echo "$xml" | grep -A1 "baseBoard" | grep "product" | sed "s/.*<entry name='product'>\(.*\)<\/entry>/\1/" | head -1)
+        log "  [4] SMBIOS: ${smbios_product:-configured}"
+    else
+        log "  [4] WARNING: SMBIOS not configured — guest sees 'QEMU' / 'Standard PC'"
+    fi
+
+    # Vector 5: GPU passthrough (real GPU, not virtual)
+    if echo "$xml" | grep -q "type='pci' managed='no'"; then
+        log "  [5] GPU: real hardware via VFIO"
+    else
+        log "  [5] WARNING: No PCI passthrough — guest uses virtual display adapter"
+    fi
+
+    # Accepted risk: VirtIO drivers
+    local virtio_disk virtio_nic
+    virtio_disk=$(echo "$xml" | grep -c "bus='virtio'" 2>/dev/null) || true
+    virtio_nic=$(echo "$xml" | grep -c "model type='virtio'" 2>/dev/null) || true
+    if [ "$((virtio_disk + virtio_nic))" -gt 0 ]; then
+        log "  [i] VirtIO devices present (disk/NIC) — accepted risk, not flagged by current anti-cheat"
     fi
 
     log "  Verification complete"

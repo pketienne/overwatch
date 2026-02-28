@@ -1,6 +1,6 @@
 # VM XML Reference
 
-Full XML from `virsh dumpxml overwatch`:
+Full XML from `virsh dumpxml --inactive overwatch`:
 
 ```xml
 <domain type='kvm'>
@@ -8,22 +8,39 @@ Full XML from `virsh dumpxml overwatch`:
   <uuid>ee9489dc-57fe-4405-ace6-73dcf9074201</uuid>
   <memory unit='KiB'>16777216</memory>
   <currentMemory unit='KiB'>16777216</currentMemory>
-  <vcpu placement='static'>7</vcpu>
+  <vcpu placement='static'>6</vcpu>
   <iothreads>1</iothreads>
   <cputune>
-    <vcpupin vcpu='0' cpuset='1'/>
-    <vcpupin vcpu='1' cpuset='2'/>
-    <vcpupin vcpu='2' cpuset='3'/>
-    <vcpupin vcpu='3' cpuset='4'/>
-    <vcpupin vcpu='4' cpuset='5'/>
-    <vcpupin vcpu='5' cpuset='6'/>
-    <vcpupin vcpu='6' cpuset='7'/>
-    <emulatorpin cpuset='0'/>
-    <iothreadpin iothread='1' cpuset='0'/>
+    <vcpupin vcpu='0' cpuset='2'/>
+    <vcpupin vcpu='1' cpuset='3'/>
+    <vcpupin vcpu='2' cpuset='4'/>
+    <vcpupin vcpu='3' cpuset='5'/>
+    <vcpupin vcpu='4' cpuset='6'/>
+    <vcpupin vcpu='5' cpuset='7'/>
+    <emulatorpin cpuset='0-1'/>
+    <iothreadpin iothread='1' cpuset='0-1'/>
   </cputune>
   <resource>
     <partition>/machine</partition>
   </resource>
+  <!-- Anti-cheat vector 4: SMBIOS — real motherboard strings -->
+  <sysinfo type='smbios'>
+    <bios>
+      <entry name='vendor'>American Megatrends International, LLC.</entry>
+      <entry name='version'>1.A80</entry>
+      <entry name='date'>01/08/2026</entry>
+    </bios>
+    <system>
+      <entry name='manufacturer'>Micro-Star International Co., Ltd.</entry>
+      <entry name='product'>MS-7E49</entry>
+      <entry name='version'>1.0</entry>
+    </system>
+    <baseBoard>
+      <entry name='manufacturer'>Micro-Star International Co., Ltd.</entry>
+      <entry name='product'>MPG X870E CARBON WIFI (MS-7E49)</entry>
+      <entry name='version'>1.0</entry>
+    </baseBoard>
+  </sysinfo>
   <os firmware='efi'>
     <type arch='x86_64' machine='pc-q35-noble'>hvm</type>
     <firmware>
@@ -33,6 +50,7 @@ Full XML from `virsh dumpxml overwatch`:
     <loader readonly='yes' secure='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE_4M.ms.fd</loader>
     <nvram template='/usr/share/OVMF/OVMF_VARS_4M.ms.fd'>/var/lib/libvirt/qemu/nvram/overwatch_VARS.fd</nvram>
     <boot dev='hd'/>
+    <smbios mode='sysinfo'/>
   </os>
   <features>
     <acpi/>
@@ -50,7 +68,7 @@ Full XML from `virsh dumpxml overwatch`:
     <smm state='on'/>
   </features>
   <cpu mode='host-passthrough' check='none' migratable='off'>
-    <topology sockets='1' dies='1' cores='7' threads='1'/>
+    <topology sockets='1' dies='1' cores='6' threads='1'/>
     <cache mode='passthrough'/>
   </cpu>
   <clock offset='localtime'>
@@ -78,6 +96,7 @@ Full XML from `virsh dumpxml overwatch`:
     <disk type='file' device='cdrom'>
       <driver name='qemu' type='raw'/>
       <source file='/home/myuser/Downloads/virtio-win.iso'/>
+      <backingStore/>
       <target dev='sda' bus='sata'/>
       <readonly/>
       <address type='drive' controller='0' bus='0' target='0' unit='0'/>
@@ -131,9 +150,9 @@ Full XML from `virsh dumpxml overwatch`:
     <controller type='virtio-serial' index='0'>
       <address type='pci' domain='0x0000' bus='0x08' slot='0x00' function='0x0'/>
     </controller>
-    <interface type='network'>
+    <interface type='bridge'>
       <mac address='52:54:00:67:c7:3e'/>
-      <source network='bridged'/>
+      <source bridge='br0'/>
       <model type='virtio'/>
       <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>
     </interface>
@@ -153,6 +172,27 @@ Full XML from `virsh dumpxml overwatch`:
       <backend type='emulator' version='2.0'/>
     </tpm>
     <audio id='1' type='none'/>
+    <hostdev mode='subsystem' type='usb' managed='yes'>
+      <source>
+        <vendor id='0x1532'/>
+        <product id='0x00a7'/>
+      </source>
+      <address type='usb' bus='0' port='4'/>
+    </hostdev>
+    <hostdev mode='subsystem' type='usb' managed='yes'>
+      <source>
+        <vendor id='0x1532'/>
+        <product id='0x0c05'/>
+      </source>
+      <address type='usb' bus='0' port='6'/>
+    </hostdev>
+    <hostdev mode='subsystem' type='usb' managed='yes'>
+      <source>
+        <vendor id='0x1038'/>
+        <product id='0x1294'/>
+      </source>
+      <address type='usb' bus='0' port='8'/>
+    </hostdev>
     <hostdev mode='subsystem' type='pci' managed='no'>
       <driver name='vfio'/>
       <source>
@@ -178,37 +218,9 @@ Full XML from `virsh dumpxml overwatch`:
     <hostdev mode='subsystem' type='usb' managed='yes'>
       <source>
         <vendor id='0x1532'/>
-        <product id='0x00a7'/>
-      </source>
-      <address type='usb' bus='0' port='4'/>
-    </hostdev>
-    <hostdev mode='subsystem' type='usb' managed='yes'>
-      <source>
-        <vendor id='0x1532'/>
         <product id='0x022b'/>
       </source>
       <address type='usb' bus='0' port='5'/>
-    </hostdev>
-    <hostdev mode='subsystem' type='usb' managed='yes'>
-      <source>
-        <vendor id='0x1532'/>
-        <product id='0x0c05'/>
-      </source>
-      <address type='usb' bus='0' port='6'/>
-    </hostdev>
-    <hostdev mode='subsystem' type='usb' managed='yes'>
-      <source>
-        <vendor id='0x1038'/>
-        <product id='0x1290'/>
-      </source>
-      <address type='usb' bus='0' port='7'/>
-    </hostdev>
-    <hostdev mode='subsystem' type='usb' managed='yes'>
-      <source>
-        <vendor id='0x1038'/>
-        <product id='0x1294'/>
-      </source>
-      <address type='usb' bus='0' port='8'/>
     </hostdev>
     <watchdog model='itco' action='reset'/>
     <memballoon model='none'/>
