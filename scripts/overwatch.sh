@@ -69,6 +69,50 @@ gpu_bus_reset() {
     return 1
 }
 
+# PCI remove + rescan: gives amdgpu a completely fresh device, avoiding stale
+# SR-IOV VF mailbox state that causes probe() to block for ~4 minutes.
+# Drivers auto-bind via modalias since driver_override was already cleared.
+gpu_pci_remove_rescan() {
+    log "Removing GPU from PCI bus and rescanning..."
+    echo 1 > "/sys/bus/pci/devices/$GPU/remove" 2>/dev/null || true
+    echo 1 > "/sys/bus/pci/devices/$GPU_AUDIO/remove" 2>/dev/null || true
+    sleep 1
+    echo 1 > /sys/bus/pci/rescan
+    local i drv
+    for i in $(seq 1 15); do
+        drv=$(gpu_driver "$GPU")
+        if [ "$drv" = "amdgpu" ]; then
+            log "PCI rescan: amdgpu auto-bound after ${i}s"
+            return 0
+        fi
+        sleep 1
+    done
+    log "PCI rescan: amdgpu did not auto-bind within 15s (driver=$(gpu_driver "$GPU"))"
+    return 1
+}
+
+# Bind GPU to amdgpu with a timeout. The bind call can block in kernel space
+# (SR-IOV VF mailbox loop) for ~4 minutes; this wrapper kills it after $1 seconds.
+gpu_bind_with_timeout() {
+    local timeout=${1:-30}
+    log "Binding to amdgpu (timeout=${timeout}s)..."
+    ( echo "$GPU" > /sys/bus/pci/drivers/amdgpu/bind 2>/dev/null ) &
+    local bind_pid=$!
+    local i
+    for i in $(seq 1 "$timeout"); do
+        if ! kill -0 "$bind_pid" 2>/dev/null; then
+            wait "$bind_pid" 2>/dev/null
+            log "amdgpu bind completed in ${i}s"
+            return 0
+        fi
+        sleep 1
+    done
+    log "WARNING: amdgpu bind still blocked after ${timeout}s — killing"
+    kill "$bind_pid" 2>/dev/null || true
+    wait "$bind_pid" 2>/dev/null || true
+    return 1
+}
+
 # Find the iGPU framebuffer by PCI device path (not hardcoded fb number)
 igpu_fb() {
     for fb in /sys/class/graphics/fb*/; do
@@ -704,6 +748,31 @@ ensure_gpu_unbound_from_vfio() {
     log_state "post_vfio_unbind"
 }
 
+# Disable runtime PM on GPU and audio, bind audio to snd_hda_intel if needed.
+# Called after any successful GPU bind method.
+disable_gpu_runtime_pm() {
+    # Disable runtime PM on GPU — amdgpu sets power/control to "auto" during
+    # probe, and the GPU crashes on D3 resume.
+    echo on > "/sys/bus/pci/devices/$GPU/power/control" 2>/dev/null || true
+
+    # GPU audio: bind to snd_hda_intel if not already bound
+    if [ -e "/sys/bus/pci/devices/$GPU_AUDIO" ]; then
+        echo on > "/sys/bus/pci/devices/$GPU_AUDIO/power/control" 2>/dev/null || true
+        if [ "$(gpu_driver "$GPU_AUDIO")" = "snd_hda_intel" ]; then
+            log "GPU audio already bound to snd_hda_intel"
+        else
+            log "Binding GPU audio to snd_hda_intel..."
+            echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/bind 2>/dev/null || \
+                log "WARNING: snd_hda_intel bind failed — HDMI/DP audio unavailable"
+            echo on > "/sys/bus/pci/devices/$GPU_AUDIO/power/control" 2>/dev/null || true
+        fi
+    else
+        log "WARNING: GPU audio device not found after rescan"
+    fi
+
+    log "Runtime PM disabled for GPU and audio"
+}
+
 ensure_gpu_on_host() {
     # Always rebind VT consoles (safe even if already bound)
     log "Rebinding VT consoles..."
@@ -716,43 +785,28 @@ ensure_gpu_on_host() {
 
     if [ "$gpu_drv" = "amdgpu" ]; then
         log "GPU already on amdgpu — skipping bind"
+        disable_gpu_runtime_pm
         return 0
     fi
 
-    # Bus reset GPU before rebinding to amdgpu. After VFIO passthrough, the GPU
-    # firmware is in whatever state the Windows guest left it. Without a reset,
-    # amdgpu tries to initialize on dirty state, causing TDRs and hangs.
-    gpu_bus_reset "post-VFIO host rebind" || true
-
-    # Bind GPU to amdgpu — this powers up the entire GPU die
-    log "Binding to amdgpu..."
-    echo "$GPU" > /sys/bus/pci/drivers/amdgpu/bind 2>/dev/null || true
-    sleep 3
-    log "GPU driver: $(gpu_driver "$GPU")"
-
-    # Disable runtime PM on GPU immediately after bind — amdgpu sets
-    # power/control to "auto" during probe, and the GPU crashes on D3 resume.
-    # Must happen before audio re-enumeration to prevent cascading failures.
-    echo on > "/sys/bus/pci/devices/$GPU/power/control" 2>/dev/null || true
-
-    # GPU audio: the SBR (bus reset above) resets both 03:00.0 and 03:00.1,
-    # so the audio function should be in a clean power state. Try direct bind
-    # without PCI remove/rescan.
-    if [ -e "/sys/bus/pci/devices/$GPU_AUDIO" ]; then
-        echo on > "/sys/bus/pci/devices/$GPU_AUDIO/power/control" 2>/dev/null || true
-        if [ "$(gpu_driver "$GPU_AUDIO")" = "snd_hda_intel" ]; then
-            log "GPU audio already bound to snd_hda_intel"
-        else
-            log "Binding GPU audio to snd_hda_intel (direct, no rescan)..."
-            echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/bind 2>/dev/null || \
-                log "WARNING: snd_hda_intel bind failed — HDMI/DP audio unavailable"
-            echo on > "/sys/bus/pci/devices/$GPU_AUDIO/power/control" 2>/dev/null || true
-        fi
-    else
-        log "WARNING: GPU audio device not found"
+    # Primary: PCI remove+rescan gives amdgpu a completely fresh device,
+    # avoiding the stale SR-IOV VF mailbox state that blocks probe() for ~4min.
+    log "Attempting PCI remove+rescan (primary)..."
+    if gpu_pci_remove_rescan && [ "$(gpu_driver "$GPU")" = "amdgpu" ]; then
+        disable_gpu_runtime_pm
+        return 0
     fi
 
-    log "Runtime PM disabled for GPU and audio"
+    # Fallback: bus reset + direct bind with timeout
+    log "PCI rescan did not bind — falling back to bus reset + timed bind..."
+    gpu_bus_reset "post-VFIO host rebind" || true
+    if gpu_bind_with_timeout 30 && [ "$(gpu_driver "$GPU")" = "amdgpu" ]; then
+        disable_gpu_runtime_pm
+        return 0
+    fi
+
+    log "WARNING: All GPU bind methods failed (driver=$(gpu_driver "$GPU"))"
+    return 1
 }
 
 ensure_services_running() {
@@ -791,9 +845,11 @@ _do_stop() {
     ensure_vm_stopped
     ensure_cpu_defaults
     ensure_gpu_unbound_from_vfio
-    ensure_gpu_on_host || log "WARNING: Could not restore GPU to host — iGPU only"
     set_igpu_blank 0 unblank || true
     ensure_services_running
+    # GPU rebind last — user already has desktop on iGPU via GDM.
+    # If this hangs or fails, the session is still usable.
+    ensure_gpu_on_host || log "WARNING: Could not restore GPU to host — iGPU only"
 
     log "=== Host restored ==="
 }
