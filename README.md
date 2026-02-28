@@ -86,7 +86,7 @@ tasks/
     instrumentation.md        # Monitoring and diagnostics inventory
     troubleshooting.md        # 31-item problem/cause/solution reference
     recipe/
-      setup.md                # Phases 1-8: BIOS, IVRS, VM creation
+      setup.md                # Phases 1-8: BIOS, GRUB, VM creation
       install.md              # Phase 9: Windows 11, drivers, Overwatch
       configure.md            # Phases 10-14: power, HDA, display, shutdown signal
       vm-xml-reference.md     # Full libvirt domain XML
@@ -103,8 +103,7 @@ tasks/
 |------|---------|
 | `/usr/local/bin/overwatch` | Installed orchestrator script |
 | `/etc/systemd/system/overwatch.service` | Service unit |
-| `/etc/default/grub` | `amd_iommu=on`, IVRS override initrd |
-| `/boot/acpi-ivrs-override.img` | Patched IVRS ACPI table |
+| `/etc/default/grub` | `amd_iommu=on` |
 | `/usr/share/qemu/gpu-rom.bin` | RX 7900 XTX VBIOS |
 | `/etc/modprobe.d/amdgpu.conf` | `options amdgpu runpm=0` |
 | `/etc/udev/rules.d/99-gpu-passthrough.rules` | Prevents dGPU logind seat assignment |

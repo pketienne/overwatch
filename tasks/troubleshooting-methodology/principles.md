@@ -60,7 +60,7 @@ layer manifest as symptoms at another.
 
 | Layer | Tools | Example Fix |
 |-------|-------|-------------|
-| **Firmware** (IOMMU identity mapping) | `dmesg \| grep iommu`, IVRS ACPI table dump, Python struct parsing | Binary-patch IVRS table, inject via GRUB CPIO initrd |
+| **Firmware** (IOMMU identity mapping) | `dmesg \| grep iommu`, ACPI table inspection | Enable IOMMU explicitly in BIOS (not Auto) |
 | **Kernel** (runtime PM, driver probe, i2c) | `/proc/PID/status`, `/proc/PID/stack`, `fuser`, `lsof`, `modprobe.d`, sysfs power attributes | `amdgpu runpm=0`, post-bind `power/control=on` writes |
 | **Virtualization** (libvirt hooks, QEMU, vfio-pci) | `virsh`, `qemu-agent-command`, hook scripts, systemd transient units | No-op libvirt hook, external orchestrator |
 | **Guest OS** (Windows power mgmt, driver store, tasks) | `Get-WinEvent`, `Get-PnpDevice`, `pnputil`, `powercfg`, `regedit`, `schtasks` | High Performance plan, block WU GPU drivers, disable HDA audio |

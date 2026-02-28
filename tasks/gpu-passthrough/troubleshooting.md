@@ -2,10 +2,7 @@
 
 | Problem | Cause | Solution |
 |---|---|---|
-| "Failed to set group container: Invalid argument" | IVRS ACPI table exclusion ranges | IVRS table override (zeroed flags, OEM rev bump) — see [Phase 3](recipe/setup.md#phase-3-ivrs-acpi-table-override) |
-| "kernel is locked down, ignoring table override" | Secure Boot enabled | Disable Secure Boot in BIOS |
-| IVRS override not applied | OEM revision same as original | Bump OEM revision to 2 |
-| White screen on iGPU | `amd_iommu=force_isolation` breaks iGPU DMA | Remove `force_isolation`, use patched IVRS alone |
+| White screen on iGPU | `amd_iommu=force_isolation` breaks iGPU DMA | Remove `force_isolation` from kernel params |
 | GPU not visible in Windows | GPU never initialized, QEMU can't read ROM | Download VBIOS from TechPowerUp, add as ROM file |
 | "failed to find romfile" | QEMU sandbox restricts file access | Place ROM in `/usr/share/qemu/` |
 | YouTube won't load in VM | NAT/QUIC issues | Switch to bridged networking |

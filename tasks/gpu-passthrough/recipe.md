@@ -5,7 +5,7 @@ dependency — complete each file top-to-bottom before moving to the next.
 
 ## Procedure
 
-1. [Setup](recipe/setup.md) — Phases 1-8: BIOS, virtualization stack, IVRS,
+1. [Setup](recipe/setup.md) — Phases 1-8: BIOS, virtualization stack, GRUB,
    networking, GPU ROM, overwatch, VM creation, desktop shortcut
 2. [Install](recipe/install.md) — Phase 9: Windows 11, drivers, Overwatch
 3. [Configure](recipe/configure.md) — Phases 10-14: power tuning, HDA audio,

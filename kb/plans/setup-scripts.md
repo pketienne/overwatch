@@ -25,14 +25,13 @@ All three scripts follow `overwatch.sh` conventions: `set -uo pipefail`, `log()`
 
 ## Script 1: `setup-host.sh` (~350 lines)
 
-Subcommands: `all | prereqs | virt-stack | ivrs | network | gpu-rom | support | sudoers | desktop`
+Subcommands: `all | prereqs | virt-stack | grub | network | gpu-rom | support | sudoers | desktop`
 
 | Function | What it does |
 |----------|-------------|
 | `ensure_prereqs()` | Verify IOMMU enabled, kernel modules, IOMMU groups |
 | `ensure_virt_stack()` | `apt install` missing packages, add user to groups, `virt-host-validate` |
-| `ensure_ivrs()` | Python heredoc: read IVRS table, patch exclusion flags, create CPIO initrd |
-| `ensure_grub_config()` | Add `amd_iommu=on` + IVRS initrd to GRUB, `update-grub` |
+| `ensure_grub_config()` | Add `amd_iommu=on` to GRUB, `update-grub` |
 | `ensure_network()` | Write netplan bridge config, create libvirt bridged network |
 | `ensure_gpu_rom()` | Verify `/usr/share/qemu/gpu-rom.bin` exists (can't auto-download) |
 | `ensure_support_files()` | Install `overwatch` to `/usr/local/bin`, `.service`, udev rules, modprobe, modules-load, monitors.xml, no-op libvirt hook |
@@ -72,7 +71,6 @@ Each function is a self-contained Python heredoc with `qga()`/`run_ps()` (same p
 
 ## Known Pitfalls
 
-- **IVRS byte offsets** (`0xC9`, `0xE9`, `0x109`) are motherboard-specific — script should verify expected values before patching
 - **HDA audio OEM inf** (`oem39.inf`) varies per install — query `pnputil /enum-drivers` to find the right one
 - **AMD registry index** (`\0001`) assumes Basic Display at `\0000` — verify by querying `DriverDesc`
 - **Netplan filename** may differ — detect existing config rather than hardcode

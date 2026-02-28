@@ -28,7 +28,6 @@ One-click GPU passthrough for Overwatch 2 on myhost. The RX 7900 XTX is switchab
 - All USB devices passed through (keyboard, mouse, keypad, mousepad, headset)
 - Windows 11 VM with UEFI, TPM 2.0, anti-cheat tweaks
 - Bridged networking (VM gets own IP on LAN)
-- IVRS ACPI table override to fix VFIO container setup
 - One-click desktop shortcut: click -> play -> shut down Windows -> back to desktop
 - Lock file prevents concurrent overwatch instances
 - Host-side CPU isolation: vCPU cores (2-7) get zero host interference; emulator/IO pinned to cores 0-1
@@ -39,15 +38,12 @@ One-click GPU passthrough for Overwatch 2 on myhost. The RX 7900 XTX is switchab
 
 ```
 GRUB_CMDLINE_LINUX_DEFAULT="quiet splash amd_iommu=on"
-GRUB_EARLY_INITRD_LINUX_CUSTOM="acpi-ivrs-override.img"
 ```
 
 ### Key Files on myhost
 
 | File | Purpose |
 |---|---|
-| `/etc/default/grub` | Kernel params: `amd_iommu=on`, IVRS override initrd |
-| `/boot/acpi-ivrs-override.img` | Patched IVRS ACPI table (zeroed exclusion flags, OEM rev 2) |
 | `/usr/share/qemu/gpu-rom.bin` | Sapphire NITRO+ RX 7900 XTX Vapor-X VBIOS (2MB, from TechPowerUp) |
 | `/usr/local/bin/overwatch` | VM lifecycle script — stops services, switches GPU drivers, starts VM, waits for shutdown, restores host. Logs to journald |
 | `/etc/systemd/system/overwatch.service` | Systemd service unit for overwatch (`Type=simple`, `ExecStart=/usr/local/bin/overwatch start`). Start with `systemctl start overwatch`, stop with `systemctl stop overwatch` |

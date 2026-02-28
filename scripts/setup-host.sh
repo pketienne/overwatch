@@ -7,8 +7,7 @@
 #   all        Run all setup steps in order
 #   prereqs    Verify IOMMU, kernel modules, IOMMU groups
 #   virt-stack Install virtualization packages, add user to groups
-#   ivrs       Patch IVRS ACPI table, create override initrd
-#   grub       Configure GRUB for IOMMU and IVRS override
+#   grub       Configure GRUB for IOMMU
 #   network    Configure netplan bridge and libvirt bridged network
 #   gpu-rom    Verify GPU ROM file exists
 #   support    Install overwatch script, service, udev, modprobe, modules-load, monitors, hook
@@ -25,7 +24,6 @@ GPU="0000:03:00.0"
 BRIDGE_IF="br0"
 PHYS_IF="enp9s0"
 GPU_ROM="/usr/share/qemu/gpu-rom.bin"
-IVRS_INITRD="/boot/acpi-ivrs-override.img"
 TARGET_USER="myuser"
 
 VIRT_PACKAGES=(
@@ -75,8 +73,7 @@ if [ -z "$CMD" ]; then
     echo "  all        Run all setup steps in order"
     echo "  prereqs    Verify IOMMU, kernel modules, IOMMU groups"
     echo "  virt-stack Install virtualization packages, add user to groups"
-    echo "  ivrs       Patch IVRS ACPI table, create override initrd"
-    echo "  grub       Configure GRUB for IOMMU and IVRS override"
+    echo "  grub       Configure GRUB for IOMMU"
     echo "  network    Configure netplan bridge and libvirt bridged network"
     echo "  gpu-rom    Verify GPU ROM file exists"
     echo "  support    Install overwatch script, service, udev, modprobe, etc."
@@ -239,79 +236,6 @@ ensure_virt_stack() {
 }
 
 # ============================================================
-# Phase 3: IVRS ACPI table override
-# ============================================================
-
-ensure_ivrs() {
-    log "=== Phase 3: IVRS ACPI table override ==="
-
-    if [ -f "$IVRS_INITRD" ]; then
-        log "  $IVRS_INITRD already exists"
-        log "  To regenerate, remove it and re-run"
-        return 0
-    fi
-
-    if [ ! -f /sys/firmware/acpi/tables/IVRS ]; then
-        log "  ERROR: /sys/firmware/acpi/tables/IVRS not found — is this an AMD system with IOMMU?"
-        return 1
-    fi
-
-    if [ "$DRY_RUN" = true ]; then
-        log "  [dry-run] Would patch IVRS table and create $IVRS_INITRD"
-        return 0
-    fi
-
-    log "  Patching IVRS table..."
-
-    # Python: read IVRS, verify expected bytes, patch exclusion flags, write patched table
-    python3 << 'PYEOF'
-import struct, sys
-
-with open("/sys/firmware/acpi/tables/IVRS", "rb") as f:
-    data = bytearray(f.read())
-
-# Verify expected exclusion flag bytes before patching (motherboard-specific)
-offsets = [0xC9, 0xE9, 0x109]
-for off in offsets:
-    if off >= len(data):
-        print(f"ERROR: IVRS table too short ({len(data)} bytes, need offset 0x{off:X})")
-        sys.exit(1)
-    val = data[off]
-    if val == 0x00:
-        print(f"  Offset 0x{off:X}: already 0x00 (no patch needed)")
-    elif val == 0x08 or val == 0x48:
-        print(f"  Offset 0x{off:X}: 0x{val:02X} -> 0x00 (patching)")
-        data[off] = 0x00
-    else:
-        print(f"WARNING: Offset 0x{off:X} has unexpected value 0x{val:02X} — patching anyway")
-        data[off] = 0x00
-
-# Bump OEM revision so kernel accepts the override
-struct.pack_into("<I", data, 0x18, 2)
-
-# Recalculate checksum
-data[9] = 0
-checksum = (256 - (sum(data) % 256)) % 256
-data[9] = checksum
-
-with open("/tmp/ivrs-patched.dat", "wb") as f:
-    f.write(data)
-
-print("  IVRS table patched successfully")
-PYEOF
-
-    # Create CPIO initrd image
-    log "  Creating CPIO initrd..."
-    local work_dir="/tmp/ivrs-img"
-    rm -rf "$work_dir"
-    mkdir -p "$work_dir/kernel/firmware/acpi"
-    cp /tmp/ivrs-patched.dat "$work_dir/kernel/firmware/acpi/ivrs.dat"
-    (cd "$work_dir" && find . -print0 | cpio --null --create --format=newc > "$IVRS_INITRD" 2>/dev/null)
-    rm -rf "$work_dir" /tmp/ivrs-patched.dat
-    log "  Created $IVRS_INITRD"
-}
-
-# ============================================================
 # Phase 3: GRUB configuration
 # ============================================================
 
@@ -347,31 +271,12 @@ ensure_grub_config() {
         fi
     fi
 
-    # Check GRUB_EARLY_INITRD_LINUX_CUSTOM for IVRS override
-    local current_initrd
-    current_initrd=$(grep "^GRUB_EARLY_INITRD_LINUX_CUSTOM=" "$grub_file" 2>/dev/null | head -1) || true
-    if echo "$current_initrd" | grep -q "acpi-ivrs-override.img"; then
-        log "  GRUB_EARLY_INITRD_LINUX_CUSTOM already contains acpi-ivrs-override.img"
-    else
-        if [ "$DRY_RUN" = true ]; then
-            log "  [dry-run] Would set GRUB_EARLY_INITRD_LINUX_CUSTOM"
-        else
-            if [ -n "$current_initrd" ]; then
-                sed -i 's|^GRUB_EARLY_INITRD_LINUX_CUSTOM=.*|GRUB_EARLY_INITRD_LINUX_CUSTOM="acpi-ivrs-override.img"|' "$grub_file"
-            else
-                echo 'GRUB_EARLY_INITRD_LINUX_CUSTOM="acpi-ivrs-override.img"' >> "$grub_file"
-            fi
-            log "  Set GRUB_EARLY_INITRD_LINUX_CUSTOM=acpi-ivrs-override.img"
-            changed=true
-        fi
-    fi
-
     if [ "$changed" = true ]; then
         log "  Running update-grub..."
         update-grub 2>&1 | while IFS= read -r line; do
             log "    $line"
         done
-        log "  GRUB updated (reboot required for IVRS override to take effect)"
+        log "  GRUB updated (reboot required for changes to take effect)"
     else
         log "  GRUB already configured"
     fi
@@ -621,7 +526,6 @@ ensure_desktop_shortcut() {
 do_all() {
     ensure_prereqs
     ensure_virt_stack
-    ensure_ivrs
     ensure_grub_config
     ensure_network
     ensure_gpu_rom
@@ -635,7 +539,6 @@ case "$CMD" in
     all)        do_all ;;
     prereqs)    ensure_prereqs ;;
     virt-stack) ensure_virt_stack ;;
-    ivrs)       ensure_ivrs ;;
     grub)       ensure_grub_config ;;
     network)    ensure_network ;;
     gpu-rom)    ensure_gpu_rom ;;

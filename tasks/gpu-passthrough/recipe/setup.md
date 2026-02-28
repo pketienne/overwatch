@@ -6,13 +6,14 @@ These must be set before the OS install (or at least before Phase 2).
 
 | Setting | Value | Location (MSI MPG X870E CARBON WIFI) |
 |---|---|---|
-| IOMMU | Enabled | AMD CBS or Advanced |
+| IOMMU | **Enabled** | OC > Advanced CPU Configuration > AMD CBS |
+| SVM Mode | **Enabled** | OC > Advanced CPU Configuration > AMD CBS |
 | Initiate Graphic Adapter | **IGD** (iGPU primary) | Advanced > Integrated Graphics Configuration |
 | Integrated Graphics | **Force** | Same section |
 | HybridGraphics | **Disabled** | Same section |
+| Re-Size BAR Support | **Enabled** | Advanced > PCIe Subsystem Settings |
+| Above 4G Decoding | **Enabled** (auto-enabled by ReBAR) | Same section |
 | Secure Boot | **Disabled** | Security > Secure Boot |
-
-**Note:** "Kernel DMA Protection" is **not exposed** in BIOS 1.A80 on this board. The IVRS ACPI table override (Phase 3) works around this.
 
 
 ## Phase 2: Install Virtualization Stack
@@ -30,45 +31,11 @@ virt-host-validate
 ```
 
 
-## Phase 3: IVRS ACPI Table Override
-
-**Why:** The motherboard's IVRS table declares exclusion ranges that block VFIO container setup ("Failed to set group container: Invalid argument"). We patch the table to zero these flags.
-
-### 3.1 Extract and patch the IVRS table
-
-```python
-import struct
-with open("/sys/firmware/acpi/tables/IVRS", "rb") as f:
-    data = bytearray(f.read())
-# Zero IVMD exclusion flags
-data[0xC9] = 0x00
-data[0xE9] = 0x00
-data[0x109] = 0x00
-# Bump OEM revision (kernel requires higher revision to accept override)
-struct.pack_into("<I", data, 0x18, 2)
-# Recalculate checksum
-data[9] = 0
-checksum = (256 - (sum(data) % 256)) % 256
-data[9] = checksum
-with open("/tmp/ivrs-patched.dat", "wb") as f:
-    f.write(data)
-```
-
-### 3.2 Create CPIO initrd image
-
-```bash
-mkdir -p /tmp/ivrs-img/kernel/firmware/acpi
-cp /tmp/ivrs-patched.dat /tmp/ivrs-img/kernel/firmware/acpi/ivrs.dat
-cd /tmp/ivrs-img
-find . -print0 | cpio --null --create --format=newc > /boot/acpi-ivrs-override.img
-```
-
-### 3.3 Configure GRUB
+## Phase 3: GRUB Configuration
 
 In `/etc/default/grub`:
 ```
 GRUB_CMDLINE_LINUX_DEFAULT="quiet splash amd_iommu=on"
-GRUB_EARLY_INITRD_LINUX_CUSTOM="acpi-ivrs-override.img"
 ```
 
 **Do NOT use** `iommu=pt` or `amd_iommu=force_isolation` — the former is unnecessary, the latter breaks iGPU display (white screen due to broken display scanout DMA).
@@ -78,11 +45,8 @@ sudo update-grub
 sudo reboot
 ```
 
-### 3.4 Verify
-
+Verify:
 ```bash
-dmesg | grep -i ivrs
-# Should show the patched table being loaded
 dmesg | grep -i iommu
 # Should show IOMMU groups without errors
 ```
