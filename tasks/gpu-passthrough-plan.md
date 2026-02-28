@@ -31,7 +31,7 @@ One-click GPU passthrough for Overwatch 2 on myhost. The RX 7900 XTX is switchab
 - IVRS ACPI table override to fix VFIO container setup
 - One-click desktop shortcut: click -> play -> shut down Windows -> back to desktop
 - Lock file prevents concurrent overwatch instances
-- Host-side CPU isolation: vCPU cores (1-7) get zero host interference; emulator/IO pinned to core 0
+- Host-side CPU isolation: vCPU cores (2-7) get zero host interference; emulator/IO pinned to cores 0-1
 - Auto HDR disabled (native HDR on), Game Bar disabled, AMD telemetry disabled
 - TDR timeout set to 60s (`TdrDelay`, `TdrDdiDelay`) — eliminates boot-time WATCHDOG dumps caused by DxgKrnl WDDM init under contention (0/4 dumps in testing)
 

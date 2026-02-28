@@ -63,7 +63,7 @@ killed on shutdown alongside other background jobs.
 
 | Metric | Tool | What it diagnoses |
 |---|---|---|
-| Per-core CPU utilization | `mpstat -P ALL` (cores >50% only) | Core 0 saturation, host interference on vCPU cores 1–7 |
+| Per-core CPU utilization | `mpstat -P ALL` (cores >50% only) | Core 0-1 saturation, host interference on vCPU cores 2–7 |
 | Disk I/O latency | `iostat -x` (nvme1n1) | qcow2 read/write await, utilization |
 | Memory pressure | `/proc/meminfo` | Free/available memory, swap usage |
 

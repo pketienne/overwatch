@@ -244,15 +244,15 @@ Use `virt-install` or import the XML from the [VM XML Reference](vm-xml-referenc
 | Setting | Value |
 |---|---|
 | **Name** | `overwatch` |
-| **vCPUs** | 7, pinned to cores 1-7 (core 0 reserved for host + emulator + IO) |
-| **Topology** | 1 socket, 7 cores, 1 thread |
-| **IO threads** | 1 dedicated IO thread, pinned to core 0 |
-| **Emulator** | Pinned to core 0 (prevents VFIO interrupt injection contention on vCPU cores) |
+| **vCPUs** | 6, pinned to cores 2-7 (cores 0-1 reserved for host + emulator + IO) |
+| **Topology** | 1 socket, 6 cores, 1 thread |
+| **IO threads** | 1 dedicated IO thread, pinned to cores 0-1 |
+| **Emulator** | Pinned to cores 0-1 (prevents VFIO interrupt injection contention on vCPU cores) |
 | **RAM** | 16 GB |
 | **CPU** | host-passthrough, cache passthrough |
 | **Firmware** | OVMF (UEFI) with TPM 2.0 (tpm-crb, emulator backend) |
 | **Disk** | VirtIO, `/var/lib/libvirt/images/overwatch.qcow2` |
-| **Network** | VirtIO NIC on `bridged` network (br0) |
+| **Network** | VirtIO NIC on bridge `br0` |
 | **Display** | None (remove Spice/QXL — native GPU output only) |
 
 ### 7.3 GPU passthrough devices
@@ -341,35 +341,38 @@ This is not a numbered phase — CPU isolation is built into overwatch and the
 libvirt XML (Phase 7), not a manual step. Understanding the architecture helps
 with troubleshooting.
 
-overwatch confines all host processes to core 0 during VM runtime, giving
-vCPU cores (1-7) zero host interference. This improves VFIO interrupt delivery
+overwatch confines all host processes to cores 0-1 during VM runtime, giving
+vCPU cores (2-7) zero host interference. This improves VFIO interrupt delivery
 latency, reduces boot-time TDR frequency, and provides better gaming frame
-consistency.
+consistency. Originally single-core (core 0) but expanded to 2 cores after
+monitoring showed core 0 at 100% during gameplay — QEMU emulator thread
+competing with host processes for USB audio isochronous transfers, causing
+headset static.
 
 ### Libvirt XML (`cputune`)
 
 ```xml
 <iothreads>1</iothreads>
 <cputune>
-  <vcpupin vcpu='0' cpuset='1'/>
-  <!-- ... vcpupin 1-6 on cpuset 2-7 ... -->
-  <emulatorpin cpuset='0'/>
-  <iothreadpin iothread='1' cpuset='0'/>
+  <vcpupin vcpu='0' cpuset='2'/>
+  <!-- ... vcpupin 1-5 on cpuset 3-7 ... -->
+  <emulatorpin cpuset='0-1'/>
+  <iothreadpin iothread='1' cpuset='0-1'/>
 </cputune>
 ```
 
-- **emulatorpin**: Confines QEMU emulator thread to core 0. This thread handles
+- **emulatorpin**: Confines QEMU emulator thread to cores 0-1. This thread handles
   VFIO interrupt injection — pinning it prevents contention on vCPU cores.
-- **iothreadpin**: Confines the IO thread (disk, network) to core 0.
+- **iothreadpin**: Confines the IO thread (disk, network) to cores 0-1.
 
 ### overwatch: dynamic AllowedCPUs
 
 During VM runtime, `ensure_performance_tuning()` confines all host processes:
 
 ```bash
-systemctl set-property --runtime -- system.slice AllowedCPUs=0
-systemctl set-property --runtime -- user.slice AllowedCPUs=0
-systemctl set-property --runtime -- init.scope AllowedCPUs=0
+systemctl set-property --runtime -- system.slice AllowedCPUs=0-1
+systemctl set-property --runtime -- user.slice AllowedCPUs=0-1
+systemctl set-property --runtime -- init.scope AllowedCPUs=0-1
 ```
 
 On restore, `ensure_cpu_defaults()` lifts the restriction:
@@ -380,5 +383,5 @@ systemctl set-property --runtime -- user.slice AllowedCPUs=0-7
 systemctl set-property --runtime -- init.scope AllowedCPUs=0-7
 ```
 
-Combined with IRQ pinning (all IRQs → core 0) and writeback migration, this
-ensures cores 1-7 run only VM vCPU threads during gameplay.
+Combined with IRQ pinning (all IRQs → cores 0-1) and writeback migration, this
+ensures cores 2-7 run only VM vCPU threads during gameplay.
