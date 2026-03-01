@@ -442,3 +442,98 @@ sudo /tmp/setup-guest.sh verify
 ```bash
 sudo virsh qemu-agent-command overwatch '{"execute":"guest-exec","arguments":{"path":"powershell.exe","arg":["-NoProfile","-Command","reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v AutoAdminLogon /t REG_SZ /d 1 /f"],"capture-output":true}}'
 ```
+
+## 12. Lifecycle script (dynamic GPU binding)
+
+The lifecycle script (`overwatch.sh`) manages the full VM lifecycle: stops host services, swaps the GPU from amdgpu to vfio-pci, starts the VM, waits for shutdown, then restores everything. This eliminates the need for host reboots between VM sessions.
+
+### Phase A: Install script (while still on static vfio-pci)
+
+```bash
+# Copy script and service to myhost
+scp scripts/overwatch.sh myhost:/tmp/overwatch.sh
+scp scripts/overwatch.service myhost:/tmp/overwatch.service
+
+# Install
+ssh myhost 'sudo install -m 755 /tmp/overwatch.sh /usr/local/bin/overwatch'
+ssh myhost 'sudo cp /tmp/overwatch.service /etc/systemd/system/overwatch.service'
+ssh myhost 'sudo systemctl daemon-reload'
+```
+
+Verify:
+
+```bash
+ssh myhost 'sudo overwatch status'
+# Expected: GPU/VM/service state summary
+
+ssh myhost 'bash -n /usr/local/bin/overwatch && echo "Syntax OK"'
+# Expected: Syntax OK
+```
+
+Test start/stop cycle (GPU is still on static vfio-pci, so the script skips the driver swap):
+
+```bash
+ssh myhost 'sudo systemctl start overwatch'
+# Expected: VM starts, script waits for shutdown
+
+# Shut down the VM from inside Windows, then check:
+ssh myhost 'journalctl -u overwatch --no-pager -n 50'
+# Expected: clean start → wait → shutdown → restore sequence
+```
+
+### Phase B: Switch to dynamic binding
+
+Remove static vfio-pci binding so the GPU boots on amdgpu:
+
+```bash
+# Remove static binding files
+ssh myhost 'sudo rm /etc/modprobe.d/vfio.conf'
+ssh myhost 'sudo rm /etc/modules-load.d/vfio-pci.conf'
+
+# Disable GPU runtime PM (crashes on D3 resume)
+ssh myhost 'echo "options amdgpu runpm=0" | sudo tee /etc/modprobe.d/amdgpu.conf'
+
+# Prevent GDM from using the dGPU (seat rule empties seat assignment)
+ssh myhost 'echo '\''ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ENV{ID_PATH}=="pci-0000:03:00.0", ENV{ID_SEAT}=""'\'' | sudo tee /etc/udev/rules.d/99-gpu-passthrough.rules'
+
+# Rebuild initramfs and reboot
+ssh myhost 'sudo update-initramfs -u && sudo reboot'
+```
+
+### Phase C: Verify dynamic binding
+
+After reboot, the GPU should be on amdgpu (not vfio-pci):
+
+```bash
+ssh myhost 'lspci -nnk -s 03:00.0 | grep "driver in use"'
+# Expected: Kernel driver in use: amdgpu
+
+ssh myhost 'lspci -nnk -s 03:00.1 | grep "driver in use"'
+# Expected: Kernel driver in use: snd_hda_intel
+```
+
+Test the full lifecycle:
+
+```bash
+# Start VM (script swaps GPU to vfio-pci)
+ssh myhost 'sudo systemctl start overwatch'
+
+# Verify GPU is on vfio-pci
+ssh myhost 'lspci -nnk -s 03:00.0 | grep "driver in use"'
+# Expected: Kernel driver in use: vfio-pci
+
+ssh myhost 'sudo virsh domstate overwatch'
+# Expected: running
+
+# Shut down the VM from inside Windows, then verify host restored:
+ssh myhost 'lspci -nnk -s 03:00.0 | grep "driver in use"'
+# Expected: Kernel driver in use: amdgpu
+
+ssh myhost 'systemctl is-active gdm ollama openrgb'
+# Expected: active (for each)
+
+ssh myhost 'journalctl -u overwatch --no-pager -n 50'
+# Expected: clean lifecycle with no errors
+```
+
+If the GPU fails to rebind after stop (shows `unbound` or header type '127'), the stop sequence logs a warning but the host remains usable on the iGPU. Check `sudo dmesg | grep -i amdgpu` for errors. A host reboot will reset the GPU to a clean state.
