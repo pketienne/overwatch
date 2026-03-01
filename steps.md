@@ -340,8 +340,8 @@ Activation steps:
 4. Enable auto-login (no password prompt):
 
 ```bash
-# From the host, via guest agent:
-sudo virsh qemu-agent-command overwatch '{"execute":"guest-exec","arguments":{"path":"powershell.exe","arg":["-NoProfile","-Command","reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v AutoAdminLogon /t REG_SZ /d 1 /f; reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v DefaultUserName /t REG_SZ /d myuser /f; reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v DefaultPassword /t REG_SZ /d \"\" /f"],"capture-output":true}}'
+# From the host, via guest agent (uses Set-ItemProperty to avoid reg.exe empty-string escaping issues):
+sudo virsh qemu-agent-command overwatch '{"execute":"guest-exec","arguments":{"path":"powershell.exe","arg":["-NoProfile","-Command","$p = \"HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\"; Set-ItemProperty $p AutoAdminLogon 1; Set-ItemProperty $p DefaultUserName myuser; Set-ItemProperty $p DefaultPassword \"\""],"capture-output":true}}'
 ```
 
 **Important:** The digital license survives switching to a local account. Once activated and linked to your Microsoft account, the license is tied to the hardware fingerprint, not the signed-in account. If you ever need to re-activate after a rebuild, keep the UUID and SMBIOS strings identical, sign in with the same Microsoft account, and use the Activation Troubleshooter > "I changed hardware on this device recently."
@@ -440,7 +440,7 @@ sudo /tmp/setup-guest.sh verify
 **Note:** `AutoAdminLogon` (step 9) tends to reset to `0` after account changes or failed logins. If Windows prompts for credentials after a reboot, re-apply it:
 
 ```bash
-sudo virsh qemu-agent-command overwatch '{"execute":"guest-exec","arguments":{"path":"powershell.exe","arg":["-NoProfile","-Command","reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" /v AutoAdminLogon /t REG_SZ /d 1 /f"],"capture-output":true}}'
+sudo virsh qemu-agent-command overwatch '{"execute":"guest-exec","arguments":{"path":"powershell.exe","arg":["-NoProfile","-Command","Set-ItemProperty \"HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\" AutoAdminLogon 1"],"capture-output":true}}'
 ```
 
 ## 12. Lifecycle script (dynamic GPU binding)
