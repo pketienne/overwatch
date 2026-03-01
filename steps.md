@@ -445,9 +445,27 @@ Disables OneDrive privacy toasts and other Windows "suggestion" notifications:
 ssh myhost 'sudo virsh qemu-agent-command overwatch "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"powershell.exe\",\"arg\":[\"-NoProfile\",\"-Command\",\"New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS -EA SilentlyContinue | Out-Null; \$sid = \\\"S-1-5-21-XXXXXXXXXX-XXXXXXXXXX-XXXXXXXXXX-1001\\\"; \$cdm = \\\"HKU:\\\\\$sid\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\ContentDeliveryManager\\\"; Set-ItemProperty \$cdm -Name SubscribedContent-310093Enabled -Value 0 -EA SilentlyContinue; Set-ItemProperty \$cdm -Name SubscribedContent-338389Enabled -Value 0 -EA SilentlyContinue; Set-ItemProperty \$cdm -Name SubscribedContent-338393Enabled -Value 0 -EA SilentlyContinue; Set-ItemProperty \$cdm -Name SilentInstalledAppsEnabled -Value 0 -EA SilentlyContinue\"],\"capture-output\":true}}"'
 ```
 
+### Defender exclusions
+
+Exclude `C:\` and `D:\` from real-time scanning. Defender stays enabled (required for Ricochet anti-cheat) but scans nothing, eliminating CPU contention during GPU driver init and gameplay. Cannot be set programmatically — Tamper Protection blocks `Add-MpPreference` from SYSTEM session.
+
+**Manual steps (inside the VM):**
+1. Windows Security → Virus & threat protection → Manage settings → Exclusions → Add an exclusion → Folder
+2. Add `C:\`
+3. Add `D:\`
+
+Verify via guest agent:
+
+```bash
+# Run from devbox
+ssh myhost 'cat /tmp/defender-check.json | sudo virsh qemu-agent-command overwatch --cmd "$(cat /dev/stdin)"'
+# where /tmp/defender-check.json contains:
+# {"execute":"guest-exec","arguments":{"path":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","arg":["-Command","(Get-MpPreference).ExclusionPath"],"capture-output":true}}
+# Expected: C:\, D:\, plus AMD driver paths
+```
+
 ### Pending guest config
 
-- Defender exclusions for AMD driver paths
 - AMD telemetry disable (AUEPLauncher + StartAUEP)
 - Display config (Auto HDR off, Game Bar off)
 - Shutdown signal (UDP packet to host on Windows shutdown)
