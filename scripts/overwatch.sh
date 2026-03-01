@@ -414,11 +414,13 @@ attach_tartarus_deferred() {
         sleep 2
     done
 
-    # Poll for RazerAppEngine process (up to 120s)
+    # Poll for razerwdl process (up to 120s)
+    # razerwdl is the last Razer process to start — it handles profile sync.
+    # RazerAppEngine starts ~10s earlier but profiles aren't ready until razerwdl is up.
     for i in $(seq 1 60); do
         local ps_out pid status_out
         ps_out=$(virsh qemu-agent-command overwatch \
-            '{"execute":"guest-exec","arguments":{"path":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","arg":["-Command","if(Get-Process RazerAppEngine -EA SilentlyContinue){\"RUNNING\"}else{\"WAITING\"}"],"capture-output":true}}' 2>/dev/null) || true
+            '{"execute":"guest-exec","arguments":{"path":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","arg":["-Command","if(Get-Process razerwdl -EA SilentlyContinue){\"RUNNING\"}else{\"WAITING\"}"],"capture-output":true}}' 2>/dev/null) || true
         if [ -n "$ps_out" ]; then
             pid=$(echo "$ps_out" | python3 -c "import sys,json; print(json.load(sys.stdin)['return']['pid'])" 2>/dev/null) || true
             if [ -n "$pid" ]; then
@@ -438,7 +440,7 @@ if r.get('out-data'):
         sleep 2
     done
 
-    # Give Synapse a moment to finish initializing
+    # Give razerwdl a moment to finish initializing after process start
     sleep 5
 
     # Attach Tartarus via virsh
