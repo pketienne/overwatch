@@ -629,13 +629,14 @@ _do_stop() {
 _do_start() {
     log "=== Starting Overwatch VM ==="
 
-    # Handle SIGTERM from systemctl stop: shut down VM, restore host, exit
-    trap '_on_sigterm' TERM
-    _on_sigterm() {
-        log "Received SIGTERM (systemctl stop) — shutting down..."
-        _do_stop
-        exit 0
-    }
+    # --- SIGTERM deferral during GPU handoff ---
+    # The GPU handoff (host → vfio → VM) puts the system in a transitional state.
+    # If SIGTERM (from systemctl stop) arrives mid-handoff and we immediately try
+    # to reverse the GPU operations, the half-unbound GPU causes a kernel panic.
+    # Solution: defer SIGTERM during the critical section, then handle it once
+    # the system is in a stable state (VM running, or fully rolled back).
+    local SIGTERM_DEFERRED=false
+    trap 'SIGTERM_DEFERRED=true; log "SIGTERM deferred — GPU handoff in progress"' TERM
 
     # Refuse if VM already running
     if virsh domstate overwatch 2>/dev/null | grep -q "running"; then
@@ -643,13 +644,30 @@ _do_start() {
         exit 1
     fi
 
-    # Pre-VM preparation (critical failures abort with cleanup)
+    # === CRITICAL SECTION: GPU handoff (SIGTERM deferred) ===
     ensure_services_stopped
     ensure_device_fds_released
     ensure_vt_unbound
     ensure_gpu_unbound_from_host
     ensure_gpu_on_vfio || { log "ERROR: VFIO bind failed"; _do_stop; exit 1; }
     ensure_vm_running || { log "ERROR: VM start failed"; _do_stop; exit 1; }
+    # === END CRITICAL SECTION ===
+
+    # Stable state reached: VM running, GPU on vfio-pci.
+    # If SIGTERM arrived during handoff, do a clean shutdown now.
+    if [ "$SIGTERM_DEFERRED" = true ]; then
+        log "Processing deferred SIGTERM — stopping VM..."
+        _do_stop
+        exit 0
+    fi
+
+    # Install interruptible SIGTERM handler for the wait loop
+    _on_sigterm() {
+        log "Received SIGTERM (systemctl stop) — shutting down..."
+        _do_stop
+        exit 0
+    }
+    trap '_on_sigterm' TERM
 
     # Post-VM-start setup (non-critical, continue on failure)
     set_igpu_blank 4 blank || true
