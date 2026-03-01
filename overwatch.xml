@@ -114,8 +114,9 @@
       <model type='virtio'/>
     </interface>
 
-    <!-- Second USB controller (default xHCI only has 4 ports) -->
-    <controller type='usb' model='qemu-xhci'/>
+    <!-- xHCI with 8 ports (default is 4, need room for keyboard, mouse,
+         strider, tartarus (deferred), steelseries, and spares) -->
+    <controller type='usb' model='qemu-xhci' ports='8'/>
 
     <!-- USB passthrough: Kinesis Advantage2 keyboard -->
     <hostdev mode='subsystem' type='usb' managed='yes'>
@@ -144,9 +145,15 @@
       </source>
     </hostdev>
 
-    <!-- SteelSeries Arctis Pro Wireless: 1038:1290 is intermittent (not always
-         enumerated), removed to prevent VM start failure. 1038:1294 also removed
-         since both devices are part of the same headset. -->
+    <!-- USB passthrough: SteelSeries Arctis Pro Wireless
+         Only 1038:1294 — 1038:1290 is intermittent (not always enumerated),
+         removed to prevent VM start failure -->
+    <hostdev mode='subsystem' type='usb' managed='yes'>
+      <source>
+        <vendor id='0x1038'/>
+        <product id='0x1294'/>
+      </source>
+    </hostdev>
 
 
     <!-- QEMU guest agent channel -->
