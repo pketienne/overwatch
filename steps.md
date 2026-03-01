@@ -374,68 +374,84 @@ sudo virsh qemu-agent-command overwatch '{"execute":"guest-exec","arguments":{"p
 
 ## 11. Guest configuration
 
-Configure the Windows guest for GPU passthrough stability, performance, and Razer peripheral support. The v1 `setup-guest.sh` script automates all phases via the guest agent. Copy it to the host and run each phase:
+Configure the Windows guest for GPU passthrough stability and performance. All commands run from devbox via the guest agent on myhost.
+
+### TDR timeout
+
+Extend the GPU Timeout Detection and Recovery deadline from the default 2s to 60s. Under passthrough, the AMD driver's WDDM init takes longer because every GPU register access goes through VFIO's MMIO trap-and-forward path. Combined with Windows Defender boot contention, init can exceed the default timeout, causing a watchdog reset (black screen → recovery). v1 tested 25s (still got dumps), 60s eliminated them (0/4).
 
 ```bash
-scp archive/v1/scripts/setup-guest.sh myhost:/tmp/setup-guest.sh
-ssh myhost 'chmod +x /tmp/setup-guest.sh'
+ssh myhost 'sudo virsh qemu-agent-command overwatch "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"powershell.exe\",\"arg\":[\"-NoProfile\",\"-Command\",\"\$p = \\\"HKLM:\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\GraphicsDrivers\\\"; Set-ItemProperty \$p -Name TdrDelay -Value 60 -Type DWord; Set-ItemProperty \$p -Name TdrDdiDelay -Value 60 -Type DWord\"],\"capture-output\":true}}"'
 ```
 
-### Phase 10: Power settings & AMD driver tuning
-
-Sets High Performance power plan, disables PCI Express ASPM, USB selective suspend, display/sleep timeouts, and hybrid sleep. Disables AMD driver internal power management (ULPS, deep sleep, DRMDMA power off) to prevent GPU entering low-power states that cause hangs in passthrough.
+Verify:
 
 ```bash
-sudo /tmp/setup-guest.sh power
+# Check registry values
+ssh myhost 'sudo virsh qemu-agent-command overwatch ...'
+# Expected: TdrDelay=60, TdrDdiDelay=60
+
+# Check LiveKernelReports for new dumps after reboot
+ssh myhost 'sudo virsh qemu-agent-command overwatch ...'
+# Expected: no new WATCHDOG dumps after the change
 ```
 
-### Phase 11: AMD HD Audio driver removal
+### AMD HD Audio driver removal
 
-Removes the AMD HD Audio driver (`AtiHDAudioService`) from the Windows driver store. The GPU audio function (03:00.1) is passed through for HDMI/DP audio, but the HDAudBus driver sends power IRPs during shutdown that vfio-pci can't handle — causing 0x9F BSODs. Removing the driver prevents this.
+Removes the AMD HD Audio driver (`atihdwt6.inf`) from the Windows driver store. The GPU audio function (03:00.1) is passed through, but the HDAudBus driver sends power IRPs during GPU state transitions that vfio-pci can't handle — causing TDR and 0x9F BSODs.
+
+Steps: disable the devices, remove the device nodes, then delete the driver from the store.
 
 ```bash
-sudo /tmp/setup-guest.sh hda-audio
+# Disable all AMD HD Audio devices
+ssh myhost 'sudo virsh qemu-agent-command overwatch "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"powershell.exe\",\"arg\":[\"-NoProfile\",\"-Command\",\"Get-PnpDevice | Where-Object InstanceId -like \\\"HDAUDIO*VEN_1002*\\\" | ForEach-Object { Disable-PnpDevice -InstanceId \$_.InstanceId -Confirm:0 -EA SilentlyContinue; Write-Output \\\"Disabled: \$(\$_.InstanceId)\\\" }\"],\"capture-output\":true}}"'
+
+# Remove device nodes
+ssh myhost 'sudo virsh qemu-agent-command overwatch "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"powershell.exe\",\"arg\":[\"-NoProfile\",\"-Command\",\"Get-PnpDevice | Where-Object InstanceId -like \\\"HDAUDIO*VEN_1002*\\\" | ForEach-Object { pnputil /remove-device \$_.InstanceId }\"],\"capture-output\":true}}"'
+
+# Find and delete the driver from the store
+ssh myhost 'sudo virsh qemu-agent-command overwatch "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"powershell.exe\",\"arg\":[\"-NoProfile\",\"-Command\",\"pnputil /enum-drivers /class MEDIA\"],\"capture-output\":true}}"'
+# Find the oem*.inf with atihdwt6.inf as Original Name, then:
+ssh myhost 'sudo virsh qemu-agent-command overwatch "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"powershell.exe\",\"arg\":[\"-NoProfile\",\"-Command\",\"pnputil /delete-driver oem28.inf /force\"],\"capture-output\":true}}"'
 ```
 
-### Phase 12: Defender exclusions & AMD telemetry
-
-Adds Windows Defender exclusions for AMD driver paths and processes (prevents Defender from scanning driver files during GPU init, which can cause TDR timeouts). Disables AMD telemetry (AUEPLauncher service + StartAUEP scheduled task) — both launch paths must be disabled or AUEPMaster respawns every boot.
+Verify:
 
 ```bash
-sudo /tmp/setup-guest.sh defender
-sudo /tmp/setup-guest.sh telemetry
+# No AMD HD Audio devices should be listed
+ssh myhost 'sudo virsh qemu-agent-command overwatch ...'
+# Expected: no HDAUDIO*VEN_1002* devices
+
+# atihdwt6.inf should not be in the driver store
+ssh myhost 'sudo virsh qemu-agent-command overwatch ...'
+# Expected: no AtiHDAudio entry in pnputil /enum-drivers /class MEDIA
 ```
 
-### Phase 13: Display configuration
+### Power settings & AMD driver tuning
 
-Disables Auto HDR (causes flickering with passthrough), Game Bar (unnecessary overhead), and Auto HDR toast notifications. These are per-user settings — the guest must have a user logged in.
+Sets High Performance power plan, disables ULPS, deep sleep, and DRMDMA power off. These were applied via the v1 `setup-guest.sh power` phase and are already active.
+
+### OneDrive removal
 
 ```bash
-sudo /tmp/setup-guest.sh display
+ssh myhost 'sudo virsh qemu-agent-command overwatch "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"powershell.exe\",\"arg\":[\"-NoProfile\",\"-Command\",\"Stop-Process -Name OneDrive -Force -EA SilentlyContinue; Start-Process \\\"C:\\\\Windows\\\\System32\\\\OneDriveSetup.exe\\\" -ArgumentList \\\"/uninstall\\\" -Wait\"],\"capture-output\":true}}"'
 ```
 
-### Phase 14: Shutdown signal
+### Windows suggestion toasts
 
-Installs a PowerShell script (`C:\ProgramData\overwatch\overwatch.ps1`) and a scheduled task that sends a UDP packet to the host when Windows initiates shutdown. Used by the lifecycle script to detect guest shutdown and begin GPU cleanup.
+Disables OneDrive privacy toasts and other Windows "suggestion" notifications:
 
 ```bash
-sudo /tmp/setup-guest.sh shutdown
+ssh myhost 'sudo virsh qemu-agent-command overwatch "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"powershell.exe\",\"arg\":[\"-NoProfile\",\"-Command\",\"New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS -EA SilentlyContinue | Out-Null; \$sid = \\\"S-1-5-21-XXXXXXXXXX-XXXXXXXXXX-XXXXXXXXXX-1001\\\"; \$cdm = \\\"HKU:\\\\\$sid\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\ContentDeliveryManager\\\"; Set-ItemProperty \$cdm -Name SubscribedContent-310093Enabled -Value 0 -EA SilentlyContinue; Set-ItemProperty \$cdm -Name SubscribedContent-338389Enabled -Value 0 -EA SilentlyContinue; Set-ItemProperty \$cdm -Name SubscribedContent-338393Enabled -Value 0 -EA SilentlyContinue; Set-ItemProperty \$cdm -Name SilentInstalledAppsEnabled -Value 0 -EA SilentlyContinue\"],\"capture-output\":true}}"'
 ```
 
-### Razer Synapse delayed start
+### Pending guest config (from v1, not yet applied)
 
-Disables Razer's auto-start via StartupApproved registry and creates a scheduled task that launches Synapse after a 15-second logon delay. This gives USB devices time to enumerate before Synapse starts. The Tartarus is currently in the VM XML (attached at boot); once the lifecycle script is built, it will be moved to deferred hot-attach so Synapse detects it via hot-plug.
-
-```bash
-sudo /tmp/setup-guest.sh synapse
-```
-
-### Verify all guest settings
-
-```bash
-sudo /tmp/setup-guest.sh verify
-# Expected: All checks passed
-```
+- Defender exclusions for AMD driver paths
+- AMD telemetry disable (AUEPLauncher + StartAUEP)
+- Display config (Auto HDR off, Game Bar off)
+- Shutdown signal (UDP packet to host on Windows shutdown)
+- Razer Synapse delayed start
 
 **Note:** `AutoAdminLogon` (step 9) tends to reset to `0` after account changes or failed logins. If Windows prompts for credentials after a reboot, re-apply it:
 
