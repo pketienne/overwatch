@@ -133,13 +133,8 @@
       </source>
     </hostdev>
 
-    <!-- USB passthrough: Razer Tartarus V2 keypad -->
-    <hostdev mode='subsystem' type='usb' managed='yes'>
-      <source>
-        <vendor id='0x1532'/>
-        <product id='0x022b'/>
-      </source>
-    </hostdev>
+    <!-- Razer Tartarus V2 keypad: NOT here — attached by overwatch.sh after
+         Synapse is running so profiles apply on hot-plug (1532:022b) -->
 
     <!-- USB passthrough: Razer Strider Chroma mousepad -->
     <hostdev mode='subsystem' type='usb' managed='yes'>

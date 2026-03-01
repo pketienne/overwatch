@@ -328,7 +328,7 @@ Windows activation is tied to a hardware fingerprint. The following identifiers 
 
 | Identifier | Value | Where |
 |---|---|---|
-| UUID | `ee9489dc-57fe-4405-ace6-73dcf9074201` | `<uuid>` in VM XML (carried over from v1) |
+| UUID | `ee9489dc-57fe-4405-ace6-73dcf9074201` | `<uuid>` in VM XML |
 | MAC address | `aa:bb:cc:dd:ee:ff` | `<mac address>` in VM XML (Realtek OUI) |
 | SMBIOS system | MS-7E49 / Micro-Star International | `<sysinfo>` in VM XML |
 
@@ -378,7 +378,7 @@ Configure the Windows guest for GPU passthrough stability and performance. All c
 
 ### TDR timeout
 
-Extend the GPU Timeout Detection and Recovery deadline from the default 2s to 60s. Under passthrough, the AMD driver's WDDM init takes longer because every GPU register access goes through VFIO's MMIO trap-and-forward path. Combined with Windows Defender boot contention, init can exceed the default timeout, causing a watchdog reset (black screen → recovery). v1 tested 25s (still got dumps), 60s eliminated them (0/4).
+Extend the GPU Timeout Detection and Recovery deadline from the default 2s to 60s. Under passthrough, the AMD driver's WDDM init takes longer because every GPU register access goes through VFIO's MMIO trap-and-forward path. Combined with Windows Defender boot contention, init can exceed the default timeout, causing a watchdog reset (black screen → recovery). 25s still produced dumps; 60s eliminated them (0/4).
 
 ```bash
 ssh myhost 'sudo virsh qemu-agent-command overwatch "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"powershell.exe\",\"arg\":[\"-NoProfile\",\"-Command\",\"\$p = \\\"HKLM:\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\GraphicsDrivers\\\"; Set-ItemProperty \$p -Name TdrDelay -Value 60 -Type DWord; Set-ItemProperty \$p -Name TdrDdiDelay -Value 60 -Type DWord\"],\"capture-output\":true}}"'
@@ -429,7 +429,7 @@ ssh myhost 'sudo virsh qemu-agent-command overwatch ...'
 
 ### Power settings & AMD driver tuning
 
-Sets High Performance power plan, disables ULPS, deep sleep, and DRMDMA power off. These were applied via the v1 `setup-guest.sh power` phase and are already active.
+Sets High Performance power plan, disables ULPS, deep sleep, and DRMDMA power off. Already applied and active.
 
 ### OneDrive removal
 
@@ -445,13 +445,13 @@ Disables OneDrive privacy toasts and other Windows "suggestion" notifications:
 ssh myhost 'sudo virsh qemu-agent-command overwatch "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"powershell.exe\",\"arg\":[\"-NoProfile\",\"-Command\",\"New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS -EA SilentlyContinue | Out-Null; \$sid = \\\"S-1-5-21-XXXXXXXXXX-XXXXXXXXXX-XXXXXXXXXX-1001\\\"; \$cdm = \\\"HKU:\\\\\$sid\\\\SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\ContentDeliveryManager\\\"; Set-ItemProperty \$cdm -Name SubscribedContent-310093Enabled -Value 0 -EA SilentlyContinue; Set-ItemProperty \$cdm -Name SubscribedContent-338389Enabled -Value 0 -EA SilentlyContinue; Set-ItemProperty \$cdm -Name SubscribedContent-338393Enabled -Value 0 -EA SilentlyContinue; Set-ItemProperty \$cdm -Name SilentInstalledAppsEnabled -Value 0 -EA SilentlyContinue\"],\"capture-output\":true}}"'
 ```
 
-### Pending guest config (from v1, not yet applied)
+### Pending guest config
 
 - Defender exclusions for AMD driver paths
 - AMD telemetry disable (AUEPLauncher + StartAUEP)
 - Display config (Auto HDR off, Game Bar off)
 - Shutdown signal (UDP packet to host on Windows shutdown)
-- Razer Synapse delayed start
+- Razer Synapse delayed start (Tartarus deferred attach implemented in overwatch.sh)
 
 **Note:** `AutoAdminLogon` (step 9) tends to reset to `0` after account changes or failed logins. If Windows prompts for credentials after a reboot, re-apply it:
 

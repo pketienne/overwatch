@@ -85,7 +85,7 @@ WDDM driver on the VFIO GPU during boot contention (proven by BasicDisplay test
   state corruption on repeated cycles
 - GPU hot-plug after boot — 0/5 dumps but **no display output** (WDDM can't
   register hot-added display adapters). See
-  [case study](../troubleshooting-methodology/case-studies.md#gpu-hot-plug-attempt-method-2).
+  [case study](debugging/case-studies.md#gpu-hot-plug-attempt-method-2).
 
 ### 7a. Increase TDR timeout to 60s
 
@@ -196,4 +196,4 @@ before the amdgpu unbind. The damage worker checks this state and returns
 immediately instead of attempting the VRAM blit. The dGPU framebuffer is found
 by PCI device path (not hardcoded fb number).
 
-See [case study](../troubleshooting-methodology/case-studies.md#drm_fb_helper_fini-deadlock-method-2).
+See [case study](debugging/case-studies.md#drm_fb_helper_fini-deadlock-method-2).

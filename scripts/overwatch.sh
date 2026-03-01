@@ -395,6 +395,63 @@ ensure_performance_tuning() {
     echo 3 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
 }
 
+# --- Deferred Tartarus attach ---
+# The Tartarus is NOT in the VM XML. It's hot-plugged after Synapse is running
+# so that Synapse detects the USB arrival and applies keybind/lighting profiles.
+# If attached at boot, Synapse hasn't started yet and profiles don't apply.
+
+TARTARUS_USB_XML="<hostdev mode='subsystem' type='usb' managed='yes'><source><vendor id='0x1532'/><product id='0x022b'/></source></hostdev>"
+
+attach_tartarus_deferred() {
+    local start_epoch=$1
+
+    # Wait for guest agent (up to 120s)
+    local i
+    for i in $(seq 1 60); do
+        if virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+            break
+        fi
+        sleep 2
+    done
+
+    # Poll for RazerAppEngine process (up to 120s)
+    for i in $(seq 1 60); do
+        local ps_out pid status_out
+        ps_out=$(virsh qemu-agent-command overwatch \
+            '{"execute":"guest-exec","arguments":{"path":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","arg":["-Command","if(Get-Process RazerAppEngine -EA SilentlyContinue){\"RUNNING\"}else{\"WAITING\"}"],"capture-output":true}}' 2>/dev/null) || true
+        if [ -n "$ps_out" ]; then
+            pid=$(echo "$ps_out" | python3 -c "import sys,json; print(json.load(sys.stdin)['return']['pid'])" 2>/dev/null) || true
+            if [ -n "$pid" ]; then
+                sleep 3
+                status_out=$(virsh qemu-agent-command overwatch \
+                    "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}" 2>/dev/null) || true
+                if echo "$status_out" | python3 -c "
+import sys,json,base64
+r=json.load(sys.stdin)['return']
+if r.get('out-data'):
+    print(base64.b64decode(r['out-data']).decode().strip())
+" 2>/dev/null | grep -q "RUNNING"; then
+                    break
+                fi
+            fi
+        fi
+        sleep 2
+    done
+
+    # Give Synapse a moment to finish initializing
+    sleep 5
+
+    # Attach Tartarus via virsh
+    local elapsed
+    if virsh attach-device overwatch /dev/stdin --live <<< "$TARTARUS_USB_XML" 2>/dev/null; then
+        elapsed=$(( $(date +%s) - start_epoch ))
+        log "Tartarus attached after ${elapsed}s (Synapse ready)"
+    else
+        elapsed=$(( $(date +%s) - start_epoch ))
+        log "WARNING: Tartarus attach failed after ${elapsed}s"
+    fi
+}
+
 # --- Host restoration (used by stop) ---
 
 ensure_vm_stopped() {
@@ -599,6 +656,12 @@ _do_start() {
     log_state "vm_running"
     log "VM running. Waiting for shutdown..."
 
+    # Deferred Tartarus attach — waits for Synapse then hot-plugs
+    local VM_START_EPOCH
+    VM_START_EPOCH=$(date +%s)
+    attach_tartarus_deferred "$VM_START_EPOCH" &
+    local tartarus_pid=$!
+
     # Listen for shutdown signal from guest (user clicks "Shutdown VM" shortcut)
     python3 -c "
 import socket
@@ -639,8 +702,10 @@ s.close()
         sleep 2
     done
 
-    # Clean up background listener
+    # Clean up background jobs
+    kill "$tartarus_pid" 2>/dev/null || true
     kill "$listener_pid" 2>/dev/null || true
+    wait "$tartarus_pid" 2>/dev/null || true
     wait "$listener_pid" 2>/dev/null || true
 
     log "VM shut down detected."
