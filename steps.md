@@ -464,6 +464,38 @@ ssh myhost 'cat /tmp/defender-check.json | sudo virsh qemu-agent-command overwat
 # Expected: C:\, D:\, plus AMD driver paths
 ```
 
+### Block Windows Update driver replacements
+
+Prevent Windows Update from pushing GPU driver updates that may cause TDR/BSOD regressions. This sets a group policy that excludes all driver updates from quality updates, keeping the current AMD driver locked in. Only manual installs can change the driver.
+
+```bash
+ssh myhost 'cat > /tmp/block-wu-driver.json << '"'"'JSONEOF'"'"'
+{"execute":"guest-exec","arguments":{"path":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","arg":["-Command","$p = '"'"'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate'"'"'; New-Item -Path $p -Force | Out-Null; Set-ItemProperty $p -Name '"'"'ExcludeWUDriversInQualityUpdate'"'"' -Value 1 -Type DWord; Get-ItemProperty $p | Select-Object ExcludeWUDriversInQualityUpdate | Format-List"],"capture-output":true}}
+JSONEOF
+sudo virsh qemu-agent-command overwatch --cmd "$(cat /tmp/block-wu-driver.json)"'
+# Expected: ExcludeWUDriversInQualityUpdate : 1
+```
+
+Registry key: `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\ExcludeWUDriversInQualityUpdate` = 1
+
+### Disable MPO and HAGS
+
+Disable Multiplane Overlay (MPO) and Hardware Accelerated GPU Scheduling (HAGS). Under VFIO passthrough, GPU register access goes through a trap-and-forward path that adds latency. MPO's hardware overlay compositing has tight timing constraints that exceed the watchdog threshold under this latency, triggering TDR events (P1: 141 WATCHDOG + a1000001 AMD_WATCHDOG) during fullscreen gameplay. Disabling MPO forces DWM to composite in software, which is more tolerant of the added latency. HAGS is disabled as a secondary precaution.
+
+```bash
+cat <<'JSONEOF' | ssh myhost 'cat > /tmp/disable-mpo-hags.json && sudo virsh qemu-agent-command overwatch --cmd "$(cat /tmp/disable-mpo-hags.json)"'
+{"execute":"guest-exec","arguments":{"path":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","arg":["-Command","Set-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\Dwm' -Name 'OverlayTestMode' -Value 5 -Type DWord; Set-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers' -Name 'HwSchMode' -Value 1 -Type DWord; $mpo = (Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\Dwm').OverlayTestMode; $hags = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers').HwSchMode; Write-Output \"MPO OverlayTestMode: $mpo (5=disabled)\"; Write-Output \"HAGS HwSchMode: $hags (1=disabled)\""],"capture-output":true}}
+JSONEOF
+# Expected: MPO OverlayTestMode: 5 (5=disabled)
+#           HAGS HwSchMode: 1 (1=disabled)
+```
+
+Registry keys:
+- `HKLM\SOFTWARE\Microsoft\Windows\Dwm\OverlayTestMode` = 5 (disables MPO)
+- `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\HwSchMode` = 1 (disables HAGS)
+
+Requires a VM reboot to take effect.
+
 ### Pending guest config
 
 - AMD telemetry disable (AUEPLauncher + StartAUEP)

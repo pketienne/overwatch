@@ -108,8 +108,8 @@
     </hostdev>
 
     <!-- Network: default NAT, Realtek OUI to avoid QEMU 52:54:00 fingerprint -->
-    <interface type='network'>
-      <source network='default'/>
+    <interface type='bridge'>
+      <source bridge='br0'/>
       <mac address='aa:bb:cc:dd:ee:ff'/>
       <model type='virtio'/>
     </interface>
