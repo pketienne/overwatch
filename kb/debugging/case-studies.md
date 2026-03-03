@@ -427,3 +427,66 @@ The iGPU blanking removal in round 3 is instructive: the hypothesis that
 immediately falsified when the monitor stayed on HDMI. The code was restored
 within minutes. **Test assumptions with reversible changes before committing
 to them.**
+
+---
+
+## CPU Pinning: Frame Pacing vs Frame Rate (Observed 2026-03-02)
+
+### Background
+
+v2 was missing the `<cputune>` XML block that v1 had. The script's
+`ensure_performance_tuning()` was already confining host processes via
+`AllowedCPUs` and pinning IRQs to `HOST_CPUS`, but without `<cputune>` the
+vCPU threads themselves floated freely across all 8 host cores. The host
+scheduler could preempt any vCPU at any time to run host work.
+
+### Effect of adding cputune
+
+After adding `<cputune>` to pin vCPUs 0-5 to cores 2-7 (emulator/IO on
+cores 0-1), the user immediately noticed smoother video without any change
+in frame rate. This illustrates the difference between the two:
+
+**Frame rate** — how many frames per second the GPU produces (e.g. 120 FPS).
+A counter displays this; it's an average throughput measurement.
+
+**Frame pacing** — how evenly those frames are spaced in time.
+
+```
+Good pacing (120 FPS):    |---|---|---|---|---|---|
+Bad pacing (120 FPS avg): |--|----|--|----|--|----|
+```
+
+With floating vCPUs, the host scheduler would occasionally preempt a vCPU
+mid-GPU-command-stream. The GPU starved briefly, then burst to catch up.
+The average frame rate measured the same, but the uneven delivery was
+perceptible as micro-stuttering. With pinned cores, the command stream flows
+uninterrupted and frames arrive at even intervals.
+
+### Boot slowdown trade-off
+
+Applying `AllowedCPUs` immediately at VM start caused noticeably slower
+Windows boot. The QEMU emulator thread (responsible for interrupt injection
+into the guest) is confined to cores 0-1 by `AllowedCPUs`. During Windows
+boot, there is a burst of driver initialization and service startup that
+generates heavy interrupt traffic. Restricting the emulator thread to 2 cores
+during this burst limits its throughput.
+
+**Fix:** `apply_cpu_isolation()` runs as a background job and waits for the
+guest agent to respond (indicating Windows has finished booting) before
+applying `AllowedCPUs`. The emulator thread runs unconstrained during boot,
+then gets pinned once steady-state gameplay begins. 120s fallback in case the
+guest agent doesn't respond.
+
+### Host RAM sizing and TDR (same session)
+
+On the same day, the VM was over-allocated (88GiB on a 96GiB host), leaving
+the host with ~6GiB. The resulting swap and kswapd CPU competition with VCPU
+threads was the primary driver of VFIO passthrough TDR pressure — GPU stalls
+causing `VidSchiCheckHwProgress` timeouts, OW2 crashes with "Rendering Device
+Lost", and mid-match disconnections. Reducing to 48GiB/48GiB eliminated swap
+entirely and reduced TDR crashes from multiple per session to rare blips.
+
+**Lesson:** Over-provisioning guest RAM at the expense of host headroom is
+counter-productive for GPU passthrough. The host kernel needs memory for
+IOMMU structures and its VCPU scheduling threads. The guest's unused RAM does
+nothing; the host's missing RAM causes real latency.

@@ -377,11 +377,7 @@ set_igpu_blank() {
 }
 
 ensure_performance_tuning() {
-    log "Applying VM performance tuning..."
-    # Confine all host processes to HOST_CPUS — VM cores get zero host interference
-    systemctl set-property --runtime -- system.slice AllowedCPUs=$HOST_CPUS 2>/dev/null || true
-    systemctl set-property --runtime -- user.slice AllowedCPUs=$HOST_CPUS 2>/dev/null || true
-    systemctl set-property --runtime -- init.scope AllowedCPUs=$HOST_CPUS 2>/dev/null || true
+    log "Applying performance tuning (governor, IRQs, writeback)..."
     # Set CPU governor to performance on all cores
     for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
         echo performance > "$gov" 2>/dev/null || true
@@ -393,6 +389,34 @@ ensure_performance_tuning() {
     done
     # Move RCU callbacks and writeback to host CPUs
     echo 3 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
+}
+
+# Confine host processes to HOST_CPUS, run as a background job after VM start.
+#
+# AllowedCPUs is applied AFTER Windows finishes booting (guest agent responds),
+# not immediately at VM start. Reason: AllowedCPUs restricts the QEMU emulator
+# thread to HOST_CPUS, which limits bandwidth for interrupt injection during
+# Windows boot (driver init, service startup). Applied too early, this noticeably
+# slows boot. During gameplay it's the opposite — vCPU cores need to be
+# interference-free for consistent GPU command delivery (frame pacing).
+#
+# Falls back to applying immediately if guest agent doesn't respond within 120s.
+apply_cpu_isolation() {
+    local deadline=$(($(date +%s) + 120))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+            log "Guest agent up — applying CPU isolation (AllowedCPUs=$HOST_CPUS)"
+            systemctl set-property --runtime -- system.slice AllowedCPUs=$HOST_CPUS 2>/dev/null || true
+            systemctl set-property --runtime -- user.slice AllowedCPUs=$HOST_CPUS 2>/dev/null || true
+            systemctl set-property --runtime -- init.scope AllowedCPUs=$HOST_CPUS 2>/dev/null || true
+            return
+        fi
+        sleep 2
+    done
+    log "Guest agent timeout — applying CPU isolation anyway (AllowedCPUs=$HOST_CPUS)"
+    systemctl set-property --runtime -- system.slice AllowedCPUs=$HOST_CPUS 2>/dev/null || true
+    systemctl set-property --runtime -- user.slice AllowedCPUs=$HOST_CPUS 2>/dev/null || true
+    systemctl set-property --runtime -- init.scope AllowedCPUs=$HOST_CPUS 2>/dev/null || true
 }
 
 # --- Network monitor ---
@@ -912,6 +936,11 @@ _do_start() {
     log_state "vm_running"
     log "VM running. Waiting for shutdown..."
 
+    # CPU isolation — deferred until guest agent responds (Windows finished booting).
+    # See apply_cpu_isolation() for rationale on why this is not applied immediately.
+    apply_cpu_isolation &
+    local cpu_iso_pid=$!
+
     # Deferred Tartarus attach — waits for Synapse then hot-plugs
     local VM_START_EPOCH
     VM_START_EPOCH=$(date +%s)
@@ -1006,12 +1035,14 @@ open('/tmp/.overwatch-shutdown-ts','w').write(str(int(time.time())))" \
     fi
 
     # Clean up background jobs
+    kill "$cpu_iso_pid" 2>/dev/null || true
     kill "$tartarus_pid" 2>/dev/null || true
     kill "$listener_pid" 2>/dev/null || true
     kill "$netmon_pid" 2>/dev/null || true
     kill "$perf_host_pid" 2>/dev/null || true
     kill "$diag_pid" 2>/dev/null || true
     kill "$guest_perf_pid" 2>/dev/null || true
+    wait "$cpu_iso_pid" 2>/dev/null || true
     wait "$tartarus_pid" 2>/dev/null || true
     wait "$listener_pid" 2>/dev/null || true
     wait "$netmon_pid" 2>/dev/null || true

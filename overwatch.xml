@@ -8,6 +8,15 @@
   </memoryBacking>
   <vcpu placement='static'>6</vcpu>
   <iothreads>1</iothreads>
+  <!-- CPU pinning: three-layer isolation for VFIO gaming performance.
+       vCPUs 0-5 pinned to cores 2-7; QEMU emulator + IO thread on cores 0-1.
+       overwatch.sh confines host OS (AllowedCPUs) and IRQs to cores 0-1 at
+       runtime. Effect: vCPU cores run only guest threads during gameplay →
+       no host preemption of GPU command stream → better frame pacing
+       (even delivery of frames in time, distinct from frame rate).
+       Trade-off: AllowedCPUs applied after Windows boots (guest-agent up)
+       to avoid slowing boot — emulator thread restricted during heavy driver
+       init causes noticeably slower startup if applied immediately. -->
   <cputune>
     <!-- vCPUs pinned to cores 2-7; host + QEMU emulator/IO on cores 0-1 -->
     <vcpupin vcpu='0' cpuset='2'/>
