@@ -1,9 +1,24 @@
 <domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
   <name>overwatch</name>
   <uuid>ee9489dc-57fe-4405-ace6-73dcf9074201</uuid>
-  <memory unit='GiB'>88</memory>
-  <currentMemory unit='GiB'>88</currentMemory>
+  <memory unit='GiB'>48</memory>
+  <currentMemory unit='GiB'>48</currentMemory>
+  <memoryBacking>
+    <hugepages/>
+  </memoryBacking>
   <vcpu placement='static'>6</vcpu>
+  <iothreads>1</iothreads>
+  <cputune>
+    <!-- vCPUs pinned to cores 2-7; host + QEMU emulator/IO on cores 0-1 -->
+    <vcpupin vcpu='0' cpuset='2'/>
+    <vcpupin vcpu='1' cpuset='3'/>
+    <vcpupin vcpu='2' cpuset='4'/>
+    <vcpupin vcpu='3' cpuset='5'/>
+    <vcpupin vcpu='4' cpuset='6'/>
+    <vcpupin vcpu='5' cpuset='7'/>
+    <emulatorpin cpuset='0-1'/>
+    <iothreadpin iothread='1' cpuset='0-1'/>
+  </cputune>
   <cpu mode='host-passthrough' check='none' migratable='off'>
     <topology sockets='1' dies='1' cores='6' threads='1'/>
     <feature policy='require' name='topoext'/>
@@ -73,7 +88,9 @@
 
   <devices>
     <!-- VirtIO SCSI controller (looks like real SCSI, avoids "Red Hat virtio" fingerprint) -->
-    <controller type='scsi' model='virtio-scsi'/>
+    <controller type='scsi' model='virtio-scsi'>
+      <driver iothread='1'/>
+    </controller>
 
     <!-- Disk: Windows -->
     <disk type='file' device='disk'>

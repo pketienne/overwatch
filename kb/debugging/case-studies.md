@@ -336,6 +336,61 @@ separate lifecycle management.
 
 ---
 
+## Gameplay TDR Root Cause via WinDbg (Method 2)
+
+OW2 was crashing with "Rendering Device Lost" 5+ times per session. Each crash
+coincided with a paired `WATCHDOG` (P1:141) + `AMD_WATCHDOG` (P1:a1000001)
+live kernel dump. Standard mitigations were already in place: `TdrDelay=60`,
+MPO disabled, HAGS disabled, known-good driver 32.0.23017.1001.
+
+### WinDbg `!analyze -v` output (WATCHDOG-20260302-2047.dmp)
+
+```
+Failure.Exception.IP.Module: amdkmdag
+FAILURE_BUCKET_ID: LKD_0x141_IMAGE_amdkmdag.sys
+
+STACK_TEXT:
+  dxgmms2!VidSchiCheckHwProgress+0x316   ← GPU scheduler: no progress detected
+  dxgmms2!VidSchiResetEngines+0xea       ← engine reset initiated
+  dxgmms2!VidSchiResetEngine+0x36e
+  dxgkrnl!TdrCollectDbgInfoStage1+0xd69
+  nt!DbgkWerCaptureLiveKernelDump        ← live dump captured here
+```
+
+### What this means
+
+`dxgmms2!VidSchiCheckHwProgress` is the WDDM GPU scheduler's heartbeat check:
+it periodically verifies the GPU is making forward progress on submitted
+commands. When it detects a stall, it triggers `VidSchiResetEngines` →
+`VidSchiResetEngine`, which collects debug info and creates the live dump.
+The faulting address lands in `amdkmdag.sys` (AMD's kernel driver).
+
+This is VFIO passthrough TDR pressure: IOMMU fault handling or VCPU scheduling
+latency causes the GPU to miss the WDDM progress heartbeat window, making it
+appear stalled to the scheduler. The TDR recovery succeeds (live dump, no BSOD)
+but OW2 loses its DirectX device and crashes.
+
+**Key insight:** `TdrDelay=60` only extends how long Windows waits before a
+*hard* TDR BSOD. Live dumps fire earlier, as part of TDR recovery, well before
+the 60s limit. Increasing TdrDelay does not prevent these events.
+
+**Key insight:** The AMD_WATCHDOG dump (P1:a1000001) always accompanies the
+WATCHDOG (141) dump. This is AMD's own driver watchdog firing alongside
+DxgKrnl's TDR — both responding to the same underlying GPU stall.
+
+### Confirmed not driver-related
+
+The TDRs occur on driver 32.0.23017.1001 (January 2026, known-good). This
+rules out the 32.0.23027.2005 regression as the cause for this pattern.
+
+### Mitigations to try
+
+1. Lower in-game graphics settings — reduces GPU command pressure
+2. Huge pages on host — reduces IOMMU translation overhead per DMA operation
+3. Try newer driver 32.0.23027.2005 — may have improved TDR handling
+
+---
+
 ## Build/Remove Cycle (Method 5)
 
 The script grew from 212 to 967 lines through iterative problem-solving:

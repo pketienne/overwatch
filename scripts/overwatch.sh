@@ -395,6 +395,239 @@ ensure_performance_tuning() {
     echo 3 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
 }
 
+# --- Network monitor ---
+# Polls the VM's vnet interface every 2s during VM runtime.
+# Logs rx/tx drop deltas with NET_HOST tag.
+# DROPS entries signal packets lost in the host network path.
+# No DROPS on disconnect → issue is upstream (router/ISP/Blizzard).
+#
+# Read logs: journalctl -u overwatch | grep NET_HOST
+# Find drops: journalctl -u overwatch | grep "NET_HOST DROPS"
+
+monitor_network() {
+    local vnet_if
+    vnet_if=$(ls /sys/class/net/br0/brif/ 2>/dev/null | grep -m1 vnet) || true
+    if [ -z "$vnet_if" ]; then
+        log "NET_HOST: vnet not found on br0 — skipping network monitor"
+        return
+    fi
+    log "NET_HOST: monitoring $vnet_if (2s poll)"
+
+    local prev_rx_drop=0 prev_tx_drop=0 prev_rx_pkts=0 ticks=0
+    local low_ticks=0 traffic_state="unknown"
+    # Thresholds (packets per 2s poll interval):
+    #   > 50  = active game traffic
+    #   < 15  = idle/disconnected (3 consecutive polls = 6s to confirm)
+    local ACTIVE_THRESHOLD=50 IDLE_THRESHOLD=15 IDLE_CONFIRM=3
+
+    while true; do
+        local stats rx_pkts rx_drop tx_pkts tx_drop
+        stats=$(ip -s link show "$vnet_if" 2>/dev/null) || { sleep 2; continue; }
+        rx_pkts=$(awk '/^ *RX:/{getline; print $2}' <<< "$stats")
+        rx_drop=$(awk '/^ *RX:/{getline; print $4}' <<< "$stats")
+        tx_pkts=$(awk '/^ *TX:/{getline; print $2}' <<< "$stats")
+        tx_drop=$(awk '/^ *TX:/{getline; print $4}' <<< "$stats")
+        ticks=$(( ticks + 1 ))
+
+        local d_rx=$(( ${rx_drop:-0} - prev_rx_drop ))
+        local d_tx=$(( ${tx_drop:-0} - prev_tx_drop ))
+        local d_rx_pkts=$(( ${rx_pkts:-0} - prev_rx_pkts ))
+
+        # Drop detection
+        if [ "$d_rx" -gt 0 ] || [ "$d_tx" -gt 0 ]; then
+            log "NET_HOST DROPS $vnet_if rx_drop=${rx_drop}(+${d_rx}) tx_drop=${tx_drop}(+${d_tx}) rx_rate=${d_rx_pkts}pkt/2s"
+        fi
+
+        # Traffic rate state machine
+        if [ "$d_rx_pkts" -gt "$ACTIVE_THRESHOLD" ]; then
+            low_ticks=0
+            if [ "$traffic_state" != "active" ]; then
+                traffic_state="active"
+                log "NET_HOST TRAFFIC_ACTIVE $vnet_if rx_rate=${d_rx_pkts}pkt/2s"
+            fi
+        elif [ "$d_rx_pkts" -lt "$IDLE_THRESHOLD" ]; then
+            low_ticks=$(( low_ticks + 1 ))
+            if [ "$low_ticks" -eq "$IDLE_CONFIRM" ] && [ "$traffic_state" = "active" ]; then
+                traffic_state="idle"
+                log "NET_HOST TRAFFIC_IDLE $vnet_if rx_rate=${d_rx_pkts}pkt/2s (${IDLE_CONFIRM} consecutive low polls)"
+            fi
+        else
+            low_ticks=0
+        fi
+
+        # Heartbeat every 30s
+        if (( ticks % 15 == 0 )); then
+            log "NET_HOST ok $vnet_if rx=${rx_pkts}pkt drop=${rx_drop} tx=${tx_pkts}pkt drop=${tx_drop} state=${traffic_state}"
+        fi
+
+        prev_rx_drop=${rx_drop:-0}
+        prev_tx_drop=${tx_drop:-0}
+        prev_rx_pkts=${rx_pkts:-0}
+        sleep 2
+    done
+}
+
+# --- Guest agent helpers ---
+
+# Run a PowerShell command on the guest via guest agent and return decoded stdout.
+# Uses guest-exec + guest-exec-status; polls for completion up to max_wait seconds.
+# Usage: guest_run_ps <cmd> [max_wait_s]
+guest_run_ps() {
+    local cmd="$1"
+    local max_wait="${2:-30}"
+    local req ps_out pid i status_out exited
+
+    req=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'execute': 'guest-exec',
+    'arguments': {
+        'path': 'C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe',
+        'arg': ['-NonInteractive', '-Command', sys.argv[1]],
+        'capture-output': True
+    }
+}))" "$cmd" 2>/dev/null) || return 1
+
+    ps_out=$(virsh qemu-agent-command overwatch "$req" 2>/dev/null) || return 1
+    pid=$(echo "$ps_out" | python3 -c "import sys,json; print(json.load(sys.stdin)['return']['pid'])" 2>/dev/null) || return 1
+    [ -z "$pid" ] && return 1
+
+    for i in $(seq 1 "$max_wait"); do
+        status_out=$(virsh qemu-agent-command overwatch \
+            "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}" 2>/dev/null) || return 1
+        exited=$(echo "$status_out" | python3 -c \
+            "import sys,json; print(json.load(sys.stdin)['return'].get('exited',False))" 2>/dev/null) || break
+        if [ "$exited" = "True" ]; then
+            echo "$status_out" | python3 -c "
+import sys,json,base64
+r=json.load(sys.stdin)['return']
+if r.get('out-data'):
+    print(base64.b64decode(r['out-data']).decode('utf-8','replace').strip())" 2>/dev/null
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+# --- Host performance monitor (background, 30s loop) ---
+# Logs per-core CPU >50%, disk await/util on nvme1n1, memory.
+# Tags: PERF_HOST cpu: | PERF_HOST disk: | PERF_HOST mem:
+# Requires sysstat package for cpu/disk metrics.
+
+monitor_host_perf() {
+    local has_mpstat has_iostat
+    command -v mpstat &>/dev/null && has_mpstat=1 || has_mpstat=0
+    command -v iostat &>/dev/null && has_iostat=1 || has_iostat=0
+    [ "$has_mpstat" = 0 ] && log "PERF_HOST: mpstat not found — install sysstat for CPU metrics"
+    [ "$has_iostat" = 0 ] && log "PERF_HOST: iostat not found — install sysstat for disk metrics"
+
+    while true; do
+        sleep 30
+
+        # CPU: only cores above 50% utilization
+        if [ "$has_mpstat" = 1 ]; then
+            local cpu_busy
+            cpu_busy=$(mpstat -P ALL 1 1 2>/dev/null | awk '
+                $1 ~ /^[0-9]{2}:[0-9]{2}:[0-9]{2}$/ && $2 ~ /^[0-9]+$/ {
+                    use = 100 - $NF
+                    if (use > 50) printf "cpu%s=%.0f%% ", $2, use
+                }' | sed 's/ *$//')
+            [ -n "$cpu_busy" ] && log "PERF_HOST cpu: $cpu_busy"
+        fi
+
+        # Disk I/O — parse header for portable column detection
+        if [ "$has_iostat" = 1 ]; then
+            local disk_stats
+            disk_stats=$(iostat -x 1 1 2>/dev/null | awk '
+                /^Device/{for(i=1;i<=NF;i++){if($i=="r_await")ri=i; if($i=="w_await")wi=i; if($i=="%util")ui=i}}
+                /^nvme1n1/ && ri {printf "r_await=%.1fms w_await=%.1fms util=%.1f%%", $ri, $wi, $ui}')
+            [ -n "$disk_stats" ] && log "PERF_HOST disk: $disk_stats"
+        fi
+
+        # Memory
+        local free_kb avail_kb swap_total_kb swap_free_kb
+        free_kb=$(awk '/^MemFree:/{print $2}' /proc/meminfo)
+        avail_kb=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+        swap_total_kb=$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)
+        swap_free_kb=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
+        log "PERF_HOST mem: free=${free_kb}kB avail=${avail_kb}kB swap=$(( ${swap_total_kb:-0} - ${swap_free_kb:-0} ))/${swap_total_kb:-0}kB"
+    done
+}
+
+# --- Guest boot diagnostics (background, runs once) ---
+# Waits 120s after VM start to avoid guest-exec contention with Tartarus attach,
+# then collects diagnostic data from the guest via guest agent.
+# Tags: SHUTDOWN_DIAG | CRASH_DUMPS | GPU_DRIVER | HD_AUDIO | DISPLAY_EVENTS | BOOT_DIAG
+
+log_guest_diagnostics() {
+    # Delay to avoid contention with attach_tartarus_deferred during boot
+    sleep 120
+
+    if ! virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+        log "SHUTDOWN_DIAG: guest agent unavailable — skipping diagnostics"
+        return
+    fi
+
+    local out
+
+    # Prior-session slow-shutdown events (IDs 200-203)
+    out=$(guest_run_ps 'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-Diagnostics-Performance/Operational";Id=200,201,202,203} -MaxEvents 5 -EA SilentlyContinue | ForEach-Object { $_.Id.ToString() + " " + $_.TimeCreated.ToString("MM/dd HH:mm") + " " + ($_.Message -replace "\n"," " -replace "\s+"," ").Substring(0,[Math]::Min(120,$_.Message.Length)) }' 20) || true
+    log "SHUTDOWN_DIAG: ${out:-none}"
+
+    # Recent crash dump files
+    out=$(guest_run_ps '@("C:\Windows\LiveKernelReports","C:\Windows\Minidump") | ForEach-Object { Get-ChildItem $_ -Recurse -Filter *.dmp -EA SilentlyContinue } | Sort-Object LastWriteTime -Descending | Select-Object -First 5 | ForEach-Object { $_.LastWriteTime.ToString("MM/dd HH:mm") + " " + $_.Name + " (" + [Math]::Round($_.Length/1MB,1) + "MB)" }' 15) || true
+    log "CRASH_DUMPS: ${out:-none}"
+
+    # AMD GPU PnP status
+    out=$(guest_run_ps 'Get-PnpDevice | Where-Object {$_.FriendlyName -match "Radeon"} | ForEach-Object { $_.Status + " " + $_.FriendlyName + " (Code:" + $_.ConfigManagerErrorCode + ")" }' 15) || true
+    log "GPU_DRIVER: ${out:-none}"
+
+    # GPU audio PnP status
+    out=$(guest_run_ps 'Get-PnpDevice | Where-Object {$_.FriendlyName -match "AMD.*Audio|High Definition Audio"} | ForEach-Object { $_.Status + " " + $_.FriendlyName }' 15) || true
+    log "HD_AUDIO: ${out:-none}"
+
+    # Recent TDR/display events from System log
+    out=$(guest_run_ps 'Get-WinEvent -FilterHashtable @{LogName="System"} -MaxEvents 200 -EA SilentlyContinue | Where-Object {$_.ProviderName -match "dxgkrnl|Dwm|Display"} | Select-Object -First 20 | ForEach-Object { $_.TimeCreated.ToString("HH:mm:ss") + " Id=" + $_.Id + " " + ($_.Message -replace "\n"," ").Substring(0,[Math]::Min(80,$_.Message.Length)) }' 20) || true
+    log "DISPLAY_EVENTS: ${out:-none}"
+
+    # Windows boot timing (Event 100)
+    out=$(guest_run_ps 'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-Diagnostics-Performance/Operational";Id=100} -MaxEvents 1 -EA SilentlyContinue | Select-Object -ExpandProperty Message' 15) || true
+    log "BOOT_DIAG: ${out:-none}"
+}
+
+# --- Guest GPU performance monitor (background, 60s loop) ---
+# Requires LibreHardwareMonitor v0.9.4 net472 running as SYSTEM on guest.
+# See: https://github.com/LibreHardwareMonitor/LibreHardwareMonitor
+# Tag: PERF_GUEST
+
+monitor_guest_perf() {
+    # Delay past boot-time contention window
+    sleep 120
+
+    if ! virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+        log "PERF_GUEST: guest agent unavailable — skipping guest perf monitor"
+        return
+    fi
+
+    # Check LHM WMI availability
+    local lhm_check
+    lhm_check=$(guest_run_ps 'if (Get-WmiObject -Namespace "root\LibreHardwareMonitor" -Class Sensor -EA SilentlyContinue | Select-Object -First 1) { "AVAILABLE" } else { "UNAVAILABLE" }' 15) || true
+    if [ "$lhm_check" != "AVAILABLE" ]; then
+        log "PERF_GUEST: LibreHardwareMonitor WMI not available — skipping guest perf monitor"
+        return
+    fi
+
+    log "PERF_GUEST: starting 60s poll loop via LHM WMI"
+
+    while virsh domstate overwatch 2>/dev/null | grep -q "running"; do
+        local out
+        out=$(guest_run_ps '$s=Get-WmiObject -Namespace "root\LibreHardwareMonitor" -Class Sensor -EA SilentlyContinue; function g($t,$n){($s|?{$_.SensorType -eq $t -and $_.Name -match $n}|select -f 1).Value}; "load=$(g Load Core)% tcore=$(g Temperature Core)C thot=$(g Temperature Hot)C tmem=$(g Temperature Memory)C clkCore=$(g Clock Core)MHz clkMem=$(g Clock Memory)MHz pwr=$(g Power Package)W vram=$(g SmallData Used)/$(g SmallData Total)MB"' 20) || true
+        [ -n "$out" ] && log "PERF_GUEST $out"
+        sleep 60
+    done
+}
+
 # --- Deferred Tartarus attach ---
 # The Tartarus is NOT in the VM XML. It's hot-plugged after Synapse is running
 # so that Synapse detects the USB arrival and applies keybind/lighting profiles.
@@ -406,9 +639,11 @@ attach_tartarus_deferred() {
     local start_epoch=$1
 
     # Wait for guest agent (up to 120s)
-    local i
+    local i elapsed
     for i in $(seq 1 60); do
         if virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+            elapsed=$(( $(date +%s) - start_epoch ))
+            log "BOOT_TIMING guest_agent=${elapsed}s"
             break
         fi
         sleep 2
@@ -433,6 +668,8 @@ r=json.load(sys.stdin)['return']
 if r.get('out-data'):
     print(base64.b64decode(r['out-data']).decode().strip())
 " 2>/dev/null | grep -q "RUNNING"; then
+                    elapsed=$(( $(date +%s) - start_epoch ))
+                    log "BOOT_TIMING synapse_ready=${elapsed}s"
                     break
                 fi
             fi
@@ -444,10 +681,9 @@ if r.get('out-data'):
     sleep 5
 
     # Attach Tartarus via virsh
-    local elapsed
     if virsh attach-device overwatch /dev/stdin --live <<< "$TARTARUS_USB_XML" 2>/dev/null; then
         elapsed=$(( $(date +%s) - start_epoch ))
-        log "Tartarus attached after ${elapsed}s (Synapse ready)"
+        log "BOOT_TIMING tartarus=${elapsed}s"
     else
         elapsed=$(( $(date +%s) - start_epoch ))
         log "WARNING: Tartarus attach failed after ${elapsed}s"
@@ -682,22 +918,54 @@ _do_start() {
     attach_tartarus_deferred "$VM_START_EPOCH" &
     local tartarus_pid=$!
 
-    # Listen for shutdown signal from guest (user clicks "Shutdown VM" shortcut)
-    python3 -c "
-import socket
+    # Network monitor — polls vnet interface for drop events
+    monitor_network &
+    local netmon_pid=$!
+
+    # Host performance monitor — 30s PERF_HOST loop
+    monitor_host_perf &
+    local perf_host_pid=$!
+
+    # Guest boot diagnostics — one-shot after boot (120s delay to avoid contention)
+    log_guest_diagnostics &
+    local diag_pid=$!
+
+    # Guest GPU performance monitor — 60s PERF_GUEST loop via LHM WMI
+    monitor_guest_perf &
+    local guest_perf_pid=$!
+
+    # Listen for shutdown signal from guest; record timestamp on receipt
+    rm -f /tmp/.overwatch-shutdown-ts
+    {
+        python3 -c "
+import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('', ${SHUTDOWN_SIGNAL_PORT}))
 s.recvfrom(64)
 s.close()
-" &>/dev/null &
+open('/tmp/.overwatch-shutdown-ts','w').write(str(int(time.time())))" \
+        && log "Shutdown signal received from guest"
+    } &
     local listener_pid=$!
 
     # Wait for VM to shut down.
     # Accept definitive non-running state OR domain-not-found (libvirtd lost track).
     # Transient empty output (libvirtd hiccup) is treated as "keep waiting".
+    local qemu_pid prev_qemu_state=""
+    qemu_pid=$(pgrep -f "guest=overwatch" 2>/dev/null) || true
     local domain_missing=0
     while true; do
+        # Track QEMU process state transitions (S=sleeping, D=uninterruptible, exited)
+        if [ -n "$qemu_pid" ]; then
+            local qemu_state
+            qemu_state=$(awk '/^State:/{print $2}' "/proc/$qemu_pid/status" 2>/dev/null) || true
+            if [ -n "$qemu_state" ] && [ "$qemu_state" != "$prev_qemu_state" ]; then
+                log "QEMU state: ${prev_qemu_state:-(started)} → $qemu_state (pid $qemu_pid)"
+                prev_qemu_state=$qemu_state
+            fi
+        fi
+
         local vm_poll
         vm_poll=$(virsh domstate overwatch 2>&1) || true
 
@@ -722,11 +990,34 @@ s.close()
         sleep 2
     done
 
+    # Shutdown duration: signal-to-domain-stop delta
+    if [ -f /tmp/.overwatch-shutdown-ts ]; then
+        local sig_ts dur
+        sig_ts=$(cat /tmp/.overwatch-shutdown-ts 2>/dev/null) || true
+        if [ -n "$sig_ts" ]; then
+            dur=$(( $(date +%s) - sig_ts ))
+            if [ "$dur" -le 300 ]; then
+                log "Shutdown duration: ${dur}s (signal to domain-stop)"
+            else
+                log "WARNING: Shutdown duration ${dur}s exceeds 300s limit"
+            fi
+        fi
+        rm -f /tmp/.overwatch-shutdown-ts
+    fi
+
     # Clean up background jobs
     kill "$tartarus_pid" 2>/dev/null || true
     kill "$listener_pid" 2>/dev/null || true
+    kill "$netmon_pid" 2>/dev/null || true
+    kill "$perf_host_pid" 2>/dev/null || true
+    kill "$diag_pid" 2>/dev/null || true
+    kill "$guest_perf_pid" 2>/dev/null || true
     wait "$tartarus_pid" 2>/dev/null || true
     wait "$listener_pid" 2>/dev/null || true
+    wait "$netmon_pid" 2>/dev/null || true
+    wait "$perf_host_pid" 2>/dev/null || true
+    wait "$diag_pid" 2>/dev/null || true
+    wait "$guest_perf_pid" 2>/dev/null || true
 
     log "VM shut down detected."
     log_state "vm_shutdown"

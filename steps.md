@@ -270,7 +270,7 @@ sudo virsh list --all
 # Expected: overwatch   shut off
 
 sudo virsh dumpxml overwatch | grep -E '<name>|memory|vcpu|hidden|vendor_id|mac address'
-# Expected: name=overwatch, 88 GiB, 6 vcpu, hidden on, vendor_id AuthenticAMD, mac 34:5a:60:...
+# Expected: name=overwatch, 48 GiB, 6 vcpu, hidden on, vendor_id AuthenticAMD, mac 34:5a:60:...
 ```
 
 **Anti-cheat requirement (guest-side):** After Windows is installed, Windows Defender and Tamper Protection must remain **ON** at all times. Ricochet checks that OS security features are enabled. Never disable them.
@@ -495,6 +495,40 @@ Registry keys:
 - `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\HwSchMode` = 1 (disables HAGS)
 
 Requires a VM reboot to take effect.
+
+### Host huge pages and VM memory sizing
+
+Static 2MB huge pages pre-allocated at boot. QEMU requests them via `MAP_HUGETLB`
+using `<memoryBacking><hugepages/>` in the VM XML. Guarantees large IOMMU page
+entries vs THP which is opportunistic.
+
+**Current allocation:** 48GiB VM / 48GiB host (half-and-half of 96GiB total).
+The VM only uses ~7–15GiB in practice (Windows + OW2 + background); the rest
+stays free. Giving the host ~45GiB eliminates kswapd pressure which was causing
+VCPU scheduling latency and contributing to TDR events.
+
+GRUB (`/etc/default/grub`):
+```
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash amd_iommu=on iommu=pt hugepages=24576"
+```
+
+VM XML (`overwatch.xml`):
+```xml
+<memory unit='GiB'>48</memory>
+<currentMemory unit='GiB'>48</currentMemory>
+<memoryBacking>
+  <hugepages/>
+</memoryBacking>
+```
+
+To resize: stop VM → update both XML and GRUB → `sudo update-grub && sudo reboot`.
+
+Verify after host reboot:
+```bash
+grep -E 'HugePages_Total|HugePages_Free' /proc/meminfo
+# Expected: HugePages_Total: 24576, HugePages_Free: 24576 (before VM starts)
+#           HugePages_Free: 0 (after VM starts)
+```
 
 ### Pending guest config
 

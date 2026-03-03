@@ -11,6 +11,7 @@ reasoning behind each item, see [principles](principles.md) and
 - [ ] What changed recently? (OS updates, driver updates, firmware, config)
 - [ ] Can you reproduce reliably? How often?
 - [ ] What's your measurement? (timestamps, logs, counters)
+- [ ] If a guest app seems to have stopped running but its devices/services still work: check Windows notification area settings (Settings → Personalization → Taskbar → Other system tray icons) before assuming a process crash — Windows auto-hides tray icons for apps that fail to register cleanly
 
 ## For BSOD / guest crashes
 - [ ] Check `Get-WinEvent` for bugcheck parameters (Id=1001)
@@ -46,6 +47,37 @@ reasoning behind each item, see [principles](principles.md) and
   telemetry (AUEPMaster), Razer, etc. — GPU init TDRs are often contention
 - [ ] If disabling a component doesn't help, check all launch paths: services,
   scheduled tasks (`Get-ScheduledTask`), startup folder, Run/RunOnce registry
+- [ ] **For gameplay TDRs (P1=141, amdkmdag.sys):** run WinDbg `!analyze -v`
+  on the dump — look for `VidSchiCheckHwProgress` in the call stack, which
+  confirms VFIO passthrough TDR pressure (GPU stall detected by WDDM scheduler).
+  `TdrDelay=60` prevents BSOD but not live dumps; the dump fires as part of
+  TDR recovery, before the 60s timeout. Mitigations: lower graphics settings,
+  huge pages, newer driver.
+
+### Running WinDbg non-interactively via guest-exec
+
+Install WinDbg from the Microsoft Store on the guest (free). The binary is in
+`C:\Program Files\WindowsApps\Microsoft.WinDbg_<ver>_x64__8wekyb3d8bbwe\amd64\kd.exe`.
+Run via guest-exec (from the Python helper scripts on myhost):
+
+```python
+KD   = "C:\\Program Files\\WindowsApps\\Microsoft.WinDbg_<ver>_x64__8wekyb3d8bbwe\\amd64\\kd.exe"
+DUMP = "C:\\Windows\\LiveKernelReports\\WATCHDOG\\WATCHDOG-<timestamp>.dmp"
+SYMS = "srv*C:\\Symbols*https://msdl.microsoft.com/download/symbols"
+OUT  = "C:\\Temp\\kd_out.txt"
+# arg: ["-z", DUMP, "-y", SYMS, "-c", "!analyze -v; q", "-logo", OUT]
+```
+
+Allow ~3 minutes for symbol download. Read `C:\Temp\kd_out.txt` after completion.
+Note: Store app stubs in `C:\Users\myuser\AppData\Local\Microsoft\WindowsApps\` cannot
+be launched from SYSTEM context — use the full package path above.
+
+## For game disconnects / lost connection to server
+
+- [ ] Check NET_HOST logs: `journalctl -u overwatch | grep "NET_HOST TRAFFIC\|NET_HOST DROPS"` — if `TRAFFIC_IDLE` appears without `DROPS`, the disconnect is upstream of the host (Blizzard or game client), not a network issue
+- [ ] If no drops: check Battle.net logs at `C:\Users\myuser\AppData\Local\Battle.net\Logs\` for `BNPresence ERROR_INTERNAL` — presence subscription failure causes disconnects regardless of network quality
+- [ ] If BNPresence errors found: close Battle.net, delete `C:\Users\myuser\AppData\Local\Battle.net\Cache`, relaunch (in-app "Clear Cache" was removed from newer client versions — delete manually)
+- [ ] Check whether Battle.net auto-updated during the last host reboot by comparing log file timestamps with reboot time
 
 ## For performance / timing issues
 - [ ] Add measurement before adding fixes
