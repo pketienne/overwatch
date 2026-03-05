@@ -58,4 +58,4 @@ All deployable artifacts (scripts, VM XML, configs) live in the
 - Cookbook `templates/overwatch.sh.erb` → deployed to `/usr/local/bin/overwatch`
 - Cookbook `templates/overwatch-vm.xml.erb` → VM definition via `virsh define`
 - Cookbook `templates/setup-guest.sh.erb` → guest registry/config setup script
-- `kb/reference.md` — Known problems, debugging checklists, stress tests
+- `reference.md` — Known problems, debugging checklists, stress tests
