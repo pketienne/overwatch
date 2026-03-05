@@ -41,7 +41,7 @@ The guest agent runs as SYSTEM. Commands launched via `guest-exec` run in the SY
 
 ## Anti-Cheat (Ricochet)
 
-Five detection vectors must remain addressed (see `overwatch.xml` and `kb/steps.md` for details):
+Five detection vectors must remain addressed (see cookbook VM XML template for details):
 1. KVM hidden (`<kvm><hidden state='on'/>`)
 2. Hyper-V vendor ID spoofed
 3. CPU host-passthrough
@@ -58,6 +58,5 @@ All deployable artifacts (scripts, VM XML, configs) live in the
 - Cookbook `templates/overwatch.sh.erb` → deployed to `/usr/local/bin/overwatch`
 - Cookbook `templates/overwatch-vm.xml.erb` → VM definition via `virsh define`
 - Cookbook `templates/setup-guest.sh.erb` → guest registry/config setup script
-- `kb/steps.md` — Full setup procedure with verification commands
 - `kb/troubleshooting.md` — Problem/cause/solution reference matrix
 - `kb/debugging/` — Debugging methodology, case studies, checklists

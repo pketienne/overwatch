@@ -21,7 +21,6 @@ Key cookbook files:
 
 ## Documentation
 
-- `kb/steps.md` — Full setup procedure (steps 0-12, execute once to build the VM)
 - `kb/troubleshooting.md` — Quick-lookup problem/cause/solution table
 - `kb/decisions.md` — Completed work items with rationale
 - `kb/vcpu-optimizations.md` — CPU isolation plan (implemented)
