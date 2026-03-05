@@ -52,10 +52,12 @@ Five detection vectors must remain addressed (see `overwatch.xml` and `kb/steps.
 
 ## Key Files
 
-- `overwatch.xml` — VM definition (anti-cheat mitigations, GPU passthrough, SMBIOS)
-- `scripts/host/overwatch.sh` — VM lifecycle (start/stop/GPU bind/unbind)
-- `scripts/host/overwatch.service` — systemd unit for lifecycle management
-- `scripts/guest/` — PowerShell scripts deployed to `C:\Scripts\` in the VM
+All deployable artifacts (scripts, VM XML, configs) live in the
+[overwatch cookbook](../symmetra/master/cookbooks/overwatch/) — this repo is documentation only.
+
+- Cookbook `templates/overwatch.sh.erb` → deployed to `/usr/local/bin/overwatch`
+- Cookbook `templates/overwatch-vm.xml.erb` → VM definition via `virsh define`
+- Cookbook `templates/setup-guest.sh.erb` → guest registry/config setup script
 - `kb/steps.md` — Full setup procedure with verification commands
 - `kb/troubleshooting.md` — Problem/cause/solution reference matrix
 - `kb/debugging/` — Debugging methodology, case studies, checklists
