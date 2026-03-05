@@ -12,6 +12,39 @@
 # Log: journalctl -u overwatch
 #
 # Usage: overwatch [--verbose] start|stop|status
+#
+# --- Telemetry tags ---
+#
+# All tags are searchable in journald:
+#   journalctl -u overwatch | grep <TAG>
+#
+# Lifecycle:
+#   STATE          GPU/audio driver, VM state at named checkpoints
+#   ERROR          Command failures (line number, command, exit code)
+#   BOOT_TIMING    guest_agent=Ns, synapse_ready=Ns, tartarus=Ns from VM start
+#
+# Host monitors (background, continuous):
+#   NET_HOST       vnet RX/TX drops, TRAFFIC_ACTIVE/TRAFFIC_IDLE transitions
+#   PCAP           Rolling packet capture on br0 (20×50MB ring)
+#   LATENCY_HOST   ICMP reachability to 8.8.8.8 (1s poll)
+#   PERF_HOST      Per-core CPU, disk I/O, memory (30s poll)
+#   TRANSITION     Throttle events relayed from guest transition-throttle.ps1
+#
+# Guest monitors (background, via guest agent):
+#   PERF_GUEST     GPU load/temps/clocks/VRAM via LibreHardwareMonitor (60s poll)
+#   NET_GUEST      Windows NetworkProfile connect/disconnect events (10s poll)
+#   SHUTDOWN_DIAG  Prior-session shutdown events (IDs 200-203)
+#   CRASH_DUMPS    Recent .dmp files from LiveKernelReports + Minidump
+#   GPU_DRIVER     AMD GPU PnP status and driver version
+#   HD_AUDIO       GPU audio codec PnP status
+#   DISPLAY_EVENTS Recent dxgkrnl/Dwm/Display events
+#   BOOT_DIAG      Windows boot timing (Event 100)
+#   BNET_GUEST     BNPresence errors in current Battle.net log
+#   OW2_SETTINGS   Key in-game settings (render scale, frame cap, window mode)
+#
+# Grep all:
+#   journalctl -u overwatch | grep -E \
+#     "STATE|ERROR|BOOT_TIMING|NET_HOST|PCAP|LATENCY_HOST|PERF_HOST|TRANSITION|PERF_GUEST|NET_GUEST|SHUTDOWN_DIAG|CRASH_DUMPS|GPU_DRIVER|HD_AUDIO|DISPLAY_EVENTS|BOOT_DIAG|BNET_GUEST|OW2_SETTINGS"
 
 set -uo pipefail
 
@@ -20,6 +53,7 @@ GPU_AUDIO="0000:03:00.1"
 IGPU="0000:74:00.0"
 HOST_CPUS="0-1"     # CPUs reserved for host tasks + QEMU emulator/IO
 SHUTDOWN_SIGNAL_PORT=9147   # UDP port for Windows shutdown signal
+TRANSITION_SIGNAL_PORT=9148 # UDP port for transition throttle events
 LOCK_FILE="/run/overwatch.lock"
 
 # --- Parse arguments ---
@@ -47,6 +81,7 @@ gpu_driver() {
 
 # PCIe Secondary Bus Reset + readiness poll via setpci.
 # RX 7900 XTX only supports SBR (no FLR); resets both 03:00.0 and 03:00.1.
+# Logs: reset completion time and vendor ID readiness.
 gpu_bus_reset() {
     local label="${1:-PCIe bus reset}"
     log "Resetting GPU ($label)..."
@@ -202,7 +237,8 @@ fi
 
 log() { echo "$(date '+%H:%M:%S') $*"; }
 
-# ERR trap — log exact line number and command on any failure
+# ERR trap — log exact line number and command on any failure.
+# Tag: ERROR
 on_error() {
     local lineno=$1 cmd=$2 rc=$3
     log "ERROR: command failed at line $lineno: '$cmd' (exit code $rc)"
@@ -217,7 +253,9 @@ if [ "$VERBOSE" = true ]; then
 fi
 
 # --- State snapshot ---
-
+# Tag: STATE
+# Logs GPU driver, audio driver, and VM domain state at named transition points
+# (post_unbind, vfio_bind_failed, vm_running, vm_shutdown, on_error).
 log_state() {
     local checkpoint="${1:-unknown}"
     local gpu_drv gpu_audio_drv vm_state
@@ -382,6 +420,13 @@ ensure_performance_tuning() {
     for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
         echo performance > "$gov" 2>/dev/null || true
     done
+    # Cap vCPU cores at C1 — prevent deep C-state entry to reduce wakeup latency
+    # state0=POLL, state1=C1 kept; state2+ (C2, C6, etc.) disabled
+    for cpu in $(seq 2 7); do
+        for state in /sys/devices/system/cpu/cpu${cpu}/cpuidle/state[2-9]/; do
+            [ -f "${state}disable" ] && echo 1 > "${state}disable" 2>/dev/null || true
+        done
+    done
     # Pin all IRQs to host CPUs so VM cores get no interrupt overhead
     systemctl stop irqbalance 2>/dev/null || true
     for irq_dir in /proc/irq/*/; do
@@ -389,6 +434,8 @@ ensure_performance_tuning() {
     done
     # Move RCU callbacks and writeback to host CPUs
     echo 3 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
+    # Disable scheduler autogroup — prevents TTY-based throughput grouping for QEMU
+    echo 0 > /proc/sys/kernel/sched_autogroup_enabled 2>/dev/null || true
 }
 
 # Confine host processes to HOST_CPUS, run as a background job after VM start.
@@ -419,14 +466,37 @@ apply_cpu_isolation() {
     systemctl set-property --runtime -- init.scope AllowedCPUs=$HOST_CPUS 2>/dev/null || true
 }
 
-# --- Network monitor ---
-# Polls the VM's vnet interface every 2s during VM runtime.
-# Logs rx/tx drop deltas with NET_HOST tag.
-# DROPS entries signal packets lost in the host network path.
-# No DROPS on disconnect → issue is upstream (router/ISP/Blizzard).
+apply_sched_fifo() {
+    local qemu_pid count=0
+    qemu_pid=$(pgrep -f "qemu-system.*overwatch" 2>/dev/null | head -1) || true
+    if [ -z "$qemu_pid" ]; then
+        log "SCHED_FIFO: QEMU PID not found, skipping"
+        return
+    fi
+    for tid in $(ls /proc/$qemu_pid/task/ 2>/dev/null); do
+        chrt -f -p 1 $tid 2>/dev/null && count=$((count + 1)) || true
+    done
+    log "SCHED_FIFO: applied to $count QEMU threads (PID $qemu_pid)"
+}
+
+# --- Network monitor (2s poll, background) ---
+# Tag: NET_HOST
+# Polls the VM's vnet interface on br0 for RX/TX drop deltas.
 #
-# Read logs: journalctl -u overwatch | grep NET_HOST
-# Find drops: journalctl -u overwatch | grep "NET_HOST DROPS"
+# Log format:
+#   NET_HOST ok             — 30s heartbeat with absolute counts and traffic state
+#   NET_HOST DROPS          — rx or tx drop counter increased
+#   NET_HOST TRAFFIC_ACTIVE — rx rate crossed above 50 pkt/2s (game connected)
+#   NET_HOST TRAFFIC_IDLE   — rx rate below 15 pkt/2s for 6s after active (likely disconnect)
+#
+# Cross-correlation:
+#   TRAFFIC_IDLE + no DROPS         → traffic stopped upstream (Blizzard/router)
+#   TRAFFIC_IDLE + DROPS            → host is dropping packets before the VM
+#   TRAFFIC_IDLE + LATENCY_HOST LOSS → host lost internet entirely
+#   TRAFFIC_IDLE + no LATENCY_HOST   → OW2/Blizzard-specific, host path fine
+#
+# On TRAFFIC_IDLE, monitor_network snapshots the pcap ring to
+# /var/log/overwatch/snapshots/YYYYMMDD-HHMMSS/ for post-mortem Wireshark.
 
 monitor_network() {
     local vnet_if
@@ -474,6 +544,16 @@ monitor_network() {
             if [ "$low_ticks" -eq "$IDLE_CONFIRM" ] && [ "$traffic_state" = "active" ]; then
                 traffic_state="idle"
                 log "NET_HOST TRAFFIC_IDLE $vnet_if rx_rate=${d_rx_pkts}pkt/2s (${IDLE_CONFIRM} consecutive low polls)"
+                # Snapshot the pcap ring buffer at the moment of disconnect.
+                # Preserves pre-event data before the ring rolls forward.
+                local snap_ts snap_dir
+                snap_ts=$(date '+%Y%m%d-%H%M%S')
+                snap_dir="/var/log/overwatch/snapshots/${snap_ts}"
+                (
+                    mkdir -p "$snap_dir" 2>/dev/null && \
+                    cp /var/log/overwatch/overwatch.pcap* "$snap_dir/" 2>/dev/null && \
+                    log "PCAP: snapshot saved → $snap_dir"
+                ) &
             fi
         else
             low_ticks=0
@@ -488,6 +568,83 @@ monitor_network() {
         prev_tx_drop=${tx_drop:-0}
         prev_rx_pkts=${rx_pkts:-0}
         sleep 2
+    done
+}
+
+# --- Packet capture rolling ring buffer ---
+# Tag: PCAP
+# Captures all traffic on br0 filtered to VM IP 192.168.0.101.
+# Rolling ring buffer: 20 files × 50MB = 1GB max.
+# Stored in /var/log/overwatch/. Requires tcpdump (apt install tcpdump).
+#
+# On TRAFFIC_IDLE, monitor_network() snapshots the ring to
+# /var/log/overwatch/snapshots/YYYYMMDD-HHMMSS/ preserving pre-event data.
+#
+# Retrieve for Wireshark:
+#   scp -r myhost:/var/log/overwatch/snapshots/YYYYMMDD-HHMMSS /tmp/
+#   scp myhost:/var/log/overwatch/overwatch.pcap* /tmp/  # live ring
+# Wireshark filter: udp && ip.addr == 192.168.0.101
+
+monitor_pcap() {
+    if ! command -v tcpdump &>/dev/null; then
+        log "PCAP: tcpdump not found — install with: apt install tcpdump"
+        return
+    fi
+
+    local pcap_dir="/var/log/overwatch"
+    if [ ! -d "$pcap_dir" ]; then
+        mkdir -p "$pcap_dir" 2>/dev/null || { log "PCAP: cannot create $pcap_dir — skipping"; return; }
+        log "PCAP: created $pcap_dir"
+    fi
+    # tcpdump drops privileges to the tcpdump user after opening the capture socket;
+    # ensure it can write pcap files to this directory.
+    chown root:tcpdump "$pcap_dir" 2>/dev/null || true
+    chmod 775 "$pcap_dir" 2>/dev/null || true
+
+    log "PCAP: starting rolling capture on br0 (host=192.168.0.101, 20×50MB=1GB, dir=$pcap_dir)"
+    exec tcpdump -i br0 -n \
+        -w "${pcap_dir}/overwatch.pcap" \
+        -C 50 \
+        -W 20 \
+        "host 192.168.0.101" \
+        2>/dev/null
+    log "PCAP: tcpdump exited"
+}
+
+# --- Host latency monitor (1s ping loop, background) ---
+# Tag: LATENCY_HOST
+# Pings 8.8.8.8 every second from the host during VM runtime.
+#
+# Log format:
+#   LATENCY_HOST ok                   — 30s heartbeat
+#   LATENCY_HOST LOSS consecutive=N   — ping failed
+#   LATENCY_HOST RECOVERED after=N    — connectivity restored
+#
+# Cross-correlation with NET_HOST:
+#   TRAFFIC_IDLE + LATENCY_HOST LOSS → host lost upstream
+#   TRAFFIC_IDLE + no LATENCY_HOST   → OW2/Blizzard-specific
+
+monitor_latency_host() {
+    log "LATENCY_HOST: starting 1s ping loop to 8.8.8.8"
+    local consecutive_loss=0 ticks=0
+
+    while true; do
+        if ping -c 1 -W 2 8.8.8.8 &>/dev/null; then
+            if [ "$consecutive_loss" -gt 0 ]; then
+                log "LATENCY_HOST RECOVERED after ${consecutive_loss} consecutive losses"
+                consecutive_loss=0
+            fi
+        else
+            consecutive_loss=$(( consecutive_loss + 1 ))
+            log "LATENCY_HOST LOSS consecutive=${consecutive_loss}"
+        fi
+
+        ticks=$(( ticks + 1 ))
+        if (( ticks % 30 == 0 )); then
+            log "LATENCY_HOST ok (${ticks}s elapsed, loss_streak=${consecutive_loss})"
+        fi
+
+        sleep 1
     done
 }
 
@@ -535,9 +692,14 @@ if r.get('out-data'):
 }
 
 # --- Host performance monitor (background, 30s loop) ---
-# Logs per-core CPU >50%, disk await/util on nvme1n1, memory.
-# Tags: PERF_HOST cpu: | PERF_HOST disk: | PERF_HOST mem:
-# Requires sysstat package for cpu/disk metrics.
+# Tag: PERF_HOST
+# Logs per-core CPU >50%, disk await/util on nvme1n1, memory/swap.
+# Requires sysstat package (apt install sysstat) for cpu/disk metrics.
+#
+# Log format:
+#   PERF_HOST cpu: cpu0=82% cpu1=67%
+#   PERF_HOST disk: r_await=0.2ms w_await=0.3ms util=5.1%
+#   PERF_HOST mem: free=42000kB avail=44000000kB swap=0/0kB
 
 monitor_host_perf() {
     local has_mpstat has_iostat
@@ -579,10 +741,20 @@ monitor_host_perf() {
     done
 }
 
-# --- Guest boot diagnostics (background, runs once) ---
-# Waits 120s after VM start to avoid guest-exec contention with Tartarus attach,
-# then collects diagnostic data from the guest via guest agent.
-# Tags: SHUTDOWN_DIAG | CRASH_DUMPS | GPU_DRIVER | HD_AUDIO | DISPLAY_EVENTS | BOOT_DIAG
+# --- Guest boot diagnostics (background, runs once 120s after VM start) ---
+# Tags: SHUTDOWN_DIAG | CRASH_DUMPS | GPU_DRIVER | HD_AUDIO | DISPLAY_EVENTS | BOOT_DIAG |
+#        BNET_GUEST | OW2_SETTINGS
+# 120s delay avoids guest-exec contention with attach_tartarus_deferred().
+#
+# What each tag captures:
+#   SHUTDOWN_DIAG  — Event IDs 200-203: prior shutdown duration, slow services/drivers
+#   CRASH_DUMPS    — 5 most recent .dmp files from LiveKernelReports + Minidump
+#   GPU_DRIVER     — AMD GPU PnP status (OK/Error), driver version
+#   HD_AUDIO       — GPU audio codec PnP status
+#   DISPLAY_EVENTS — 20 most recent dxgkrnl/Dwm/Display events (TDR, mode switches)
+#   BOOT_DIAG      — Event 100: MainPathBootTime, BootDriverInitTime, BootIsDegradation
+#   BNET_GUEST     — BNPresence error count in current Battle.net log (disconnect indicator)
+#   OW2_SETTINGS   — Key OW2 settings (RenderScale, FrameRateCap, WindowMode)
 
 log_guest_diagnostics() {
     # Delay to avoid contention with attach_tartarus_deferred during boot
@@ -618,12 +790,27 @@ log_guest_diagnostics() {
     # Windows boot timing (Event 100)
     out=$(guest_run_ps 'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-Diagnostics-Performance/Operational";Id=100} -MaxEvents 1 -EA SilentlyContinue | Select-Object -ExpandProperty Message' 15) || true
     log "BOOT_DIAG: ${out:-none}"
+
+    # Battle.net BNPresence errors (disconnect indicator)
+    out=$(guest_run_ps '$d="C:\Users\myuser\AppData\Local\Battle.net\Logs"; $l=Get-ChildItem $d -Filter "battle.net-*.log" -EA SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if($l){$c=(Select-String -Path $l.FullName -Pattern "BNPresence.*err=1|ERROR_INTERNAL" -EA SilentlyContinue | Measure-Object).Count; "$($l.Name): $c errors"} else {"no logs"}' 15) || true
+    log "BNET_GUEST: ${out:-none}"
+
+    # OW2 in-game settings (detect silent resets after updates)
+    out=$(guest_run_ps '$f="C:\Users\myuser\Documents\Overwatch\Settings\Settings_v0.ini"; if(Test-Path $f){$c=Get-Content $f; $rs=($c|Select-String "RenderScale").ToString().Split("=")[1].Trim(); $fc=($c|Select-String "FrameRateCap").ToString().Split("=")[1].Trim(); $wm=($c|Select-String "WindowMode").ToString().Split("=")[1].Trim(); "RenderScale=$rs FrameRateCap=$fc WindowMode=$wm"} else {"settings file not found"}' 15) || true
+    log "OW2_SETTINGS: ${out:-none}"
 }
 
-# --- Guest GPU performance monitor (background, 60s loop) ---
-# Requires LibreHardwareMonitor v0.9.4 net472 running as SYSTEM on guest.
-# See: https://github.com/LibreHardwareMonitor/LibreHardwareMonitor
+# --- Guest GPU performance monitor (background, 60s loop via LHM WMI) ---
 # Tag: PERF_GUEST
+# Requires LibreHardwareMonitor v0.9.4 net472 running as SYSTEM on guest.
+# Queries root\LibreHardwareMonitor WMI namespace via guest agent.
+#
+# Captures: GPU core load %, temps (core/hotspot/memory), clocks (core/memory),
+#           package power, VRAM used/total.
+# If LHM unavailable, logs once and exits.
+#
+# For frame-level analysis, use OW2's built-in overlay (Ctrl+Shift+N) —
+# frame time, render time, and network latency aren't capturable via agent.
 
 monitor_guest_perf() {
     # Delay past boot-time contention window
@@ -652,10 +839,90 @@ monitor_guest_perf() {
     done
 }
 
-# --- Deferred Tartarus attach ---
+# --- Guest network profile monitor (10s poll via guest agent, background) ---
+# Tag: NET_GUEST
+# 120s startup delay. Queries Microsoft-Windows-NetworkProfile/Operational events,
+# deduplicating via EventRecordId.
+#
+# Log format:
+#   NET_GUEST CONNECTED ...    — Windows registered a network connection (Event 10000)
+#   NET_GUEST DISCONNECTED ... — Windows registered a network disconnection (Event 10001)
+#
+# Cross-correlation:
+#   NET_GUEST DISCONNECTED + OW2 drop → Windows lost the adapter
+#   No NET_GUEST event + OW2 drop     → adapter is up; disconnect is app/server layer
+
+monitor_guest_network() {
+    sleep 120  # avoid boot contention (same as other guest monitors)
+
+    if ! virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+        log "NET_GUEST: guest agent unavailable -- skipping guest network monitor"
+        return
+    fi
+
+    log "NET_GUEST: starting 10s poll for NetworkProfile events (ID 10000/10001)"
+    local last_seen_id=0
+
+    while virsh domstate overwatch 2>/dev/null | grep -q "running"; do
+        local out
+        out=$(guest_run_ps 'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-NetworkProfile/Operational";Id=10000,10001} -MaxEvents 5 -EA SilentlyContinue | Sort-Object RecordId | ForEach-Object { $_.RecordId.ToString() + "|" + $_.Id.ToString() + "|" + $_.TimeCreated.ToString("HH:mm:ss") + "|" + ($_.Message -replace "\n"," " -replace "\s+"," ").Substring(0,[Math]::Min(80,$_.Message.Length)) }' 20) || true
+
+        if [ -n "$out" ]; then
+            while IFS='|' read -r rec_id evt_id ts msg; do
+                [ -z "$rec_id" ] && continue
+                if [ "$rec_id" -gt "$last_seen_id" ] 2>/dev/null; then
+                    last_seen_id=$rec_id
+                    if [ "$evt_id" = "10000" ]; then
+                        log "NET_GUEST CONNECTED RecordId=${rec_id} time=${ts} msg=${msg}"
+                    elif [ "$evt_id" = "10001" ]; then
+                        log "NET_GUEST DISCONNECTED RecordId=${rec_id} time=${ts} msg=${msg}"
+                    fi
+                fi
+            done <<< "$out"
+        fi
+
+        sleep 10
+    done
+}
+
+# --- Transition throttle event listener (background, UDP on port 9148) ---
+# Tag: TRANSITION
+# Receives messages from guest-side scripts/guest/transition-throttle.ps1.
+#
+# Log format (relayed from guest):
+#   TRANSITION started                      — script started on guest
+#   TRANSITION ow2_detected pid=N           — OW2 process found
+#   TRANSITION throttle_on gpu=N            — loading screen, affinity reduced to 0x3
+#   TRANSITION throttle_off duration=Ns gpu=N — affinity restored to 0x3F
+#   TRANSITION manual_throttle_on           — ScrollLock hotkey engaged
+#   TRANSITION manual_throttle_off duration=Ns — ScrollLock released / auto-timeout
+#   TRANSITION ow2_exited pid=N             — OW2 closed
+#   TRANSITION stopped                      — script exiting
+
+monitor_transition_events() {
+    python3 -uc "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('', ${TRANSITION_SIGNAL_PORT}))
+while True:
+    data, _ = s.recvfrom(512)
+    print(data.decode('utf-8', 'replace'), flush=True)
+" 2>/dev/null | while IFS= read -r line; do
+        log "$line"
+    done
+}
+
+# --- Deferred Tartarus attach (background) ---
+# Tag: BOOT_TIMING
 # The Tartarus is NOT in the VM XML. It's hot-plugged after Synapse is running
 # so that Synapse detects the USB arrival and applies keybind/lighting profiles.
 # If attached at boot, Synapse hasn't started yet and profiles don't apply.
+#
+# Log format:
+#   BOOT_TIMING guest_agent=Ns  — seconds from VM start to first guest-ping
+#   BOOT_TIMING synapse_ready=Ns — seconds from VM start to razerwdl running
+#   BOOT_TIMING tartarus=Ns     — seconds from VM start to Tartarus hot-plugged
 
 TARTARUS_USB_XML="<hostdev mode='subsystem' type='usb' managed='yes'><source><vendor id='0x1532'/><product id='0x022b'/></source></hostdev>"
 
@@ -750,12 +1017,19 @@ ensure_cpu_defaults() {
     systemctl set-property --runtime -- system.slice AllowedCPUs=0-7 2>/dev/null || true
     systemctl set-property --runtime -- user.slice AllowedCPUs=0-7 2>/dev/null || true
     systemctl set-property --runtime -- init.scope AllowedCPUs=0-7 2>/dev/null || true
+    # Re-enable deep C-states on vCPU cores
+    for cpu in $(seq 2 7); do
+        for state in /sys/devices/system/cpu/cpu${cpu}/cpuidle/state[2-9]/; do
+            [ -f "${state}disable" ] && echo 0 > "${state}disable" 2>/dev/null || true
+        done
+    done
     # Governor back to powersave
     for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
         echo powersave > "$g" 2>/dev/null || true
     done
     # Restart irqbalance to redistribute IRQs
     systemctl start irqbalance 2>/dev/null || true
+    echo 1 > /proc/sys/kernel/sched_autogroup_enabled 2>/dev/null || true
 }
 
 ensure_gpu_unbound_from_vfio() {
@@ -932,6 +1206,7 @@ _do_start() {
     # Post-VM-start setup (non-critical, continue on failure)
     set_igpu_blank 4 blank || true
     ensure_performance_tuning
+    apply_sched_fifo
 
     log_state "vm_running"
     log "VM running. Waiting for shutdown..."
@@ -962,6 +1237,22 @@ _do_start() {
     # Guest GPU performance monitor — 60s PERF_GUEST loop via LHM WMI
     monitor_guest_perf &
     local guest_perf_pid=$!
+
+    # Packet capture -- rolling ring buffer on br0 for post-incident Wireshark analysis
+    monitor_pcap &
+    local pcap_pid=$!
+
+    # Host latency monitor -- 1s ping to 8.8.8.8; distinguishes host vs OW2-specific drops
+    monitor_latency_host &
+    local latency_host_pid=$!
+
+    # Guest network monitor -- polls Windows NetworkProfile events 10000/10001 via guest agent
+    monitor_guest_network &
+    local guest_netmon_pid=$!
+
+    # Transition throttle event listener -- receives TRANSITION messages from guest script
+    monitor_transition_events &
+    local transition_pid=$!
 
     # Listen for shutdown signal from guest; record timestamp on receipt
     rm -f /tmp/.overwatch-shutdown-ts
@@ -1042,6 +1333,10 @@ open('/tmp/.overwatch-shutdown-ts','w').write(str(int(time.time())))" \
     kill "$perf_host_pid" 2>/dev/null || true
     kill "$diag_pid" 2>/dev/null || true
     kill "$guest_perf_pid" 2>/dev/null || true
+    kill "$pcap_pid" 2>/dev/null || true
+    kill "$latency_host_pid" 2>/dev/null || true
+    kill "$guest_netmon_pid" 2>/dev/null || true
+    kill "$transition_pid" 2>/dev/null || true
     wait "$cpu_iso_pid" 2>/dev/null || true
     wait "$tartarus_pid" 2>/dev/null || true
     wait "$listener_pid" 2>/dev/null || true
@@ -1049,6 +1344,10 @@ open('/tmp/.overwatch-shutdown-ts','w').write(str(int(time.time())))" \
     wait "$perf_host_pid" 2>/dev/null || true
     wait "$diag_pid" 2>/dev/null || true
     wait "$guest_perf_pid" 2>/dev/null || true
+    wait "$pcap_pid" 2>/dev/null || true
+    wait "$latency_host_pid" 2>/dev/null || true
+    wait "$guest_netmon_pid" 2>/dev/null || true
+    wait "$transition_pid" 2>/dev/null || true
 
     log "VM shut down detected."
     log_state "vm_shutdown"

@@ -551,8 +551,8 @@ The lifecycle script (`overwatch.sh`) manages the full VM lifecycle: stops host 
 
 ```bash
 # Copy script and service to myhost
-scp scripts/overwatch.sh myhost:/tmp/overwatch.sh
-scp scripts/overwatch.service myhost:/tmp/overwatch.service
+scp scripts/host/overwatch.sh myhost:/tmp/overwatch.sh
+scp scripts/host/overwatch.service myhost:/tmp/overwatch.service
 
 # Install
 ssh myhost 'sudo install -m 755 /tmp/overwatch.sh /usr/local/bin/overwatch'

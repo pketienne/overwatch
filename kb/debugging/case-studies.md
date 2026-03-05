@@ -391,6 +391,150 @@ rules out the 32.0.23027.2005 regression as the cause for this pattern.
 
 ---
 
+## AtihdWT6 Reinstated by Driver Update (2026-03-03)
+
+### Background
+
+The 0x9F BSOD at Shutdown case study identified `HDAudBus` blocking power IRPs
+to the GPU's HDMI audio codec and fixed it by disabling the HDAUDIO device
+(`pnputil /disable-device`). This also addressed AtihdWT6 (AMD HD Audio driver)
+which was the functional driver for the GPU's HDMI audio endpoint.
+
+### What happened
+
+After updating to AMD driver **32.0.23027.2005** (Feb 17, 2026), the driver
+installer re-added `atihdwt6.inf` to the driver store (`oem62.inf`) and
+re-enabled the `AMD High Definition Audio Device` (Status: OK). The device was
+back online, binding to `HDAUDIO\FUNC_01&VEN_1002&DEV_AA01&SUBSYS_00AA0100`.
+
+The WinDbg module list from the 2026-03-03 crash dumps confirmed AtihdWT6.sys
+was loaded during TDR events. The driver is compiled Sep 2, 2025 — it shipped
+as part of the Adrenalin 32.0.23027.2005 package.
+
+### WinDbg analysis of 2026-03-03 dumps
+
+Running `!analyze -v` on `WATCHDOG-20260303-1349.dmp` and `WATCHDOG-20260303-1413.dmp`:
+
+```
+1349.dmp: BugCheck 0x117 (VIDEO_TDR_TIMEOUT_DETECTED)
+  System uptime: 0:01:11 — TDR during early GPU driver initialization
+  Faulting IP: amdkmdag+0x1ec600
+
+1413.dmp: BugCheck 0x141 (VIDEO_ENGINE_TIMEOUT_DETECTED)
+  System uptime: 0:25:42 — TDR during match loading
+  Faulting IP: amdkmdag+0x1ec600  ← same address both times
+```
+
+Both crash at the exact same address in amdkmdag.sys, indicating the same code
+path stalls regardless of whether it's early initialization or active gameplay.
+The 0x117 is the initial TDR detection; the 0x141 is the follow-on engine
+reset also timing out (both are live dumps, not hard BSODs).
+
+The call stacks confirm the standard VFIO TDR path:
+```
+dxgmms2!VidSchiCheckHwProgress  ← heartbeat: no GPU progress detected
+dxgmms2!VidSchiReportHwHang     ← hang reported
+dxgkrnl!TdrIsRecoveryRequired   ← decides recovery is needed
+dxgkrnl!TdrCollectDbgInfoStage1 ← live dump captured
+```
+
+### Permanent fix: Device Installation Restrictions policy
+
+Deleting the INF and disabling the device is not durable — AMD driver updates
+reinstall the INF and may re-enable the device. The durable fix is Windows
+Device Installation Restrictions, which blocks PnP from binding any driver to
+the hardware ID regardless of what is in the driver store:
+
+```powershell
+$restrict = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions"
+$denyKey  = "$restrict\DenyDeviceIDs"
+New-Item -Path $restrict -Force | Out-Null
+New-Item -Path $denyKey  -Force | Out-Null
+Set-ItemProperty -Path $restrict -Name "DenyDeviceIDs"            -Value 1 -Type DWord
+Set-ItemProperty -Path $restrict -Name "DenyDeviceIDsRetroactive"  -Value 1 -Type DWord
+# Block HDAUDIO codec (loads AtihdWT6.sys)
+Set-ItemProperty -Path $denyKey -Name "1" -Value "HDAUDIO\FUNC_01&VEN_1002&DEV_AA01" -Type String
+# Block PCI HD Audio Bus (parent — prevents codec from ever enumerating)
+Set-ItemProperty -Path $denyKey -Name "2" -Value "PCI\VEN_1002&DEV_AB30" -Type String
+```
+
+`DenyDeviceIDsRetroactive=1` immediately disables any currently-enabled
+matching device. No reboot required; takes effect on next PnP enumeration.
+Future AMD driver updates may still add `atihdwt6.inf` to the driver store, but
+PnP will refuse to bind it to the blocked hardware IDs.
+
+### Why audio interacts with GPU TDRs
+
+The AMD HD Audio codec sits on the GPU's PCIe device (address `03:00.1`),
+sharing the GPU's PCIe bus with the display engine (`03:00.0`). In a VFIO
+passthrough setup, both devices are passed through and share the same IOMMU
+group. When AtihdWT6 issues codec verb commands (e.g., for EDID probe, power
+state transitions, or audio encoding), those commands go through the same
+hardware command ring as GPU rendering work. Under VFIO, MMIO access latency
+from the host can delay command completion. If a codec verb is in-flight while
+dxgmms2 checks GPU progress, the heartbeat check can see the engine as "stuck"
+and trigger TDR.
+
+Disabling the audio device eliminates this command traffic from the shared ring,
+reducing one source of TDR pressure during high-load transitions (match loading,
+driver initialization).
+
+### Post-removal confirmation: AtihdWT6 not primary TDR cause
+
+After removing AtihdWT6 and the HDA Bus device, a new crash occurred at 15:02
+(`WATCHDOG-20260303-1502.dmp`):
+
+```
+BugCheck 0x141, Faulting IP: amdkmdag+0x1ec600
+FAILURE_ID_HASH: {48b738dd-5a92-7ff8-63d0-f075fc680fe0} — identical to 1413 dump
+```
+
+The FAILURE_ID_HASH is identical across all three 2026-03-03 dumps. AtihdWT6 removal
+had no effect on the TDR signature. The audio driver removal was correct hygiene
+(previously caused 0x9F shutdown BSODs via HDAudBus) but is not the cause of
+gameplay TDRs.
+
+The root cause is VFIO passthrough latency: `amdkmdag.sys` at offset `+0x1ec600`
+stalls during high GPU command pressure (match transitions, driver initialization).
+No driver update was available (32.0.23027.2005 = latest as of 2026-03-03).
+
+### Reducing TDR frequency without eliminating root cause
+
+`TdrDelay=60` converts hard crashes to recoverable stalls: the GPU hangs but Windows
+recovers it within the 60s window, avoiding the "Rendering Device Lost" OW2 crash.
+
+Additional in-game settings reduced peak GPU command pressure:
+- **Render Scale**: Automatic → Custom 100%. OW2's Automatic goes *above* 100% when the
+  GPU has headroom (supersampling), not at 100% as a floor. On an RX 7900 XTX at
+  3440×1440, Automatic was driving render scales above 100% into match transitions.
+- **Frame Rate**: Automatic → Custom 240 (matches monitor Hz, caps steady-state queue depth)
+
+Effect: TDR events during transitions changed from hard crashes to occasional recoverable
+hangs.
+
+### Confirmed behavioral pattern (2026-03-04)
+
+The transition freeze is **deterministic when OW2 is backgrounded** (alt-tabbed away in
+borderless window mode). OW2 runs at its background FPS limit when not focused — the GPU
+is near-idle. When the match starts loading, GPU command submission jumps from near-zero
+to maximum in one frame. This cold-to-hot spike overwhelms the VFIO interrupt/MMIO path
+every time, causing a TDR stall that results in "Rendering Device Lost" or server timeout.
+
+When OW2 is **in the foreground**, the GPU is already at steady-state (240fps). The
+transition command burst is a smaller delta from the current load. It sometimes works
+cleanly; when it doesn't, a brief hiccup occurs that is recoverable:
+
+- Alt+Tab away (game reduces submission) → wait 2-3s → Alt+Tab back
+- Screen immediately recovers, match loads normally
+
+If left alone during a foreground hiccup, the GPU does not self-recover fast enough —
+the game server times out and the result is "Lost connection to server".
+
+**Operational rule:** Keep OW2 in the foreground when queuing. If a hiccup occurs on
+transition, Alt+Tab → 2-3s → Alt+Tab back.
+
+---
+
 ## Build/Remove Cycle (Method 5)
 
 The script grew from 212 to 967 lines through iterative problem-solving:
@@ -490,3 +634,63 @@ entirely and reduced TDR crashes from multiple per session to rare blips.
 counter-productive for GPU passthrough. The host kernel needs memory for
 IOMMU structures and its VCPU scheduling threads. The guest's unused RAM does
 nothing; the host's missing RAM causes real latency.
+
+### TDR types that CPU pinning configuration can induce
+
+Both issues above (missing `<cputune>` and immediate `AllowedCPUs`) can
+produce WATCHDOG live kernel dumps. They have the same dump signature
+(`P1:141` WATCHDOG + `P1:a1000001` AMD_WATCHDOG) but differ in *when* they
+fire and what triggers them.
+
+**Type 1 — Gameplay TDR (missing `<cputune>`)**
+
+Without `<cputune>`, vCPU threads float across all host cores. The Linux
+scheduler can preempt any vCPU at any point to run host work (kworker,
+kswapd, IRQ handlers, GDM, etc.). If a vCPU is preempted while the GPU is
+mid-pipeline (processing a draw call batch, waiting for fence signal), the
+GPU stalls. If the stall exceeds the WDDM heartbeat window,
+`dxgmms2!VidSchiCheckHwProgress` triggers engine reset → live dump. OW2
+loses its DirectX device and crashes with "Rendering Device Lost".
+
+This TDR is indistinguishable from a RAM-pressure TDR (kswapd VCPU
+competition) based on the dump alone. Both produce the same
+`VidSchiCheckHwProgress → VidSchiResetEngines` call stack. The distinguishing
+factor is host memory state: if `swap > 0` or `HugePages_Free > 0` (pages
+unallocated), RAM pressure is the more likely cause. If swap is zero and
+pages are fully allocated, missing CPU pinning is more likely.
+
+Fix: add `<cputune>` to VM XML with vCPUs pinned to dedicated cores and
+emulator/IO thread on the remaining cores.
+
+**Type 2 — Boot-time TDR (immediate `AllowedCPUs`)**
+
+If `AllowedCPUs` is applied immediately when the VM starts (before Windows
+boots), the QEMU emulator thread is confined to `HOST_CPUS` (cores 0-1)
+during the entire boot sequence. The emulator thread is responsible for
+injecting interrupts into the guest. During Windows boot, AMD GPU driver
+initialization, Defender service init, and other heavy startup activity all
+generate interrupt bursts simultaneously. With the emulator thread constrained
+to 2 cores, it cannot keep up with the volume of interrupt delivery → interrupt
+injection queues back up → AMD GPU driver stalls waiting for interrupt
+acknowledgment → `VidSchiCheckHwProgress` fires → boot-time WATCHDOG TDR.
+
+This produces the same dump signature as the pre-existing boot-time TDRs
+documented in the "Boot-Time TDR Dumps" case study (Defender/AUEPMaster
+contention). Immediate `AllowedCPUs` *adds to* that contention; it doesn't
+create an entirely new failure mode. The practical effect: boot-time TDR
+frequency increases when `AllowedCPUs` is applied immediately.
+
+Fix: apply `AllowedCPUs` only after the guest agent responds (`apply_cpu_isolation()`
+background function), so the emulator thread runs unconstrained during boot.
+
+**Summary**
+
+| TDR type | Timing | Trigger | Fix |
+|---|---|---|---|
+| Gameplay (missing cputune) | During active gameplay | vCPU preempted mid-GPU-pipeline | Add `<cputune>` XML block |
+| Boot-time (immediate AllowedCPUs) | ~T+49s and T+78s after VM start | Emulator thread bottleneck during interrupt burst | Defer `AllowedCPUs` until guest-agent up |
+| Boot-time (Defender/AMD contention) | Same window | Defender + AUEPMaster saturate CPUs during GPU driver init | Disable AUEPMaster; add Defender exclusions |
+
+The boot-time types compound: all three can fire simultaneously during the
+same ~30-second driver-init window, and any one of them is sufficient to
+trigger a TDR dump.

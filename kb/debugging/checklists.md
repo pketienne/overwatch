@@ -91,3 +91,16 @@ be launched from SYSTEM context — use the full package path above.
 - [ ] Test the "it works without the workaround" hypothesis
 - [ ] Record the failure pattern for future reference even if you don't
   fully understand it
+
+## Host-level tracing (BPF tools)
+
+Available via `bpfcc-tools`, `bpftrace`, `trace-cmd`. Useful for deep-diving
+host-side issues that the polling monitors in overwatch.sh can't catch:
+
+| Tool | Use case | Example |
+|---|---|---|
+| `bpftrace` | One-liner kernel probes | `bpftrace -e 'tracepoint:kvm:kvm_exit { @[args->exit_reason] = count(); }'` — count VM exit reasons |
+| `trace-cmd` | Kernel ftrace recorder | `trace-cmd record -e kvm` — record all KVM events during a session |
+| `bpfcc-tools` | Pre-built BPF scripts | `biolatency` (disk latency histograms), `runqlat` (scheduler queue latency) |
+
+These are ad-hoc diagnostic tools for manual investigation, not wired into the overwatch service.

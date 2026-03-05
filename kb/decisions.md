@@ -47,15 +47,15 @@ PCI remove/rescan needed. The remove/rescan code was deleted from overwatch.
 
 ## 3. Disable Auto HDR — Done
 
-Disabled Auto HDR globally (`AutoHDREnable=0`) while keeping native HDR on. Prevents per-app display pipeline mode switching that caused TDR on first Overwatch launch. See [Phase 13](recipe/configure.md#phase-13-display-configuration).
+Disabled Auto HDR globally (`AutoHDREnable=0`) while keeping native HDR on. Prevents per-app display pipeline mode switching that caused TDR on first Overwatch launch.
 
 ## 4. Disable Game Bar — Done
 
-Disabled Game Bar via `AllowGameDVR` policy + user settings. Suppresses unnecessary overlay and Auto HDR recommendation toasts. See [Phase 13](recipe/configure.md#phase-13-display-configuration).
+Disabled Game Bar via `AllowGameDVR` policy + user settings. Suppresses unnecessary overlay and Auto HDR recommendation toasts.
 
 ## 5. Disable Auto HDR system toast — Done
 
-Disabled `Windows.SystemToast.Graphics.AutoHDR` notification (separate from Game Bar). See [Phase 13](recipe/configure.md#phase-13-display-configuration).
+Disabled `Windows.SystemToast.Graphics.AutoHDR` notification (separate from Game Bar).
 
 ## 6. Host-side CPU isolation — Implemented
 
@@ -65,7 +65,7 @@ Originally single-core (cpu0) but expanded to 2 cores after PERF_HOST
 monitoring showed cpu0 at 100% during gameplay — QEMU emulator thread
 competing with VS Code/Claude/node for USB audio isochronous transfers,
 causing headset static. 6 vCPUs on cores 2–7 (was 7 on cores 1–7).
-See [CPU Isolation Architecture](recipe/setup.md#cpu-isolation-architecture).
+See [CPU Pinning case study](debugging/case-studies.md#cpu-pinning-frame-pacing-vs-frame-rate-observed-2026-03-02).
 
 ---
 

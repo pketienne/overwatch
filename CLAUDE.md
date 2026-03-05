@@ -41,7 +41,7 @@ The guest agent runs as SYSTEM. Commands launched via `guest-exec` run in the SY
 
 ## Anti-Cheat (Ricochet)
 
-Five detection vectors must remain addressed (see `overwatch.xml` and `steps.md` for details):
+Five detection vectors must remain addressed (see `overwatch.xml` and `kb/steps.md` for details):
 1. KVM hidden (`<kvm><hidden state='on'/>`)
 2. Hyper-V vendor ID spoofed
 3. CPU host-passthrough
@@ -53,8 +53,9 @@ Five detection vectors must remain addressed (see `overwatch.xml` and `steps.md`
 ## Key Files
 
 - `overwatch.xml` — VM definition (anti-cheat mitigations, GPU passthrough, SMBIOS)
-- `scripts/overwatch.sh` — VM lifecycle (start/stop/GPU bind/unbind)
-- `scripts/overwatch.service` — systemd unit for lifecycle management
-- `steps.md` — Full setup procedure with verification commands
+- `scripts/host/overwatch.sh` — VM lifecycle (start/stop/GPU bind/unbind)
+- `scripts/host/overwatch.service` — systemd unit for lifecycle management
+- `scripts/guest/` — PowerShell scripts deployed to `C:\Scripts\` in the VM
+- `kb/steps.md` — Full setup procedure with verification commands
 - `kb/troubleshooting.md` — Problem/cause/solution reference matrix
 - `kb/debugging/` — Debugging methodology, case studies, checklists
