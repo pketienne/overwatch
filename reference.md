@@ -1,7 +1,7 @@
-# Troubleshooting Reference
+# Reference
 
-Quick-lookup table for known problems, then debugging checklists for unknown ones.
-For generalized debugging principles, see `nerv/debugging-principles.md`.
+Known problems, debugging checklists, and stress tests.
+Generalized debugging principles live in the [nerv](https://github.com/pketienne/nerv) repo (`debugging-principles.md`).
 
 ## Known Problems
 
