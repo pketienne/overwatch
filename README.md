@@ -21,4 +21,4 @@ Key cookbook files:
 
 ## Documentation
 
-- `kb/troubleshooting.md` — Problem/cause/solution matrix, debugging checklists, stress tests
+- `kb/reference.md` — Known problems, debugging checklists, stress tests
