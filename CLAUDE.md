@@ -52,10 +52,5 @@ Five detection vectors must remain addressed (see cookbook VM XML template for d
 
 ## Key Files
 
-All deployable artifacts (scripts, VM XML, configs) live in the
-[overwatch cookbook](../symmetra/master/cookbooks/overwatch/) — this repo is documentation only.
-
-- Cookbook `templates/overwatch.sh.erb` → deployed to `/usr/local/bin/overwatch`
-- Cookbook `templates/overwatch-vm.xml.erb` → VM definition via `virsh define`
-- Cookbook `templates/setup-guest.sh.erb` → guest registry/config setup script
-- `reference.md` — Known problems, debugging checklists, stress tests
+This repo is documentation only — see `README.md` for cookbook paths and deployment targets.
+`reference.md` contains known problems, debugging checklists, and stress tests.
