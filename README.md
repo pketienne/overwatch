@@ -21,11 +21,5 @@ Key cookbook files:
 
 ## Documentation
 
-- `kb/troubleshooting.md` — Quick-lookup problem/cause/solution table
-- `kb/decisions.md` — Completed work items with rationale
-- `kb/vcpu-optimizations.md` — CPU isolation plan (implemented)
-- `kb/debugging/` — Debugging methodology (read in order):
-  1. `principles.md` — 10 methods + 7 anti-patterns
-  2. `case-studies.md` — Detailed investigations illustrating each method
-  3. `checklists.md` — Quick-reference debugging checklists
-  4. `stress-testing.md` — Synthetic load procedures for reproducing failures
+- `kb/troubleshooting.md` — Problem/cause/solution table + debugging checklists
+- `kb/debugging.md` — Principles, case studies, and stress tests
