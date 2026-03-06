@@ -40,6 +40,60 @@ To uninstall:
 sudo cinc-client -z -o 'recipe[overwatch::uninstall]'
 ```
 
+## Required attributes
+
+The cookbook ships with generic defaults. The following attributes must
+be overridden in a policyfile or node JSON before converging:
+
+```ruby
+# Network
+default['overwatch']['host_ip']             = '192.168.0.100' # host bridge IP
+default['overwatch']['vm_ip']               = '192.168.0.101' # VM IP (static DHCP lease)
+default['overwatch']['vm_mac']              = 'aa:bb:cc:dd:ee:ff'
+default['overwatch']['physical_interface']  = 'enp8s0' # NIC for bridge
+
+# Users
+default['overwatch']['target_user']         = 'myuser' # Linux account
+default['overwatch']['windows_user']        = 'myuser' # Windows guest account
+
+# SMBIOS — must match real hardware for anti-cheat
+default['overwatch']['smbios'] = {
+  'bios_vendor'        => 'American Megatrends International, LLC.',
+  'bios_version'       => '1.00',
+  'bios_date'          => '01/01/2025',
+  'sys_manufacturer'   => 'My Vendor',
+  'sys_product'        => 'My Product',
+  'sys_version'        => '1.0',
+  'board_manufacturer' => 'My Vendor',
+  'board_product'      => 'My Board',
+  'board_version'      => '1.0',
+  'board_serial'       => 'XXXXXXXXXX',    # your board serial
+  'sys_serial'         => 'To be filled by O.E.M.',
+}
+
+# USB devices to pass through to the VM
+default['overwatch']['usb_devices'] = [
+  { 'vid' => '0x1234', 'pid' => '0x5678', 'name' => 'My Keyboard' },
+]
+```
+
+Read your host's SMBIOS values with `sudo dmidecode -t bios -t system -t baseboard`.
+
+These attributes have sensible defaults but may need adjustment per host:
+
+| Attribute | Default | Notes |
+|---|---|---|
+| `gpu` | `0000:03:00.0` | dGPU PCI address (`lspci -D \| grep VGA`) |
+| `gpu_audio` | `0000:03:00.1` | GPU HDMI/DP audio function |
+| `igpu` | `0000:74:00.0` | iGPU PCI address (for display switching) |
+| `host_cpus` | `0-1` | CPUs reserved for host (not pinned to VM) |
+| `emulator_cpuset` | `0-1` | CPUs for QEMU emulator threads |
+| `vcpu_pins` | cores 2-7 | vCPU-to-physical-core pinning map |
+| `vm_ram_kib` | 50331648 (48G) | VM RAM in KiB |
+| `vm_vcpus` | 6 | Number of vCPUs |
+| `grub_cmdline_params` | IOMMU + hugepages + CPU isolation | Kernel parameters |
+| `virtio_iso` | (empty) | Path to `virtio-win.iso` for driver install |
+
 ## Prerequisites
 
 - `libvirt` cookbook (base packages, libvirtd service)
@@ -144,8 +198,8 @@ the rest is verbatim bash. This keeps them maintainable and diffable.
 Templated constants in `overwatch.sh.erb`: `GPU`, `GPU_AUDIO`, `IGPU`,
 `HOST_CPUS`, `SHUTDOWN_SIGNAL_PORT`, `TRANSITION_SIGNAL_PORT`, `VM_NAME`.
 
-`overwatch-monitors.sh.erb` has no templated constants — it is pure bash,
-sourced by `overwatch.sh` at runtime.
+Templated constants in `overwatch-monitors.sh.erb`: `VM_IP`,
+`WINDOWS_USER`.
 
 Templated constants in `setup-guest.sh.erb`: `VM_NAME`, `HOST_IP`,
 `SHUTDOWN_SIGNAL_PORT`, `TRANSITION_SIGNAL_PORT`.
