@@ -1,12 +1,15 @@
-# Overwatch VM
+# Overwatch
 
-GPU-passthrough Windows 11 gaming VM on myhost. AMD RX 7900 XTX passed through to a Windows guest for Overwatch 2 with Ricochet anti-cheat.
+GPU-passthrough Windows 11 gaming VM on myhost. AMD RX 7900 XTX
+passed through to a Windows guest for Overwatch 2 with Ricochet
+anti-cheat.
 
-The `cookbook/` directory contains the Cinc (Chef) cookbook that configures the host and deploys all scripts. See [`cookbook/README.md`](cookbook/README.md) for cookbook internals (templates, anti-cheat design, GRUB parameters, post-converge workflow).
+This repo is a [Cinc](https://cinc.sh) (open-source Chef) cookbook that
+configures the host (GRUB, VFIO, network bridge, libvirt VM definition,
+lifecycle tooling) and deploys guest setup scripts for manual execution
+after Windows installation.
 
 ## Install Cinc
-
-[Cinc](https://cinc.sh) is an open-source distribution of Chef. Install it on the target host:
 
 ```bash
 curl -L https://omnitruck.cinc.sh/install.sh | sudo bash
@@ -21,7 +24,8 @@ cinc-solo --version
 
 ## Run the cookbook
 
-The cookbook depends on `symmetra_core` and `libvirt` cookbooks from the [symmetra](https://github.com/pketienne/symmetra) repo. To converge:
+The cookbook depends on `symmetra_core` and `libvirt` cookbooks from the
+[symmetra](https://github.com/pketienne/symmetra) repo. To converge:
 
 ```bash
 # From the symmetra repo (has all dependency cookbooks)
@@ -37,11 +41,44 @@ To uninstall:
 sudo cinc-client -z -o 'recipe[overwatch::uninstall]'
 ```
 
-To run compliance checks:
+## Prerequisites
 
-```bash
-cinc-auditor exec cookbooks/overwatch/compliance/profiles/default
-```
+- `libvirt` cookbook (base packages, libvirtd service)
+- GPU ROM (`/usr/share/qemu/gpu-rom.bin`) — download the VBIOS for your
+  specific GPU from [TechPowerUp VGA BIOS Collection][vbios]. The
+  cookbook logs a warning if the file is missing but does not fail.
+- VirtIO ISO (`~/Downloads/virtio-win.iso`) — optional; mounted as a
+  CDROM if present during VM definition for driver installation.
+
+[vbios]: https://www.techpowerup.com/vgabios/
+
+## What the cookbook does NOT do
+
+- **Run guest configuration automatically.** The guest must be running
+  with QEMU guest agent installed before `setup-guest.sh` can execute.
+- **Install Windows.** This is manual; `autounattend.xml` is deployed
+  to assist unattended installs.
+- **Download the GPU ROM.** This is specific to the GPU model and must
+  be placed manually.
+- **Apply netplan.** The bridge config is written but `netplan apply`
+  is not called — this is dangerous over SSH and could sever the
+  connection. A warning is logged instead.
+
+## Post-converge workflow
+
+After the cookbook converges on myhost:
+
+1. **Reboot** to pick up GRUB IOMMU and VFIO module changes.
+2. **Apply netplan** (if first run): `sudo netplan apply`
+3. **Install Windows** into the VM:
+   - Attach a Windows ISO to the VM definition.
+   - `virsh start overwatch` and connect via VNC/Spice for initial setup.
+   - Install VirtIO drivers from the mounted ISO.
+   - Install QEMU guest agent.
+4. **Run guest setup**: `sudo /usr/local/share/overwatch/setup-guest.sh all`
+   from the host. This configures power settings, removes HDA audio,
+   disables Defender telemetry, sets up the shutdown signal listener,
+   and tunes display/performance settings inside the guest.
 
 ## VM lifecycle
 
@@ -72,7 +109,9 @@ sudo cp /var/lib/libvirt/qemu/nvram/overwatch_VARS.fd{,.bak}
 sudo virsh snapshot-create-as overwatch --name <label> --disk-only
 ```
 
-Host and guest configs must stay in sync. A change that prevents the VM from booting risks a host kernel panic — a failed boot leaves the GPU held via vfio with no guest to release it.
+Host and guest configs must stay in sync. A change that prevents the VM
+from booting risks a host kernel panic — a failed boot leaves the GPU
+held via vfio with no guest to release it.
 
 ## Frozen guest recovery
 
@@ -85,7 +124,8 @@ Host and guest configs must stay in sync. A change that prevents the VM from boo
 
 ## Guest agent
 
-The agent runs as SYSTEM. Commands via `guest-exec` run in the SYSTEM session, not the interactive user session:
+The agent runs as SYSTEM. Commands via `guest-exec` run in the SYSTEM
+session, not the interactive user session:
 
 - GUI apps are invisible to the logged-in user
 - `HKCU:` maps to SYSTEM's hive, not the user's
@@ -93,7 +133,64 @@ The agent runs as SYSTEM. Commands via `guest-exec` run in the SYSTEM session, n
 
 Windows Defender and Tamper Protection must always remain on.
 
+## Template strategy
+
+The lifecycle script is split into two files: `overwatch.sh.erb` (~920
+lines) for core logic and `overwatch-monitors.sh.erb` (~465 lines) for
+background monitors and deferred boot tasks (sourced at runtime). The
+guest setup script is `setup-guest.sh.erb` (~1075 lines). All three
+template only a small block of machine-specific constants in the header;
+the rest is verbatim bash. This keeps them maintainable and diffable.
+
+Templated constants in `overwatch.sh.erb`: `GPU`, `GPU_AUDIO`, `IGPU`,
+`HOST_CPUS`, `SHUTDOWN_SIGNAL_PORT`, `TRANSITION_SIGNAL_PORT`, `VM_NAME`.
+
+`overwatch-monitors.sh.erb` has no templated constants — it is pure bash,
+sourced by `overwatch.sh` at runtime.
+
+Templated constants in `setup-guest.sh.erb`: `VM_NAME`, `HOST_IP`,
+`SHUTDOWN_SIGNAL_PORT`, `TRANSITION_SIGNAL_PORT`.
+
+The VM XML (`overwatch-vm.xml.erb`) is fully generated from attributes.
+
+## Anti-cheat design
+
+The VM definition includes five vectors to avoid hypervisor detection
+by anti-cheat software:
+
+1. **KVM hidden** — hides CPUID leaf `0x40000000`
+2. **Hyper-V vendor ID** — spoofs to `AuthenticAMD` (avoids `Microsoft Hv`)
+3. **CPU host-passthrough** — exposes the real CPU model
+4. **SMBIOS strings** — real motherboard vendor/product/version from host
+5. **GPU VFIO passthrough** — real GPU, not emulated
+
+## GRUB kernel parameters
+
+The cookbook manages these via `node['overwatch']['grub_cmdline_params']`:
+
+- `amd_iommu=on` — enable IOMMU for VFIO passthrough
+- `iommu=pt` — passthrough mode (only VFIO devices use IOMMU)
+- `hugepages=24576` — 48GiB of 2MB huge pages for VM memory
+- `isolcpus=domain,managed_irq,2-7` — isolate vCPU cores from host scheduler
+- `nohz_full=2-7` — disable periodic timer tick on vCPU cores
+- `rcu_nocbs=2-7` — move RCU callbacks off vCPU cores
+
+An IVRS ACPI override (`/boot/ivrs-override.img` via
+`GRUB_EARLY_INITRD_LINUX_CUSTOM`) patches the MSI X870E firmware's
+broken IOMMU exclusion flags that block VFIO.
+
+## Verification
+
+```bash
+virsh dominfo overwatch            # VM is defined
+systemctl cat overwatch            # service unit installed
+/usr/local/bin/overwatch status    # host-ready report
+ls /usr/local/bin/overwatch*       # lifecycle script + monitors
+ls /usr/local/share/overwatch/     # guest setup + autounattend available
+```
+
+InSpec: `cinc-auditor exec compliance/profiles/default`
+
 ## Reference
 
 - [`reference.md`](reference.md) — Known problems, debugging checklists, stress tests
-- [`cookbook/README.md`](cookbook/README.md) — Cookbook design, templates, GRUB parameters
