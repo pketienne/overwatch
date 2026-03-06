@@ -165,6 +165,7 @@ action :install do
       shutdown_signal_port: node['overwatch']['shutdown_signal_port'],
       transition_signal_port: node['overwatch']['transition_signal_port'],
       vm_name: new_resource.vm_name,
+      target_user: new_resource.target_user,
     )
   end
 
@@ -175,6 +176,10 @@ action :install do
     owner 'root'
     group 'root'
     mode '0755'
+    variables(
+      vm_ip: node['overwatch']['vm_ip'],
+      windows_user: node['overwatch']['windows_user'],
+    )
   end
 
   # Systemd service
@@ -328,16 +333,20 @@ action :install do
       host_ip: node['overwatch']['host_ip'],
       shutdown_signal_port: node['overwatch']['shutdown_signal_port'],
       transition_signal_port: node['overwatch']['transition_signal_port'],
+      windows_user: node['overwatch']['windows_user'],
     )
   end
 
   # Transition throttle script (read by setup-guest.sh for guest deployment)
-  cookbook_file '/usr/local/share/overwatch/transition-throttle.ps1' do
-    source 'transition-throttle.ps1'
+  template '/usr/local/share/overwatch/transition-throttle.ps1' do
+    source 'transition-throttle.ps1.erb'
     cookbook 'overwatch'
     owner 'root'
     group 'root'
     mode '0644'
+    variables(
+      host_ip: node['overwatch']['host_ip'],
+    )
   end
 
   # autounattend.xml for Windows reinstalls

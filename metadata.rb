@@ -4,7 +4,7 @@ name             'overwatch'
 maintainer       'Patrick K. Etienne'
 maintainer_email 'git@paradox.limited'
 license          'All Rights Reserved'
-description      'GPU-passthrough Windows gaming VM on myhost (host + guest setup)'
+description      'GPU-passthrough Windows gaming VM (host + guest setup)'
 version          '1.0.0'
 
 supports 'ubuntu', '>= 24.04'

@@ -32,6 +32,7 @@ VM_NAME="<%= @vm_name %>"
 HOST_IP="<%= @host_ip %>"
 SHUTDOWN_SIGNAL_PORT=<%= @shutdown_signal_port %>
 TRANSITION_SIGNAL_PORT=<%= @transition_signal_port %>
+WINDOWS_USER="<%= @windows_user %>"
 
 # --- Parse arguments ---
 
@@ -121,6 +122,7 @@ HOST_IP = "${HOST_IP}"
 SHUTDOWN_PORT = ${SHUTDOWN_SIGNAL_PORT}
 TRANSITION_PORT = ${TRANSITION_SIGNAL_PORT}
 DRY_RUN = ${dry_run_val}
+WINDOWS_USER = "${WINDOWS_USER}"
 ENDVARS
 
     # Preamble: helpers (no bash substitution)
@@ -826,12 +828,12 @@ else:
     log("ERROR: Failed to write transition-throttle.ps1")
     sys.exit(1)
 
-# Create scheduled task (AtLogon, user myuser, Interactive, Highest, indefinite)
+# Create scheduled task (AtLogon, Interactive, Highest, indefinite)
 run_ps(
     "$action = New-ScheduledTaskAction -Execute 'powershell.exe' "
     "-Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Scripts\\transition-throttle.ps1'; "
-    "$trigger = New-ScheduledTaskTrigger -AtLogon -User 'myuser'; "
-    "$principal = New-ScheduledTaskPrincipal -UserId 'myuser' -LogonType Interactive -RunLevel Highest; "
+    f"$trigger = New-ScheduledTaskTrigger -AtLogon -User '{WINDOWS_USER}'; "
+    f"$principal = New-ScheduledTaskPrincipal -UserId '{WINDOWS_USER}' -LogonType Interactive -RunLevel Highest; "
     "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) "
     "-RestartCount 3 -RestartInterval ([TimeSpan]::FromMinutes(1)) -AllowStartIfOnBatteries; "
     "Unregister-ScheduledTask -TaskName 'OW2 Transition Throttle' -Confirm:$false -EA SilentlyContinue; "

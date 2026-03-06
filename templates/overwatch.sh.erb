@@ -1,7 +1,7 @@
 #!/bin/bash
 # overwatch — GPU passthrough VM lifecycle manager (v2)
 #
-# Manages myhost through: host-mode ↔ vfio ↔ vm-running
+# Manages the host through: host-mode ↔ vfio ↔ vm-running
 #
 # Subcommands:
 #   start   Full lifecycle: prepare host → start VM → wait for shutdown → restore host
@@ -58,6 +58,7 @@ SHUTDOWN_SIGNAL_PORT=<%= @shutdown_signal_port %>   # UDP port for Windows shutd
 TRANSITION_SIGNAL_PORT=<%= @transition_signal_port %> # UDP port for transition throttle events
 LOCK_FILE="/run/overwatch.lock"
 VM_NAME="<%= @vm_name %>"
+TARGET_USER="<%= @target_user %>"
 
 # --- Parse arguments ---
 
@@ -685,8 +686,8 @@ ensure_services_running() {
     fi
 
     # Ensure GDM monitors.xml is correct
-    if [ -f /home/myuser/.config/monitors.xml ]; then
-        cp /home/myuser/.config/monitors.xml /var/lib/gdm3/.config/monitors.xml
+    if [ -f "/home/${TARGET_USER}/.config/monitors.xml" ]; then
+        cp "/home/${TARGET_USER}/.config/monitors.xml" /var/lib/gdm3/.config/monitors.xml
         chown gdm:gdm /var/lib/gdm3/.config/monitors.xml
     fi
 }

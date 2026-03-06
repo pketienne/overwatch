@@ -4,7 +4,8 @@
 # Cookbook:: overwatch
 # Attributes:: default
 #
-# System-level only. All values are myhost-specific defaults.
+# Generic defaults. Override machine-specific values (SMBIOS, network,
+# user, etc.) in a policyfile or node attributes.
 #
 
 # =============================================================================
@@ -29,10 +30,10 @@ default['overwatch']['vm_disk_size'] = '200G'
 default['overwatch']['vm_app_disk_path'] = '/var/lib/libvirt/images/overwatch-app.qcow2'
 default['overwatch']['vm_ram_kib']   = 50_331_648 # 48 GB
 default['overwatch']['vm_vcpus']     = 6
-default['overwatch']['vm_mac']       = 'aa:bb:cc:dd:ee:ff'
+default['overwatch']['vm_mac']       = '' # must override
 
 # =============================================================================
-# GPU / PCI
+# GPU / PCI (topology-specific — override per host)
 # =============================================================================
 
 default['overwatch']['gpu']       = '0000:03:00.0'
@@ -56,20 +57,20 @@ default['overwatch']['vcpu_pins'] = [
 ]
 
 # =============================================================================
-# SMBIOS (match real host hardware for anti-cheat)
+# SMBIOS (match real host hardware for anti-cheat — override per host)
 # =============================================================================
 
 default['overwatch']['smbios'] = {
   'bios_vendor'        => 'American Megatrends International, LLC.',
-  'bios_version'       => '1.A80',
-  'bios_date'          => '01/08/2026',
-  'sys_manufacturer'   => 'Micro-Star International Co., Ltd.',
-  'sys_product'        => 'MS-7E49',
+  'bios_version'       => '',
+  'bios_date'          => '',
+  'sys_manufacturer'   => '',
+  'sys_product'        => '',
   'sys_version'        => '1.0',
-  'board_manufacturer' => 'Micro-Star International Co., Ltd.',
-  'board_product'      => 'MPG X870E CARBON WIFI (MS-7E49)',
+  'board_manufacturer' => '',
+  'board_product'      => '',
   'board_version'      => '1.0',
-  'board_serial'       => 'XXXXXXXXXX',
+  'board_serial'       => 'To be filled by O.E.M.',
   'sys_serial'         => 'To be filled by O.E.M.',
 }
 
@@ -77,12 +78,7 @@ default['overwatch']['smbios'] = {
 # USB Devices (passthrough to VM)
 # =============================================================================
 
-default['overwatch']['usb_devices'] = [
-  { 'vid' => '0x29ea', 'pid' => '0x0102', 'name' => 'Kinesis Advantage2' },
-  { 'vid' => '0x1532', 'pid' => '0x00a7', 'name' => 'Razer Naga V2 Pro' },
-  { 'vid' => '0x1532', 'pid' => '0x0c05', 'name' => 'Razer Strider Chroma' },
-  { 'vid' => '0x1038', 'pid' => '0x1294', 'name' => 'SteelSeries Arctis Pro Wireless' },
-]
+default['overwatch']['usb_devices'] = []
 
 # Tartarus V2: attached at runtime by overwatch.sh after Synapse is running
 default['overwatch']['tartarus'] = { 'vid' => '0x1532', 'pid' => '0x022b' }
@@ -92,8 +88,9 @@ default['overwatch']['tartarus'] = { 'vid' => '0x1532', 'pid' => '0x022b' }
 # =============================================================================
 
 default['overwatch']['bridge_name']         = 'br0'
-default['overwatch']['physical_interface']  = 'enp8s0'
-default['overwatch']['host_ip']             = '192.168.0.100'
+default['overwatch']['physical_interface']  = '' # must override
+default['overwatch']['host_ip']             = '' # must override
+default['overwatch']['vm_ip']               = '' # must override
 default['overwatch']['shutdown_signal_port'] = 9147
 default['overwatch']['transition_signal_port'] = 9148
 
@@ -101,8 +98,9 @@ default['overwatch']['transition_signal_port'] = 9148
 # Host / User
 # =============================================================================
 
-default['overwatch']['target_user'] = 'myuser'
-default['overwatch']['virtio_iso']  = '/home/myuser/Downloads/virtio-win.iso'
+default['overwatch']['target_user']  = '' # must override (Linux username)
+default['overwatch']['windows_user'] = '' # must override (Windows guest username)
+default['overwatch']['virtio_iso']   = '' # path to virtio-win.iso (optional)
 
 # =============================================================================
 # GRUB Kernel Parameters

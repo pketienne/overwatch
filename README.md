@@ -1,8 +1,7 @@
 # Overwatch
 
-GPU-passthrough Windows 11 gaming VM on myhost. AMD RX 7900 XTX
-passed through to a Windows guest for Overwatch 2 with Ricochet
-anti-cheat.
+GPU-passthrough Windows 11 gaming VM. AMD RX 7900 XTX passed through
+to a Windows guest for Overwatch 2 with Ricochet anti-cheat.
 
 This repo is a [Cinc](https://cinc.sh) (open-source Chef) cookbook that
 configures the host (GRUB, VFIO, network bridge, libvirt VM definition,
@@ -25,7 +24,7 @@ cinc-solo --version
 ## Run the cookbook
 
 The cookbook depends on `symmetra_core` and `libvirt` cookbooks from the
-[symmetra](https://github.com/pketienne/symmetra) repo. To converge:
+symmetra repo. To converge:
 
 ```bash
 # From the symmetra repo (has all dependency cookbooks)
@@ -66,7 +65,7 @@ sudo cinc-client -z -o 'recipe[overwatch::uninstall]'
 
 ## Post-converge workflow
 
-After the cookbook converges on myhost:
+After the cookbook converges:
 
 1. **Reboot** to pick up GRUB IOMMU and VFIO module changes.
 2. **Apply netplan** (if first run): `sudo netplan apply`

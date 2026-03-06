@@ -4,6 +4,8 @@
 # Sourced by overwatch.sh. All functions here run as background jobs during
 # the VM lifecycle. They rely on log() and guest_run_ps() from the main script.
 
+VM_IP="<%= @vm_ip %>"
+WINDOWS_USER="<%= @windows_user %>"
 
 # --- Network monitor (2s poll, background) ---
 # Tag: NET_HOST
@@ -99,7 +101,7 @@ monitor_network() {
 
 # --- Packet capture rolling ring buffer ---
 # Tag: PCAP
-# Captures all traffic on br0 filtered to VM IP 192.168.0.101.
+# Captures all traffic on br0 filtered to VM IP ${VM_IP}.
 # Rolling ring buffer: 20 files × 50MB = 1GB max.
 # Stored in /var/log/overwatch/. Requires tcpdump (apt install tcpdump).
 #
@@ -107,9 +109,9 @@ monitor_network() {
 # /var/log/overwatch/snapshots/YYYYMMDD-HHMMSS/ preserving pre-event data.
 #
 # Retrieve for Wireshark:
-#   scp -r myhost:/var/log/overwatch/snapshots/YYYYMMDD-HHMMSS /tmp/
-#   scp myhost:/var/log/overwatch/overwatch.pcap* /tmp/  # live ring
-# Wireshark filter: udp && ip.addr == 192.168.0.101
+#   scp -r host:/var/log/overwatch/snapshots/YYYYMMDD-HHMMSS /tmp/
+#   scp host:/var/log/overwatch/overwatch.pcap* /tmp/  # live ring
+# Wireshark filter: udp && ip.addr == ${VM_IP}
 
 monitor_pcap() {
     if ! command -v tcpdump &>/dev/null; then
@@ -127,12 +129,12 @@ monitor_pcap() {
     chown root:tcpdump "$pcap_dir" 2>/dev/null || true
     chmod 775 "$pcap_dir" 2>/dev/null || true
 
-    log "PCAP: starting rolling capture on br0 (host=192.168.0.101, 20×50MB=1GB, dir=$pcap_dir)"
+    log "PCAP: starting rolling capture on br0 (host=${VM_IP}, 20×50MB=1GB, dir=$pcap_dir)"
     exec tcpdump -i br0 -n \
         -w "${pcap_dir}/overwatch.pcap" \
         -C 50 \
         -W 20 \
-        "host 192.168.0.101" \
+        "host ${VM_IP}" \
         2>/dev/null
     log "PCAP: tcpdump exited"
 }
@@ -275,11 +277,11 @@ log_guest_diagnostics() {
     log "BOOT_DIAG: ${out:-none}"
 
     # Battle.net BNPresence errors (disconnect indicator)
-    out=$(guest_run_ps '$d="C:\Users\myuser\AppData\Local\Battle.net\Logs"; $l=Get-ChildItem $d -Filter "battle.net-*.log" -EA SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if($l){$c=(Select-String -Path $l.FullName -Pattern "BNPresence.*err=1|ERROR_INTERNAL" -EA SilentlyContinue | Measure-Object).Count; "$($l.Name): $c errors"} else {"no logs"}' 15) || true
+    out=$(guest_run_ps '$d="C:\Users\${WINDOWS_USER}\AppData\Local\Battle.net\Logs"; $l=Get-ChildItem $d -Filter "battle.net-*.log" -EA SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if($l){$c=(Select-String -Path $l.FullName -Pattern "BNPresence.*err=1|ERROR_INTERNAL" -EA SilentlyContinue | Measure-Object).Count; "$($l.Name): $c errors"} else {"no logs"}' 15) || true
     log "BNET_GUEST: ${out:-none}"
 
     # OW2 in-game settings (detect silent resets after updates)
-    out=$(guest_run_ps '$f="C:\Users\myuser\Documents\Overwatch\Settings\Settings_v0.ini"; if(Test-Path $f){$c=Get-Content $f; $rs=($c|Select-String "RenderScale").ToString().Split("=")[1].Trim(); $fc=($c|Select-String "FrameRateCap").ToString().Split("=")[1].Trim(); $wm=($c|Select-String "WindowMode").ToString().Split("=")[1].Trim(); "RenderScale=$rs FrameRateCap=$fc WindowMode=$wm"} else {"settings file not found"}' 15) || true
+    out=$(guest_run_ps '$f="C:\Users\${WINDOWS_USER}\Documents\Overwatch\Settings\Settings_v0.ini"; if(Test-Path $f){$c=Get-Content $f; $rs=($c|Select-String "RenderScale").ToString().Split("=")[1].Trim(); $fc=($c|Select-String "FrameRateCap").ToString().Split("=")[1].Trim(); $wm=($c|Select-String "WindowMode").ToString().Split("=")[1].Trim(); "RenderScale=$rs FrameRateCap=$fc WindowMode=$wm"} else {"settings file not found"}' 15) || true
     log "OW2_SETTINGS: ${out:-none}"
 }
 

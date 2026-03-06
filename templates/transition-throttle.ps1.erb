@@ -8,13 +8,13 @@
 # State machine: IDLE → STEADY → LOADING → THROTTLED → STEADY
 #
 # Deploy: C:\Scripts\transition-throttle.ps1
-# Task Scheduler: AtLogon, user myuser, Interactive, Highest, indefinite
+# Task Scheduler: AtLogon, Interactive, Highest, indefinite
 #
 # Setup (run once from host via guest agent or on guest as admin):
 #   $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
 #     -Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\Scripts\transition-throttle.ps1'
-#   $trigger = New-ScheduledTaskTrigger -AtLogon -User 'myuser'
-#   $principal = New-ScheduledTaskPrincipal -UserId 'myuser' -LogonType Interactive -RunLevel Highest
+#   $trigger = New-ScheduledTaskTrigger -AtLogon -User '<username>'
+#   $principal = New-ScheduledTaskPrincipal -UserId '<username>' -LogonType Interactive -RunLevel Highest
 #   $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
 #     -RestartCount 3 -RestartInterval ([TimeSpan]::FromMinutes(1)) -AllowStartIfOnBatteries
 #   Register-ScheduledTask -TaskName 'OW2 Transition Throttle' -Action $action `
@@ -39,7 +39,7 @@ $GPU_LOW           = 15      # Below this = loading screen
 $LOADING_HOLD_MS   = 1000    # GPU must stay below GPU_LOW for this long before throttle
 $FULL_AFFINITY     = 0x3F    # All 6 vCPUs (bits 0-5)
 $THROTTLE_AFFINITY = 0x3     # vCPUs 0-1 only
-$HOST_IP           = '192.168.0.100'
+$HOST_IP           = '<%= @host_ip %>'
 $HOST_PORT         = 9148
 
 # --- Single-instance mutex ---

@@ -4,7 +4,7 @@
 # Cookbook:: overwatch
 # Recipe:: default
 #
-# GPU-passthrough Windows gaming VM: host setup + VM definition on myhost.
+# GPU-passthrough Windows gaming VM: host setup + VM definition.
 #
 # @chef.scope System: /usr/local/bin/overwatch, /etc/systemd/system/overwatch.service,
 #   VM definition, GRUB, netplan, udev, modprobe, sudoers
