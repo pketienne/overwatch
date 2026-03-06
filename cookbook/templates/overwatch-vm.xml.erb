@@ -1,0 +1,202 @@
+<%
+  # Parse PCI address "0000:03:00.0" into hex components
+  def pci_parts(addr)
+    parts = addr.split(/[:.]/)
+    {
+      domain: "0x#{parts[0]}",
+      bus:    "0x#{parts[1]}",
+      slot:   "0x#{parts[2]}",
+      func:   "0x#{parts[3]}",
+    }
+  end
+
+  gpu_pci   = pci_parts(@gpu)
+  audio_pci = pci_parts(@gpu_audio)
+-%>
+<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+  <name><%= @vm_name %></name>
+  <memory unit='KiB'><%= @vm_ram_kib %></memory>
+  <currentMemory unit='KiB'><%= @vm_ram_kib %></currentMemory>
+  <memoryBacking>
+    <hugepages/>
+  </memoryBacking>
+  <vcpu placement='static'><%= @vm_vcpus %></vcpu>
+  <iothreads>1</iothreads>
+  <!-- CPU pinning: three-layer isolation for VFIO gaming performance.
+       vCPUs pinned to dedicated cores; QEMU emulator + IO thread on host cores.
+       overwatch.sh confines host OS (AllowedCPUs) and IRQs to host cores at
+       runtime. Effect: vCPU cores run only guest threads during gameplay. -->
+  <cputune>
+<% @vcpu_pins.each do |pin| -%>
+    <vcpupin vcpu='<%= pin['vcpu'] %>' cpuset='<%= pin['cpuset'] %>'/>
+<% end -%>
+    <emulatorpin cpuset='<%= @emulator_cpuset %>'/>
+    <iothreadpin iothread='1' cpuset='<%= @emulator_cpuset %>'/>
+  </cputune>
+  <!-- Anti-cheat vector 4: SMBIOS — real motherboard strings -->
+  <sysinfo type='smbios'>
+    <bios>
+      <entry name='vendor'><%= @smbios['bios_vendor'] %></entry>
+      <entry name='version'><%= @smbios['bios_version'] %></entry>
+      <entry name='date'><%= @smbios['bios_date'] %></entry>
+    </bios>
+    <system>
+      <entry name='manufacturer'><%= @smbios['sys_manufacturer'] %></entry>
+      <entry name='product'><%= @smbios['sys_product'] %></entry>
+      <entry name='version'><%= @smbios['sys_version'] %></entry>
+      <entry name='serial'><%= @smbios['sys_serial'] %></entry>
+    </system>
+    <baseBoard>
+      <entry name='manufacturer'><%= @smbios['board_manufacturer'] %></entry>
+      <entry name='product'><%= @smbios['board_product'] %></entry>
+      <entry name='version'><%= @smbios['board_version'] %></entry>
+      <entry name='serial'><%= @smbios['board_serial'] %></entry>
+    </baseBoard>
+  </sysinfo>
+  <smbios mode='sysinfo'/>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='pc-q35-8.2'>hvm</type>
+    <firmware>
+      <feature enabled='yes' name='enrolled-keys'/>
+      <feature enabled='yes' name='secure-boot'/>
+    </firmware>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <!-- Anti-cheat vector 2: Hyper-V vendor ID — spoof to avoid "Microsoft Hv" -->
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <spinlocks state='on' retries='8191'/>
+      <vpindex state='on'/>
+      <runtime state='on'/>
+      <synic state='on'/>
+      <stimer state='on'/>
+      <frequencies state='on'/>
+      <vendor_id state='on' value='AuthenticAMD'/>
+    </hyperv>
+    <!-- Anti-cheat vector 1: Hide KVM CPUID leaf 0x40000000 -->
+    <kvm>
+      <hidden state='on'/>
+    </kvm>
+    <vmport state='off'/>
+    <ioapic driver='kvm'/>
+  </features>
+  <!-- Anti-cheat vector 3: Real CPU model via host-passthrough -->
+  <cpu mode='host-passthrough' check='none' migratable='off'>
+    <topology sockets='1' dies='1' cores='<%= @vm_vcpus %>' threads='1'/>
+    <feature policy='require' name='topoext'/>
+  </cpu>
+  <clock offset='localtime'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+    <timer name='hypervclock' present='yes'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <!-- VirtIO SCSI controller (looks like real SCSI, avoids "Red Hat virtio" fingerprint) -->
+    <controller type='scsi' model='virtio-scsi'>
+      <driver iothread='1'/>
+    </controller>
+
+    <!-- Disk: Windows -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' discard='unmap'/>
+      <source file='<%= @vm_disk_path %>'/>
+      <serial>S6XWNG0R401283</serial>
+      <target dev='sda' bus='scsi'/>
+    </disk>
+
+    <!-- Disk: Game (Overwatch 2) -->
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' discard='unmap'/>
+      <source file='<%= @vm_app_disk_path %>'/>
+      <serial>S6XWNG0R401297</serial>
+      <target dev='sdb' bus='scsi'/>
+    </disk>
+
+<% if File.exist?(@virtio_iso) -%>
+    <!-- VirtIO drivers ISO (install-only, removed after Windows setup) -->
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='<%= @virtio_iso %>'/>
+      <target dev='sdc' bus='sata'/>
+      <readonly/>
+    </disk>
+<% end -%>
+
+    <!-- Anti-cheat vector 5: Real GPU via VFIO passthrough -->
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source>
+        <address domain='<%= gpu_pci[:domain] %>' bus='<%= gpu_pci[:bus] %>' slot='<%= gpu_pci[:slot] %>' function='<%= gpu_pci[:func] %>'/>
+      </source>
+      <rom bar='off' file='<%= @gpu_rom %>'/>
+    </hostdev>
+
+    <!-- GPU passthrough: Audio -->
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source>
+        <address domain='<%= audio_pci[:domain] %>' bus='<%= audio_pci[:bus] %>' slot='<%= audio_pci[:slot] %>' function='<%= audio_pci[:func] %>'/>
+      </source>
+    </hostdev>
+
+    <!-- Network: bridge, Realtek OUI to avoid QEMU 52:54:00 fingerprint -->
+    <interface type='bridge'>
+      <source bridge='br0'/>
+      <mac address='<%= @vm_mac %>'/>
+      <model type='virtio'/>
+    </interface>
+
+    <!-- xHCI with 8 ports (keyboard, mouse, strider, tartarus (deferred),
+         steelseries, and spares) -->
+    <controller type='usb' model='qemu-xhci' ports='8'/>
+
+<% @usb_devices.each do |dev| -%>
+    <!-- USB passthrough: <%= dev['name'] %> -->
+    <hostdev mode='subsystem' type='usb' managed='yes'>
+      <source>
+        <vendor id='<%= dev['vid'] %>'/>
+        <product id='<%= dev['pid'] %>'/>
+      </source>
+    </hostdev>
+
+<% end -%>
+    <!-- Razer Tartarus V2 keypad: NOT here — attached by overwatch.sh after
+         Synapse is running so profiles apply on hot-plug (<%= @tartarus['vid'] %>:<%= @tartarus['pid'] %>) -->
+
+    <!-- QEMU guest agent channel -->
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+
+    <!-- Console -->
+    <serial type='pty'>
+      <target port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+  </devices>
+
+  <qemu:commandline>
+    <!-- SMBIOS Type 0: BIOS -->
+    <qemu:arg value='-smbios'/>
+    <qemu:arg value='type=0,vendor=<%= @smbios['bios_vendor'].gsub(',', ',,') %>,version=<%= @smbios['bios_version'] %>,date=<%= @smbios['bios_date'] %>'/>
+    <!-- SMBIOS Type 1: System -->
+    <qemu:arg value='-smbios'/>
+    <qemu:arg value='type=1,manufacturer=<%= @smbios['sys_manufacturer'].gsub(',', ',,') %>,product=<%= @smbios['sys_product'] %>,version=<%= @smbios['sys_version'] %>,serial=<%= @smbios['sys_serial'] %>,family=Default string'/>
+    <!-- SMBIOS Type 2: Baseboard -->
+    <qemu:arg value='-smbios'/>
+    <qemu:arg value='type=2,manufacturer=<%= @smbios['board_manufacturer'].gsub(',', ',,') %>,product=<%= @smbios['board_product'] %>,version=<%= @smbios['board_version'] %>,serial=<%= @smbios['board_serial'] %>'/>
+    <!-- SCSI disk vendor/product (replaces "QEMU QEMU HARDDISK") -->
+    <qemu:arg value='-global'/>
+    <qemu:arg value='scsi-hd.vendor=Samsung'/>
+    <qemu:arg value='-global'/>
+    <qemu:arg value='scsi-hd.product=SSD 870 EVO 1TB'/>
+  </qemu:commandline>
+</domain>

@@ -1,70 +1,99 @@
 # Overwatch VM
 
-GPU-passthrough Windows gaming VM on a Linux host (myhost). AMD RX 7900 XTX passed through to a Windows 11 guest for Overwatch 2 with Ricochet anti-cheat.
+GPU-passthrough Windows 11 gaming VM on myhost. AMD RX 7900 XTX passed through to a Windows guest for Overwatch 2 with Ricochet anti-cheat.
 
-## VM Lifecycle
+The `cookbook/` directory contains the Cinc (Chef) cookbook that configures the host and deploys all scripts. See [`cookbook/README.md`](cookbook/README.md) for cookbook internals (templates, anti-cheat design, GRUB parameters, post-converge workflow).
 
-**ALWAYS use systemd:**
-- Start: `sudo systemctl start overwatch`
-- Stop: `sudo systemctl stop overwatch`
+## Install Cinc
 
-**NEVER use these commands directly:**
-- `virsh destroy overwatch` — yanks GPU mid-operation, corrupts GPU state
-- `virsh reboot overwatch` — causes grey screen / TDR with GPU passthrough
-- `virsh shutdown overwatch` — bypasses the overwatch.sh cleanup sequence
-- `sudo overwatch start` — must go through systemd for proper lifecycle
-- `virsh undefine --nvram overwatch` — destroys UEFI NVRAM (Secure Boot keys, boot entries). To update VM XML, use `virsh define <file>` which overwrites in place preserving NVRAM.
+[Cinc](https://cinc.sh) is an open-source distribution of Chef. Install it on the target host:
 
-**Before modifying VM XML or NVRAM, back up the NVRAM file:**
-`sudo cp /var/lib/libvirt/qemu/nvram/overwatch_VARS.fd /var/lib/libvirt/qemu/nvram/overwatch_VARS.fd.bak`
+```bash
+curl -L https://omnitruck.cinc.sh/install.sh | sudo bash
+```
 
-**There are no qcow2 disk snapshots or backups.** Take a snapshot before risky guest operations:
-`sudo virsh snapshot-create-as overwatch --name <label> --disk-only`
+Verify:
 
-**Host and guest configurations must stay in sync.** A change that prevents the VM from booting normally risks a host kernel panic — a failed boot leaves the GPU held via vfio with no functioning guest to release it.
+```bash
+cinc-client --version
+cinc-solo --version
+```
 
-**When the guest appears frozen (black/grey screen, unresponsive peripherals):**
-1. Wait 30-60 seconds — AMD GPU driver initialization can take this long. It often recovers on its own.
-2. Check if the guest agent responds: `sudo virsh qemu-agent-command overwatch '{"execute":"guest-ping"}'`
-3. If the agent responds, Windows is running — the display may just be slow to initialize. Wait longer.
-4. Only if truly unrecoverable, use `sudo systemctl stop overwatch` — it handles destroy + GPU cleanup.
-5. A host reboot is only needed if the host kernel panics (green screen). Do not preemptively reboot the host.
+## Run the cookbook
 
-**After a forced stop**, check `sudo dmesg | grep -i amdgpu` for errors before starting the VM again.
+The cookbook depends on `symmetra_core` and `libvirt` cookbooks from the [symmetra](https://github.com/pketienne/symmetra) repo. To converge:
 
-## Guest Agent
+```bash
+# From the symmetra repo (has all dependency cookbooks)
+cd ~/Projects/symmetra/master
 
-The guest agent runs as SYSTEM. Commands launched via `guest-exec` run in the SYSTEM session, NOT the interactive user session:
-- GUI applications launched via guest agent are invisible to the logged-in user
-- Registry paths like `HKCU:` map to SYSTEM's hive, not the user's
-- Use full SID paths for per-user registry: `HKU\S-1-5-21-XXXXXXXXXX-XXXXXXXXXX-XXXXXXXXXX-1000`
+# Run just the overwatch cookbook
+sudo cinc-client -z -o 'recipe[overwatch::default]'
+```
 
-## Anti-Cheat (Ricochet)
+To uninstall:
 
-Five detection vectors must remain addressed (see cookbook VM XML template for details):
-1. KVM hidden (`<kvm><hidden state='on'/>`)
-2. Hyper-V vendor ID spoofed
-3. CPU host-passthrough
-4. SMBIOS strings (real motherboard)
-5. GPU passthrough (real hardware)
+```bash
+sudo cinc-client -z -o 'recipe[overwatch::uninstall]'
+```
 
-**Windows Defender and Tamper Protection must ALWAYS remain ON.**
+To run compliance checks:
 
-## Deployment
+```bash
+cinc-auditor exec cookbooks/overwatch/compliance/profiles/default
+```
 
-All deployable artifacts (scripts, VM XML, systemd units, guest configs) live in the
-[overwatch cookbook](../symmetra/master/cookbooks/overwatch/) and are deployed via Chef converge.
-This repo contains only documentation.
+## VM lifecycle
 
-| Cookbook path | Deploys to | Purpose |
-| --- | --- | --- |
-| `templates/overwatch.sh.erb` | `/usr/local/bin/overwatch` | Lifecycle manager (GPU bind/unbind, start/stop) |
-| `templates/overwatch.service.erb` | `/etc/systemd/system/overwatch.service` | systemd unit |
-| `templates/overwatch-vm.xml.erb` | libvirt VM definition | Anti-cheat, GPU passthrough, SMBIOS |
-| `templates/setup-guest.sh.erb` | `/usr/local/share/overwatch/setup-guest.sh` | Guest registry/config (run manually post-install) |
-| `files/transition-throttle.ps1` | VM `C:\Scripts\` (via setup-guest.sh) | OW2 transition freeze mitigation |
-| `files/autounattend.xml` | `/usr/local/share/overwatch/` | Unattended Windows install |
+**Always use systemd:**
+
+```bash
+sudo systemctl start overwatch
+sudo systemctl stop overwatch
+```
+
+**Never use these directly:**
+
+- `virsh destroy` — yanks GPU mid-operation, corrupts GPU state
+- `virsh reboot` — causes grey screen / TDR with GPU passthrough
+- `virsh shutdown` — bypasses cleanup sequence
+- `sudo overwatch start` — must go through systemd
+- `virsh undefine --nvram` — destroys UEFI NVRAM. To update XML, use `virsh define <file>`.
+
+**Before modifying VM XML or NVRAM:**
+
+```bash
+sudo cp /var/lib/libvirt/qemu/nvram/overwatch_VARS.fd{,.bak}
+```
+
+**Before risky guest operations** (no qcow2 snapshots exist by default):
+
+```bash
+sudo virsh snapshot-create-as overwatch --name <label> --disk-only
+```
+
+Host and guest configs must stay in sync. A change that prevents the VM from booting risks a host kernel panic — a failed boot leaves the GPU held via vfio with no guest to release it.
+
+## Frozen guest recovery
+
+1. Wait 30-60s — AMD GPU driver init can take this long. It often recovers.
+2. Check guest agent: `sudo virsh qemu-agent-command overwatch '{"execute":"guest-ping"}'`
+3. If the agent responds, Windows is running — wait longer for the display.
+4. Only if unrecoverable: `sudo systemctl stop overwatch`
+5. Host reboot only needed on kernel panic (green screen).
+6. After forced stop, check `sudo dmesg | grep -i amdgpu` before restarting.
+
+## Guest agent
+
+The agent runs as SYSTEM. Commands via `guest-exec` run in the SYSTEM session, not the interactive user session:
+
+- GUI apps are invisible to the logged-in user
+- `HKCU:` maps to SYSTEM's hive, not the user's
+- Use `HKU\<SID>` for per-user registry access
+
+Windows Defender and Tamper Protection must always remain on.
 
 ## Reference
 
-- `reference.md` — Known problems, debugging checklists, stress tests
+- [`reference.md`](reference.md) — Known problems, debugging checklists, stress tests
+- [`cookbook/README.md`](cookbook/README.md) — Cookbook design, templates, GRUB parameters

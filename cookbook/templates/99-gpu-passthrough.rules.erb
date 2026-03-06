@@ -1,0 +1,4 @@
+# Prevent the passthrough GPU from being assigned to any seat.
+# This stops GDM from spawning a greeter on it.
+# The render node remains available for compute (ollama).
+ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ENV{ID_PATH}=="pci-<%= @gpu %>", ENV{ID_SEAT}=""

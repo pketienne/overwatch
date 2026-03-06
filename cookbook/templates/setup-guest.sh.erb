@@ -1,0 +1,1073 @@
+#!/bin/bash
+# setup-guest — Configure Windows guest via QEMU guest agent
+# Automates guest-side configuration after Windows install + VirtIO drivers.
+# Phase 9 (Windows/driver/game install) remains manual.
+#
+# Prerequisite: VM running with guest agent installed and active.
+#
+# Subcommands:
+#   all          Run all guest configuration steps in order
+#   power        Power plan, ASPM, sleep, AMD driver PM, TDR timeout, WU driver block
+#   hda-audio    Remove AMD HD Audio driver + block reinstall via policy
+#   defender     Defender exclusions (C:\ and D:\ drives)
+#   telemetry    Disable AMD telemetry (AUEPMaster)
+#   display      Auto HDR off, Game Bar off, toast off, MPO off, HAGS off
+#   onedrive     Remove OneDrive (per-machine + per-user)
+#   suggestions  Disable Windows suggestion toasts (ContentDeliveryManager)
+#   shutdown     Install shutdown signal script and scheduled task
+#   transition   Deploy transition-throttle.ps1 and scheduled task
+#   synapse      Synapse delayed start (prevents windows on boot)
+#   verify       Query all settings and report current vs expected
+#   boot-timing  Show boot timing log from guest
+#
+# Usage: setup-guest [--dry-run] [--verbose] <subcommand>
+#
+# Managed by Chef (overwatch cookbook). Do not edit directly.
+
+set -uo pipefail
+
+# --- Constants ---
+
+VM_NAME="<%= @vm_name %>"
+HOST_IP="<%= @host_ip %>"
+SHUTDOWN_SIGNAL_PORT=<%= @shutdown_signal_port %>
+TRANSITION_SIGNAL_PORT=<%= @transition_signal_port %>
+
+# --- Parse arguments ---
+
+DRY_RUN=false
+VERBOSE=false
+while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=true ;;
+        --verbose) VERBOSE=true ;;
+    esac
+    shift
+done
+CMD="${1:-}"
+
+# --- Logging ---
+
+log() { echo "$(date '+%H:%M:%S') $*"; }
+
+on_error() {
+    local lineno=$1 cmd=$2 rc=$3
+    log "ERROR: command failed at line $lineno: '$cmd' (exit code $rc)"
+}
+trap 'on_error $LINENO "$BASH_COMMAND" $?' ERR
+
+if [ "$VERBOSE" = true ]; then
+    export PS4='+${BASH_SOURCE}:${LINENO}: '
+    set -x
+    log "Verbose mode enabled"
+fi
+
+# --- Usage ---
+
+if [ -z "$CMD" ]; then
+    echo "Usage: setup-guest [--dry-run] [--verbose] <subcommand>"
+    echo ""
+    echo "  all          Run all guest configuration steps"
+    echo "  power        Power plan, ASPM, sleep, AMD driver PM, TDR, WU block"
+    echo "  hda-audio    Remove AMD HD Audio driver + block reinstall"
+    echo "  defender     Defender exclusions (C:\\ and D:\\ drives)"
+    echo "  telemetry    Disable AMD telemetry (AUEPMaster)"
+    echo "  display      Auto HDR off, Game Bar off, MPO off, HAGS off"
+    echo "  shutdown     Shutdown signal script and scheduled task"
+    echo "  transition   Transition throttle script and scheduled task"
+    echo "  synapse      Synapse delayed start (prevents windows on boot)"
+    echo "  verify       Query all settings and report status"
+    echo "  boot-timing  Show boot timing log from guest"
+    exit 1
+fi
+
+# --- Guest agent check ---
+
+ensure_guest_agent() {
+    local vm_state
+    vm_state=$(virsh domstate "$VM_NAME" 2>/dev/null) || true
+    if ! echo "$vm_state" | grep -q "running"; then
+        log "ERROR: VM '$VM_NAME' is not running (state: ${vm_state:-unknown})"
+        log "Start the VM and ensure the guest agent is installed before running this script"
+        return 1
+    fi
+    if ! virsh qemu-agent-command "$VM_NAME" '{"execute":"guest-ping"}' &>/dev/null; then
+        log "ERROR: Guest agent not responding on VM '$VM_NAME'"
+        log "Ensure qemu-guest-agent is installed and running in the Windows guest"
+        return 1
+    fi
+    log "Guest agent: connected"
+}
+
+# --- Python helper ---
+
+# Run Python code with guest agent helpers pre-loaded.
+# Phase-specific code is read from stdin (use a quoted heredoc).
+# The preamble provides: log(), qga(), run_ps(), guest_file_write(),
+# USER_SID, AMD_DRIVER_IDX, AMD_DRIVER_REGPATH, DISPLAY_CLASS,
+# plus VM, HOST_IP, SHUTDOWN_PORT, TRANSITION_PORT, DRY_RUN variables.
+guest_python() {
+    local tmpf
+    tmpf=$(mktemp /tmp/setup-guest-XXXXXX.py)
+    local dry_run_val
+    [ "$DRY_RUN" = true ] && dry_run_val="True" || dry_run_val="False"
+
+    # Preamble: variables (bash-substituted)
+    cat > "$tmpf" <<ENDVARS
+import subprocess, json, base64, time, sys, datetime
+
+VM = "${VM_NAME}"
+HOST_IP = "${HOST_IP}"
+SHUTDOWN_PORT = ${SHUTDOWN_SIGNAL_PORT}
+TRANSITION_PORT = ${TRANSITION_SIGNAL_PORT}
+DRY_RUN = ${dry_run_val}
+ENDVARS
+
+    # Preamble: helpers (no bash substitution)
+    cat >> "$tmpf" << 'ENDHELPERS'
+
+def log(msg):
+    ts = datetime.datetime.now().strftime('%H:%M:%S')
+    print(f"{ts}   {msg}", flush=True)
+
+def qga(payload):
+    try:
+        r = subprocess.run(
+            ["virsh", "qemu-agent-command", VM, json.dumps(payload)],
+            capture_output=True, text=True, timeout=10)
+        return json.loads(r.stdout) if r.returncode == 0 else None
+    except Exception:
+        return None
+
+def run_ps(cmd):
+    """Execute PowerShell command on guest, return stdout."""
+    result = qga({"execute": "guest-exec", "arguments": {
+        "path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "arg": ["-Command", cmd],
+        "capture-output": True}})
+    if not result:
+        return ""
+    pid = result["return"]["pid"]
+    time.sleep(5)
+    status = qga({"execute": "guest-exec-status", "arguments": {"pid": pid}})
+    if not status:
+        return ""
+    r = status["return"]
+    if not r.get("exited"):
+        time.sleep(10)
+        status = qga({"execute": "guest-exec-status", "arguments": {"pid": pid}})
+        if status:
+            r = status["return"]
+    if r.get("out-data"):
+        return base64.b64decode(r["out-data"]).decode().strip()
+    return ""
+
+def guest_file_write(path, content):
+    """Write a file on the guest via guest-file-* API."""
+    result = qga({"execute": "guest-file-open", "arguments": {
+        "path": path, "mode": "wb"}})
+    if not result:
+        log(f"ERROR: Could not open {path} for writing")
+        return False
+    handle = result["return"]
+    if isinstance(content, str):
+        content = content.encode("utf-8")
+    encoded = base64.b64encode(content).decode()
+    qga({"execute": "guest-file-write", "arguments": {
+        "handle": handle, "buf-b64": encoded}})
+    qga({"execute": "guest-file-flush", "arguments": {"handle": handle}})
+    qga({"execute": "guest-file-close", "arguments": {"handle": handle}})
+    return True
+
+def get_user_sid():
+    """Get the logged-in user's SID for HKU registry access."""
+    out = run_ps(
+        "$p = Get-CimInstance Win32_UserProfile "
+        "| Where-Object { -not $_.Special -and $_.Loaded } "
+        "| Select-Object -First 1; "
+        "if($p){ $p.SID } else { 'NONE' }"
+    )
+    if not out or out == "NONE":
+        return None
+    return out.strip()
+
+def get_amd_driver_idx():
+    """Find AMD GPU registry index under display class."""
+    display_class = r"HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+    out = run_ps(
+        "$base = '" + display_class + "'; "
+        "for($i=0; $i -le 9; $i++){ "
+        "  $path = \"$base\\$('{0:D4}' -f $i)\"; "
+        "  $desc = (Get-ItemProperty -Path $path -Name DriverDesc -EA SilentlyContinue).DriverDesc; "
+        "  if($desc -like '*AMD*' -or $desc -like '*Radeon*'){ "
+        "    Write-Output('{0:D4}' -f $i); break "
+        "  } "
+        "}"
+    )
+    if not out:
+        return None, None
+    idx = out.strip()
+    return idx, display_class + "\\" + idx
+
+USER_SID = get_user_sid()
+AMD_DRIVER_IDX, AMD_DRIVER_REGPATH = get_amd_driver_idx()
+DISPLAY_CLASS = r"HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+
+ENDHELPERS
+
+    # Append phase-specific code from stdin
+    cat >> "$tmpf"
+
+    python3 "$tmpf"
+    local rc=$?
+    rm -f "$tmpf"
+    return $rc
+}
+
+# ============================================================
+# Power settings & AMD driver tuning
+# ============================================================
+
+ensure_power_settings() {
+    log "=== Power settings ==="
+    guest_python << 'PYEOF'
+# --- Power plan ---
+out = run_ps("powercfg /getactivescheme")
+hp_guid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+if hp_guid in (out or ""):
+    log("Power plan: already High Performance")
+else:
+    log(f"Power plan: {out or 'unknown'}")
+    if DRY_RUN:
+        log("[dry-run] Would switch to High Performance")
+    else:
+        run_ps("powercfg /setactive " + hp_guid)
+        log("Switched to High Performance")
+
+# --- Power settings (idempotent, always apply) ---
+if DRY_RUN:
+    log("[dry-run] Would apply power settings (ASPM off, USB suspend off, no sleep)")
+else:
+    run_ps(
+        # PCI Express ASPM off
+        "powercfg /setacvalueindex SCHEME_CURRENT 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0; "
+        "powercfg /setdcvalueindex SCHEME_CURRENT 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0; "
+        # USB selective suspend off
+        "powercfg /setacvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0; "
+        "powercfg /setdcvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0; "
+        # Display timeout never
+        "powercfg /setacvalueindex SCHEME_CURRENT 7516b95f-f776-4464-8c53-06167f40cc99 3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e 0; "
+        "powercfg /setdcvalueindex SCHEME_CURRENT 7516b95f-f776-4464-8c53-06167f40cc99 3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e 0; "
+        # Sleep never
+        "powercfg /setacvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 29f6c1db-86da-48c5-9fdb-f2b67b1f44da 0; "
+        "powercfg /setdcvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 29f6c1db-86da-48c5-9fdb-f2b67b1f44da 0; "
+        # Hybrid sleep off
+        "powercfg /setacvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 94ac6d29-73ce-41a6-809f-6363ba21b47e 0; "
+        "powercfg /setdcvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 94ac6d29-73ce-41a6-809f-6363ba21b47e 0; "
+        # Apply
+        "powercfg /setactive SCHEME_CURRENT"
+    )
+    log("Power settings applied (ASPM off, USB suspend off, display/sleep never, hybrid sleep off)")
+
+# --- AMD driver internal power management ---
+if not AMD_DRIVER_IDX:
+    log("WARNING: AMD GPU driver not found in registry — skipping driver PM settings")
+else:
+    regpath = AMD_DRIVER_REGPATH
+    log(f"AMD GPU driver at registry index {AMD_DRIVER_IDX}")
+
+    # Check current values ('N/A' distinguishes missing from 0)
+    vals = run_ps(
+        "$p = '" + regpath + "'; "
+        "$names = 'EnableUlps','PP_SclkDeepSleepDisable','DisableDrmdmaPowerOff'; "
+        "$vals = foreach($n in $names){ "
+        "  $v = (Get-ItemProperty -Path $p -Name $n -EA SilentlyContinue).$n; "
+        "  if($null -eq $v){ 'N/A' } else { $v } "
+        "}; "
+        "$vals -join '|'"
+    )
+    parts = (vals or "N/A|N/A|N/A").split("|")
+    ulps, sclk, drm = parts[0].strip(), parts[1].strip(), parts[2].strip()
+
+    if ulps == "0" and sclk == "1" and drm == "1":
+        log("AMD driver PM: already configured (EnableUlps=0, SclkDeepSleep=1, DrmdmaPowerOff=1)")
+    else:
+        log(f"AMD driver PM: EnableUlps={ulps}, SclkDeepSleep={sclk}, DrmdmaPowerOff={drm}")
+        if DRY_RUN:
+            log("[dry-run] Would set EnableUlps=0, PP_SclkDeepSleepDisable=1, DisableDrmdmaPowerOff=1")
+        else:
+            # New-ItemProperty -Force creates or overwrites with explicit DWORD type
+            run_ps(
+                "$p = '" + regpath + "'; "
+                "New-ItemProperty -Path $p -Name EnableUlps -Value 0 -PropertyType DWord -Force | Out-Null; "
+                "New-ItemProperty -Path $p -Name PP_SclkDeepSleepDisable -Value 1 -PropertyType DWord -Force | Out-Null; "
+                "New-ItemProperty -Path $p -Name DisableDrmdmaPowerOff -Value 1 -PropertyType DWord -Force | Out-Null"
+            )
+            # Verify write
+            check = run_ps(
+                "$p = '" + regpath + "'; "
+                "$names = 'EnableUlps','PP_SclkDeepSleepDisable','DisableDrmdmaPowerOff'; "
+                "$vals = foreach($n in $names){ "
+                "  $v = (Get-ItemProperty -Path $p -Name $n -EA SilentlyContinue).$n; "
+                "  if($null -eq $v){ 'N/A' } else { $v } "
+                "}; "
+                "$vals -join '|'"
+            )
+            cparts = (check or "").split("|")
+            if len(cparts) == 3 and cparts[0].strip() == "0" and cparts[1].strip() == "1" and cparts[2].strip() == "1":
+                log("AMD driver PM disabled (verified)")
+            else:
+                log(f"WARNING: AMD driver PM write may have failed — read back: {check}")
+
+# --- TDR timeout (60s) ---
+# Converts hard TDR crashes to recoverable stalls. GPU hangs but Windows
+# recovers within 60s window; OW2 no longer loses DirectX device.
+tdr_out = run_ps(
+    "$gd = 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers'; "
+    "$d = (Get-ItemProperty -Path $gd -Name TdrDelay -EA SilentlyContinue).TdrDelay; "
+    "$dd = (Get-ItemProperty -Path $gd -Name TdrDdiDelay -EA SilentlyContinue).TdrDdiDelay; "
+    "Write-Output \"$d|$dd\""
+)
+tdr_parts = (tdr_out or "|").split("|")
+tdr_delay = tdr_parts[0].strip()
+tdr_ddi = tdr_parts[1].strip() if len(tdr_parts) > 1 else ""
+
+if tdr_delay == "60" and tdr_ddi == "60":
+    log("TDR timeout: already 60s")
+else:
+    log(f"TDR timeout: TdrDelay={tdr_delay or 'default'}, TdrDdiDelay={tdr_ddi or 'default'}")
+    if DRY_RUN:
+        log("[dry-run] Would set TdrDelay=60, TdrDdiDelay=60")
+    else:
+        run_ps(
+            "$gd = 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers'; "
+            "New-ItemProperty -Path $gd -Name TdrDelay -Value 60 -PropertyType DWord -Force | Out-Null; "
+            "New-ItemProperty -Path $gd -Name TdrDdiDelay -Value 60 -PropertyType DWord -Force | Out-Null"
+        )
+        log("TDR timeout set to 60s (reboot required)")
+
+# --- Block Windows Update from replacing AMD driver ---
+wu_out = run_ps(
+    "$wuPath = 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate'; "
+    "if(-not (Test-Path $wuPath)){ 'MISSING' } "
+    "else { (Get-ItemProperty -Path $wuPath -Name ExcludeWUDriversInQualityUpdate -EA SilentlyContinue).ExcludeWUDriversInQualityUpdate }"
+)
+if (wu_out or "").strip() == "1":
+    log("WU driver block: already enabled")
+else:
+    log(f"WU driver block: {wu_out or 'not set'}")
+    if DRY_RUN:
+        log("[dry-run] Would set ExcludeWUDriversInQualityUpdate=1")
+    else:
+        run_ps(
+            "$wuPath = 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate'; "
+            "if(-not (Test-Path $wuPath)){ New-Item -Path $wuPath -Force | Out-Null }; "
+            "New-ItemProperty -Path $wuPath -Name ExcludeWUDriversInQualityUpdate -Value 1 -PropertyType DWord -Force | Out-Null"
+        )
+        log("WU driver block enabled (ExcludeWUDriversInQualityUpdate=1)")
+PYEOF
+}
+
+# ============================================================
+# GPU HDA Audio driver removal + policy block
+# ============================================================
+
+ensure_hda_audio() {
+    log "=== HDA Audio ==="
+    guest_python << 'PYEOF'
+import re
+
+# Check if AtiHDAudioService driver is in the driver store
+out = run_ps(
+    "$drv = pnputil /enum-drivers /class MEDIA 2>&1 "
+    "| Select-String 'oem.*\\.inf|AtiHDAudio|Provider.*AMD'; "
+    "if($drv){ ($drv | ForEach-Object { $_.Line.Trim() }) -join '|' } "
+    "else { 'NOT_FOUND' }"
+)
+
+if "NOT_FOUND" in (out or "NOT_FOUND"):
+    log("AtiHDAudioService not in driver store — already removed")
+else:
+    log(f"Found AMD HD Audio driver: {out}")
+    oem_match = re.search(r'(oem\d+\.inf)', out or "", re.IGNORECASE)
+    if not oem_match:
+        log("WARNING: Could not extract OEM inf name — manual removal required")
+        sys.exit(1)
+
+    oem_inf = oem_match.group(1)
+    log(f"Driver package: {oem_inf}")
+
+    # Find the device instance ID
+    dev_out = run_ps(
+        "$dev = Get-PnpDevice -EA SilentlyContinue "
+        "| Where-Object InstanceId -like 'HDAUDIO*VEN_1002*' "
+        "| Select-Object -First 1; "
+        "if($dev){ $dev.InstanceId } else { 'NONE' }"
+    )
+
+    if DRY_RUN:
+        if dev_out and dev_out != "NONE":
+            log(f"[dry-run] Would remove device {dev_out}")
+        log(f"[dry-run] Would delete driver {oem_inf} from store")
+    else:
+        if dev_out and dev_out != "NONE":
+            run_ps('pnputil /remove-device "' + dev_out + '"')
+            log(f"Removed device {dev_out}")
+        run_ps("pnputil /delete-driver " + oem_inf + " /force")
+        log(f"Deleted {oem_inf} from driver store")
+
+# --- Device Installation Restrictions policy ---
+# Block reinstall of AMD HD Audio by hardware ID. Survives AMD driver updates.
+restrict_path = r"HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions"
+deny_path = restrict_path + r"\DenyDeviceIDs"
+
+restrict_out = run_ps(
+    "$rp = '" + restrict_path + "'; "
+    "$dp = '" + deny_path + "'; "
+    "$deny = (Get-ItemProperty -Path $rp -Name DenyDeviceIDs -EA SilentlyContinue).DenyDeviceIDs; "
+    "$retro = (Get-ItemProperty -Path $rp -Name DenyDeviceIDsRetroactive -EA SilentlyContinue).DenyDeviceIDsRetroactive; "
+    "$id1 = (Get-ItemProperty -Path $dp -Name 1 -EA SilentlyContinue).1; "
+    "$id2 = (Get-ItemProperty -Path $dp -Name 2 -EA SilentlyContinue).2; "
+    "Write-Output \"$deny|$retro|$id1|$id2\""
+)
+rparts = (restrict_out or "|||").split("|")
+deny_val = rparts[0].strip()
+retro_val = rparts[1].strip()
+id1_val = rparts[2].strip()
+id2_val = rparts[3].strip() if len(rparts) > 3 else ""
+
+hda_id = r"HDAUDIO\FUNC_01&VEN_1002&DEV_AA01"
+pci_id = r"PCI\VEN_1002&DEV_AB30"
+
+if deny_val == "1" and retro_val == "1" and hda_id in id1_val and pci_id in id2_val:
+    log("Device Installation Restrictions: already configured")
+else:
+    log(f"Device Installation Restrictions: DenyDeviceIDs={deny_val}, Retroactive={retro_val}")
+    if DRY_RUN:
+        log("[dry-run] Would set Device Installation Restrictions to block AMD HD Audio")
+    else:
+        run_ps(
+            "$rp = '" + restrict_path + "'; "
+            "$dp = '" + deny_path + "'; "
+            "New-Item -Path $dp -Force | Out-Null; "
+            "New-ItemProperty -Path $rp -Name DenyDeviceIDs -Value 1 -PropertyType DWord -Force | Out-Null; "
+            "New-ItemProperty -Path $rp -Name DenyDeviceIDsRetroactive -Value 1 -PropertyType DWord -Force | Out-Null; "
+            "New-ItemProperty -Path $dp -Name 1 -Value '" + hda_id + "' -PropertyType String -Force | Out-Null; "
+            "New-ItemProperty -Path $dp -Name 2 -Value '" + pci_id + "' -PropertyType String -Force | Out-Null"
+        )
+        log("Device Installation Restrictions set (blocks HDAUDIO + PCI AMD audio devices)")
+PYEOF
+}
+
+# ============================================================
+# Defender exclusions
+# ============================================================
+
+ensure_defender_exclusions() {
+    log "=== Defender exclusions ==="
+    guest_python << 'PYEOF'
+# Check current path exclusions
+out = run_ps(
+    "$prefs = Get-MpPreference -EA SilentlyContinue; "
+    "$paths = @($prefs.ExclusionPath) -join '|'; "
+    "Write-Output \"PATHS:$paths\""
+)
+
+current_paths = ""
+for line in (out or "").splitlines():
+    if line.startswith("PATHS:"):
+        current_paths = line[6:]
+
+# Drive-level exclusions reduce boot contention with AMD driver init
+needed_paths = [r"C:\\", r"D:\\"]
+
+missing_paths = [p for p in needed_paths if p not in current_paths]
+
+if not missing_paths:
+    log("Defender exclusions: C:\\ and D:\\ already excluded")
+else:
+    log(f"Missing drive exclusions: {missing_paths}")
+    if DRY_RUN:
+        log(f"[dry-run] Would add {len(missing_paths)} drive exclusions")
+    else:
+        for p in missing_paths:
+            run_ps("Add-MpPreference -ExclusionPath '" + p + "'")
+        log("Defender exclusions applied (C:\\ and D:\\)")
+PYEOF
+}
+
+# ============================================================
+# AMD telemetry
+# ============================================================
+
+ensure_telemetry_disabled() {
+    log "=== AMD telemetry ==="
+    guest_python << 'PYEOF'
+# Check AUEPLauncher service
+svc_out = run_ps(
+    "$svc = Get-Service AUEPLauncher -EA SilentlyContinue; "
+    "if($svc){ Write-Output \"$($svc.StartType)|$($svc.Status)\" } "
+    "else { Write-Output 'NOT_FOUND' }"
+)
+
+# Check StartAUEP task
+task_out = run_ps(
+    "$t = Get-ScheduledTask -TaskName StartAUEP -EA SilentlyContinue; "
+    "if($t){ $t.State } else { 'NOT_FOUND' }"
+)
+
+svc_ok = "NOT_FOUND" in (svc_out or "") or "Disabled" in (svc_out or "")
+task_ok = "NOT_FOUND" in (task_out or "") or "Disabled" in (task_out or "")
+
+if svc_ok and task_ok:
+    log(f"AMD telemetry: already disabled (service={svc_out}, task={task_out})")
+else:
+    log(f"AMD telemetry: service={svc_out}, task={task_out}")
+    if DRY_RUN:
+        log("[dry-run] Would disable AUEPLauncher service and StartAUEP task")
+    else:
+        run_ps(
+            "sc.exe config AUEPLauncher start=disabled; "
+            "Stop-Service AUEPLauncher -EA SilentlyContinue; "
+            "Disable-ScheduledTask -TaskName StartAUEP -EA SilentlyContinue"
+        )
+        log("AMD telemetry disabled (AUEPLauncher service + StartAUEP task)")
+PYEOF
+}
+
+# ============================================================
+# Display configuration
+# ============================================================
+
+ensure_display_config() {
+    log "=== Display configuration ==="
+    guest_python << 'PYEOF'
+if not USER_SID:
+    log("WARNING: No loaded user profile — skipping per-user display settings")
+else:
+    sid = USER_SID
+    log(f"User SID: {sid}")
+
+    if DRY_RUN:
+        log("[dry-run] Would configure: Auto HDR off, SwapEffectUpgrade off, Game Bar off, toast off, MPO off, HAGS off")
+    else:
+        # Auto HDR off + SwapEffectUpgrade off (per-user)
+        run_ps(
+            "$dxPath = \"Registry::HKEY_USERS\\" + sid + "\\SOFTWARE\\Microsoft\\DirectX\\UserGpuPreferences\"; "
+            "if(-not (Test-Path $dxPath)){ New-Item -Path $dxPath -Force | Out-Null }; "
+            "Set-ItemProperty -Path $dxPath -Name 'DirectXUserGlobalSettings' "
+            "-Value 'SwapEffectUpgradeEnable=0;AutoHDREnable=0;' -Type String"
+        )
+        log("Auto HDR: disabled, SwapEffectUpgrade: disabled")
+
+        # Game Bar off (machine policy + per-user)
+        run_ps(
+            "New-Item -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR' -Force | Out-Null; "
+            "Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\GameDVR' -Name 'AllowGameDVR' -Value 0 -Type DWord; "
+            "$gbPath = \"Registry::HKEY_USERS\\" + sid + "\\SOFTWARE\\Microsoft\\GameBar\"; "
+            "if(-not (Test-Path $gbPath)){ New-Item -Path $gbPath -Force | Out-Null }; "
+            "Set-ItemProperty -Path $gbPath -Name 'UseNexusForGameBarEnabled' -Value 0 -Type DWord; "
+            "$gdvrPath = \"Registry::HKEY_USERS\\" + sid + "\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR\"; "
+            "if(-not (Test-Path $gdvrPath)){ New-Item -Path $gdvrPath -Force | Out-Null }; "
+            "Set-ItemProperty -Path $gdvrPath -Name 'AppCaptureEnabled' -Value 0 -Type DWord"
+        )
+        log("Game Bar: disabled (policy + user settings)")
+
+        # Auto HDR toast notification off (per-user)
+        run_ps(
+            "$toastPath = \"Registry::HKEY_USERS\\" + sid + "\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion"
+            "\\Notifications\\Settings\\Windows.SystemToast.Graphics.AutoHDR\"; "
+            "New-Item -Path $toastPath -Force | Out-Null; "
+            "Set-ItemProperty -Path $toastPath -Name 'Enabled' -Value 0 -Type DWord"
+        )
+        log("Auto HDR toast: disabled")
+
+        # MPO (Multiplane Overlay) off — reduces TDR under VFIO passthrough
+        run_ps(
+            "New-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\Dwm' "
+            "-Name OverlayTestMode -Value 5 -PropertyType DWord -Force | Out-Null"
+        )
+        log("MPO: disabled (OverlayTestMode=5)")
+
+        # HAGS (Hardware Accelerated GPU Scheduling) off — reduces scheduling pressure
+        run_ps(
+            "New-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers' "
+            "-Name HwSchMode -Value 1 -PropertyType DWord -Force | Out-Null"
+        )
+        log("HAGS: disabled (HwSchMode=1)")
+PYEOF
+}
+
+# ============================================================
+# OneDrive removal
+# ============================================================
+
+ensure_onedrive_removed() {
+    log "=== OneDrive removal ==="
+    guest_python << 'PYEOF'
+# Check if OneDrive is installed (per-machine or per-user)
+out = run_ps(
+    "$paths = @("
+    "  'C:\\Windows\\System32\\OneDriveSetup.exe',"
+    "  \"$env:LOCALAPPDATA\\Microsoft\\OneDrive\\OneDrive.exe\""
+    "); "
+    "$found = $paths | Where-Object { Test-Path $_ }; "
+    "if($found){ 'INSTALLED' } else { 'REMOVED' }"
+)
+
+if "REMOVED" in (out or "REMOVED"):
+    log("OneDrive: already removed")
+else:
+    log("OneDrive: installed — removing")
+    if DRY_RUN:
+        log("[dry-run] Would uninstall OneDrive and clean up scheduled tasks/Run key")
+    else:
+        # Stop OneDrive process
+        run_ps("Stop-Process -Name OneDrive -Force -EA SilentlyContinue")
+
+        # Run the per-machine uninstaller (covers SYSTEM session)
+        run_ps(
+            "if(Test-Path 'C:\\Windows\\System32\\OneDriveSetup.exe'){ "
+            "  Start-Process 'C:\\Windows\\System32\\OneDriveSetup.exe' "
+            "    -ArgumentList '/uninstall' -Wait "
+            "}"
+        )
+
+        # Run the per-user uninstaller
+        run_ps(
+            "$setup = \"$env:LOCALAPPDATA\\Microsoft\\OneDrive\\OneDriveSetup.exe\"; "
+            "if(Test-Path $setup){ Start-Process $setup -ArgumentList '/uninstall' -Wait }"
+        )
+
+        # Clean up per-user Run key (runs as SYSTEM, so check all loaded user hives)
+        run_ps(
+            "Get-ChildItem 'Registry::HKEY_USERS' | ForEach-Object { "
+            "  $runPath = \"Registry::$($_.Name)\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\"; "
+            "  if(Test-Path $runPath){ "
+            "    Remove-ItemProperty -Path $runPath -Name OneDrive -EA SilentlyContinue "
+            "  } "
+            "}"
+        )
+
+        # Disable OneDrive scheduled tasks
+        run_ps(
+            "Get-ScheduledTask -TaskPath '\\' | "
+            "  Where-Object { $_.TaskName -like '*OneDrive*' } | "
+            "  ForEach-Object { "
+            "    Disable-ScheduledTask -TaskName $_.TaskName -EA SilentlyContinue; "
+            "    Write-Output \"Disabled task: $($_.TaskName)\" "
+            "  }"
+        )
+
+        log("OneDrive: uninstalled and cleaned up")
+PYEOF
+}
+
+# ============================================================
+# Windows suggestion toasts
+# ============================================================
+
+ensure_suggestions_disabled() {
+    log "=== Windows suggestions ==="
+    guest_python << 'PYEOF'
+if not USER_SID:
+    log("WARNING: No loaded user profile — skipping per-user suggestion settings")
+else:
+    sid = USER_SID
+    cdm_path = f"Registry::HKEY_USERS\\{sid}\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\ContentDeliveryManager"
+
+    # Check current state
+    out = run_ps(
+        "$cdm = '" + cdm_path + "'; "
+        "$keys = @('SubscribedContent-310093Enabled','SubscribedContent-338389Enabled',"
+        "'SubscribedContent-338393Enabled','SilentInstalledAppsEnabled'); "
+        "$vals = foreach($k in $keys){ "
+        "  $v = (Get-ItemProperty -Path $cdm -Name $k -EA SilentlyContinue).$k; "
+        "  if($null -eq $v){ 'N/A' } else { $v } "
+        "}; "
+        "$vals -join '|'"
+    )
+    parts = (out or "N/A|N/A|N/A|N/A").split("|")
+    all_zero = all(p.strip() == "0" for p in parts)
+
+    if all_zero:
+        log("Windows suggestions: already disabled")
+    else:
+        log(f"Windows suggestions: {out}")
+        if DRY_RUN:
+            log("[dry-run] Would disable ContentDeliveryManager suggestion keys")
+        else:
+            run_ps(
+                "$cdm = '" + cdm_path + "'; "
+                "Set-ItemProperty $cdm -Name SubscribedContent-310093Enabled -Value 0 -EA SilentlyContinue; "
+                "Set-ItemProperty $cdm -Name SubscribedContent-338389Enabled -Value 0 -EA SilentlyContinue; "
+                "Set-ItemProperty $cdm -Name SubscribedContent-338393Enabled -Value 0 -EA SilentlyContinue; "
+                "Set-ItemProperty $cdm -Name SilentInstalledAppsEnabled -Value 0 -EA SilentlyContinue"
+            )
+            log("Windows suggestions: disabled")
+PYEOF
+}
+
+# ============================================================
+# Shutdown signal
+# ============================================================
+
+ensure_shutdown_signal() {
+    log "=== Shutdown signal ==="
+    guest_python << 'PYEOF'
+# Ensure C:\Scripts exists
+run_ps(r"New-Item -ItemType Directory -Path 'C:\Scripts' -Force | Out-Null")
+
+# Check if script already exists
+out = run_ps(
+    r"if(Test-Path 'C:\Scripts\overwatch.ps1'){ 'EXISTS' } else { 'MISSING' }"
+)
+script_exists = "EXISTS" in (out or "")
+
+# Check if scheduled task exists
+task_out = run_ps(
+    "$t = Get-ScheduledTask -TaskName 'Overwatch Shutdown Signal' -EA SilentlyContinue; "
+    "if($t){ $t.State } else { 'MISSING' }"
+)
+task_exists = "MISSING" not in (task_out or "MISSING")
+
+if script_exists and task_exists:
+    log(f"Shutdown signal: already configured (task={task_out})")
+    sys.exit(0)
+
+if DRY_RUN:
+    if not script_exists:
+        log("[dry-run] Would write C:\\Scripts\\overwatch.ps1")
+    if not task_exists:
+        log("[dry-run] Would create 'Overwatch Shutdown Signal' scheduled task")
+    sys.exit(0)
+
+# Write overwatch.ps1 via guest-file API
+ps1_content = (
+    "$udp = New-Object Net.Sockets.UdpClient\r\n"
+    "$udp.Connect('" + HOST_IP + "', " + str(SHUTDOWN_PORT) + ")\r\n"
+    '$bytes = [Text.Encoding]::ASCII.GetBytes(\'shutdown\')\r\n'
+    "[void]$udp.Send($bytes, $bytes.Length)\r\n"
+    "$udp.Close()\r\n"
+)
+if guest_file_write(r"C:\Scripts\overwatch.ps1", ps1_content):
+    log("Wrote overwatch.ps1")
+else:
+    log("ERROR: Failed to write overwatch.ps1")
+    sys.exit(1)
+
+# Create scheduled task via CIM event trigger
+run_ps(
+    "$trigger = New-CimInstance -CimClass (Get-CimClass MSFT_TaskEventTrigger "
+    "-Namespace 'Root/Microsoft/Windows/TaskScheduler') -ClientOnly; "
+    "$trigger.Subscription = '<QueryList><Query Id=\"0\" Path=\"System\">"
+    "<Select Path=\"System\">*[System[Provider[@Name=\"User32\"] and EventID=1074]]"
+    "</Select></Query></QueryList>'; "
+    "$trigger.Enabled = $true; "
+    "$action = New-ScheduledTaskAction -Execute 'powershell.exe' "
+    "-Argument '-NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Scripts\\overwatch.ps1'; "
+    "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds 30); "
+    "$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest; "
+    "Unregister-ScheduledTask -TaskName 'Overwatch Shutdown Signal' -Confirm:$false -EA SilentlyContinue; "
+    "Register-ScheduledTask -TaskName 'Overwatch Shutdown Signal' -Action $action "
+    "-Trigger $trigger -Settings $settings -Principal $principal"
+)
+log("Created 'Overwatch Shutdown Signal' scheduled task (Event ID 1074)")
+PYEOF
+}
+
+# ============================================================
+# Transition throttle
+# ============================================================
+
+ensure_transition_throttle() {
+    log "=== Transition throttle ==="
+    guest_python << 'PYEOF'
+# Ensure C:\Scripts exists
+run_ps(r"New-Item -ItemType Directory -Path 'C:\Scripts' -Force | Out-Null")
+
+# Check if script exists
+out = run_ps(
+    r"if(Test-Path 'C:\Scripts\transition-throttle.ps1'){ 'EXISTS' } else { 'MISSING' }"
+)
+script_exists = "EXISTS" in (out or "")
+
+# Check if scheduled task exists
+task_out = run_ps(
+    "$t = Get-ScheduledTask -TaskName 'OW2 Transition Throttle' -EA SilentlyContinue; "
+    "if($t){ $t.State } else { 'MISSING' }"
+)
+task_exists = "MISSING" not in (task_out or "MISSING")
+
+if script_exists and task_exists:
+    log(f"Transition throttle: already configured (task={task_out})")
+    sys.exit(0)
+
+if DRY_RUN:
+    if not script_exists:
+        log("[dry-run] Would write C:\\Scripts\\transition-throttle.ps1")
+    if not task_exists:
+        log("[dry-run] Would create 'OW2 Transition Throttle' scheduled task")
+    sys.exit(0)
+
+# Read the script from the host deployment path
+import os
+script_path = "/usr/local/share/overwatch/transition-throttle.ps1"
+if not os.path.exists(script_path):
+    log(f"ERROR: {script_path} not found on host — deploy it first")
+    sys.exit(1)
+
+with open(script_path, "rb") as f:
+    script_content = f.read()
+
+if guest_file_write(r"C:\Scripts\transition-throttle.ps1", script_content):
+    log("Wrote transition-throttle.ps1")
+else:
+    log("ERROR: Failed to write transition-throttle.ps1")
+    sys.exit(1)
+
+# Create scheduled task (AtLogon, user myuser, Interactive, Highest, indefinite)
+run_ps(
+    "$action = New-ScheduledTaskAction -Execute 'powershell.exe' "
+    "-Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Scripts\\transition-throttle.ps1'; "
+    "$trigger = New-ScheduledTaskTrigger -AtLogon -User 'myuser'; "
+    "$principal = New-ScheduledTaskPrincipal -UserId 'myuser' -LogonType Interactive -RunLevel Highest; "
+    "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) "
+    "-RestartCount 3 -RestartInterval ([TimeSpan]::FromMinutes(1)) -AllowStartIfOnBatteries; "
+    "Unregister-ScheduledTask -TaskName 'OW2 Transition Throttle' -Confirm:$false -EA SilentlyContinue; "
+    "Register-ScheduledTask -TaskName 'OW2 Transition Throttle' -Action $action "
+    "-Trigger $trigger -Principal $principal -Settings $settings"
+)
+log("Created 'OW2 Transition Throttle' scheduled task (AtLogon)")
+PYEOF
+}
+
+# ============================================================
+# Synapse: Delayed start (prevents windows on boot)
+# Tartarus profile detection is handled by host-side deferred
+# USB attach in overwatch.sh (attach_tartarus_deferred).
+# ============================================================
+
+ensure_synapse_delayed() {
+    log "=== Synapse: Delayed start ==="
+    guest_python << 'PYEOF'
+if not USER_SID:
+    log("WARNING: No loaded user profile — skipping per-user Synapse configuration")
+else:
+    sid = USER_SID
+    log(f"User SID: {sid}")
+
+    # --- 1. Disable RazerAppEngine Run key via StartupApproved ---
+    # This is the same mechanism Task Manager's Startup tab uses.
+    # Synapse recreates the Run key on launch, but StartupApproved keeps it disabled.
+    approved_path = f"HKU\\{sid}\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"
+
+    # Check current state: 03 prefix = disabled, 02 prefix = enabled
+    approved_out = run_ps(
+        'reg query "' + approved_path + '" /v RazerAppEngine 2>&1'
+    )
+
+    approved_ok = False
+    if approved_out and "RazerAppEngine" in approved_out:
+        # Value exists — check if it starts with 03 (disabled)
+        if "0300000000000000" in approved_out.replace(" ", ""):
+            approved_ok = True
+            log("StartupApproved\\Run\\RazerAppEngine: already disabled")
+        else:
+            log(f"StartupApproved\\Run\\RazerAppEngine: exists but not disabled")
+    else:
+        log("StartupApproved\\Run\\RazerAppEngine: not set")
+
+    if not approved_ok:
+        if DRY_RUN:
+            log("[dry-run] Would disable RazerAppEngine in StartupApproved\\Run")
+        else:
+            run_ps(
+                'reg add "' + approved_path + '" '
+                '/v RazerAppEngine /t REG_BINARY '
+                '/d 030000000000000000000000 /f'
+            )
+            # Verify
+            check = run_ps(
+                'reg query "' + approved_path + '" /v RazerAppEngine 2>&1'
+            )
+            if check and "0300000000000000" in check.replace(" ", ""):
+                log("StartupApproved\\Run\\RazerAppEngine: disabled (verified)")
+            else:
+                log(f"WARNING: StartupApproved write may have failed — read back: {check}")
+
+    # --- 2. Write start-synapse.ps1 launch script ---
+    # Tartarus profile detection is handled by host-side deferred USB attach
+    # (attach_tartarus_deferred in overwatch.sh), so no kill/restart needed.
+    synapse_script = (
+        '# start-synapse.ps1 - Launch Synapse after desktop is ready\r\n'
+        '# Tartarus is attached by the host after Synapse is running,\r\n'
+        '# so Synapse applies profiles on hot-plug (no restart needed).\r\n'
+        '\r\n'
+        '# --- Timing helper ---\r\n'
+        'function Write-Timing($phase) {\r\n'
+        '    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"\r\n'
+        '    $dir = "C:\\ProgramData\\overwatch"\r\n'
+        '    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }\r\n'
+        '    Add-Content -Path "$dir\\boot-timing.log" -Value "$ts SYNAPSE $phase"\r\n'
+        '}\r\n'
+        '\r\n'
+        '$synapse = "C:\\Program Files\\Razer\\RazerAppEngine\\RazerAppEngine.exe"\r\n'
+        '$argList = "--url-params=apps=synapse,chroma-app '
+        '--launch-force-hidden=synapse,chroma-app --autoStart=1"\r\n'
+        '\r\n'
+        'Write-Timing "script-start"\r\n'
+        '\r\n'
+        '# Wait for explorer shell (interactive desktop ready)\r\n'
+        'for ($i = 0; $i -lt 30; $i++) {\r\n'
+        '    $shell = Get-Process explorer -ErrorAction SilentlyContinue '
+        '| Where-Object { $_.MainWindowHandle -ne 0 }\r\n'
+        '    if ($shell) { break }\r\n'
+        '    Start-Sleep -Seconds 1\r\n'
+        '}\r\n'
+        'Write-Timing "shell-ready"\r\n'
+        '\r\n'
+        '# Launch Synapse\r\n'
+        'Start-Process -FilePath $synapse -ArgumentList $argList -WindowStyle Minimized\r\n'
+        'Write-Timing "complete"\r\n'
+    )
+
+    run_ps(r"New-Item -ItemType Directory -Path 'C:\ProgramData\overwatch' -Force | Out-Null")
+
+    if DRY_RUN:
+        log("[dry-run] Would write C:\\ProgramData\\overwatch\\start-synapse.ps1")
+    else:
+        if guest_file_write(r"C:\ProgramData\overwatch\start-synapse.ps1", synapse_script):
+            log("Wrote start-synapse.ps1")
+        else:
+            log("ERROR: Failed to write start-synapse.ps1")
+            sys.exit(1)
+
+    # --- 3. Create RazerSynapseDelayed scheduled task ---
+    # 15s logon delay gives USB devices time to enumerate before the restart script runs.
+    task_out = run_ps(
+        "$t = Get-ScheduledTask -TaskName RazerSynapseDelayed -EA SilentlyContinue; "
+        "if($t){ $t.State } else { 'MISSING' }"
+    )
+
+    if "MISSING" not in (task_out or "MISSING"):
+        log(f"RazerSynapseDelayed task: already exists (state={task_out})")
+    else:
+        log("RazerSynapseDelayed task: not found — creating")
+        if DRY_RUN:
+            log("[dry-run] Would create RazerSynapseDelayed scheduled task (15s logon delay)")
+        else:
+            # Task runs the restart script in the user's logon session
+            task_xml = (
+                '<?xml version="1.0"?>\r\n'
+                '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\r\n'
+                '  <Triggers>\r\n'
+                '    <LogonTrigger>\r\n'
+                '      <Delay>PT15S</Delay>\r\n'
+                '      <Enabled>true</Enabled>\r\n'
+                '    </LogonTrigger>\r\n'
+                '  </Triggers>\r\n'
+                '  <Actions>\r\n'
+                '    <Exec>\r\n'
+                '      <Command>powershell.exe</Command>\r\n'
+                '      <Arguments>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden '
+                '-File C:\\ProgramData\\overwatch\\start-synapse.ps1</Arguments>\r\n'
+                '    </Exec>\r\n'
+                '  </Actions>\r\n'
+                '  <Principals>\r\n'
+                '    <Principal>\r\n'
+                '      <GroupId>S-1-5-32-545</GroupId>\r\n'
+                '      <RunLevel>LeastPrivilege</RunLevel>\r\n'
+                '    </Principal>\r\n'
+                '  </Principals>\r\n'
+                '  <Settings>\r\n'
+                '    <Enabled>true</Enabled>\r\n'
+                '    <AllowStartIfOnBatteries>true</AllowStartIfOnBatteries>\r\n'
+                '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n'
+                '  </Settings>\r\n'
+                '</Task>\r\n'
+            )
+            guest_file_write(r"C:\ProgramData\overwatch\synapse-task.xml", task_xml)
+            out = run_ps(
+                r"schtasks /Create /TN 'RazerSynapseDelayed' /XML 'C:\ProgramData\overwatch\synapse-task.xml' /F 2>&1"
+            )
+            run_ps(r"Remove-Item 'C:\ProgramData\overwatch\synapse-task.xml' -EA SilentlyContinue")
+
+            if out and "SUCCESS" in out.upper():
+                log("Created RazerSynapseDelayed scheduled task (15s logon delay)")
+            elif out and "ERROR" in out.upper():
+                log(f"WARNING: schtasks returned: {out}")
+            else:
+                log("Created RazerSynapseDelayed scheduled task")
+PYEOF
+}
+
+# ============================================================
+# Boot timing log
+# ============================================================
+
+show_boot_timing() {
+    log "=== Boot timing log ==="
+    guest_python << 'PYEOF'
+out = run_ps(
+    r"if(Test-Path 'C:\ProgramData\overwatch\boot-timing.log'){"
+    r"Get-Content 'C:\ProgramData\overwatch\boot-timing.log' -Tail 20"
+    r"} else { 'No boot-timing.log found' }"
+)
+if out:
+    for line in out.splitlines():
+        log(line)
+else:
+    log("No output from guest")
+PYEOF
+}
+
+# ============================================================
+# Verify all guest settings (dry-run of do_all)
+# ============================================================
+
+verify_guest() {
+    DRY_RUN=true
+    do_all
+}
+
+# ============================================================
+# Main dispatch
+# ============================================================
+
+do_all() {
+    ensure_power_settings
+    ensure_hda_audio
+    ensure_defender_exclusions
+    ensure_telemetry_disabled
+    ensure_display_config
+    ensure_onedrive_removed
+    ensure_suggestions_disabled
+    ensure_shutdown_signal
+    ensure_transition_throttle
+    ensure_synapse_delayed
+    log "=== Guest configuration complete ==="
+}
+
+case "$CMD" in
+    all|power|hda-audio|defender|telemetry|display|onedrive|suggestions|shutdown|transition|synapse|boot-timing)
+        ensure_guest_agent
+        ;;&
+    all)          do_all ;;
+    power)        ensure_power_settings ;;
+    hda-audio)    ensure_hda_audio ;;
+    defender)     ensure_defender_exclusions ;;
+    telemetry)    ensure_telemetry_disabled ;;
+    display)      ensure_display_config ;;
+    onedrive)     ensure_onedrive_removed ;;
+    suggestions)  ensure_suggestions_disabled ;;
+    shutdown)     ensure_shutdown_signal ;;
+    transition)   ensure_transition_throttle ;;
+    synapse)      ensure_synapse_delayed ;;
+    boot-timing)  show_boot_timing ;;
+    verify)       ensure_guest_agent && verify_guest ;;
+    *)
+        log "ERROR: Unknown subcommand '$CMD'"
+        exit 1
+        ;;
+esac

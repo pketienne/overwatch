@@ -1,0 +1,9 @@
+network:
+  version: 2
+  ethernets:
+    <%= @physical_interface %>:
+      dhcp4: false
+  bridges:
+    <%= @bridge_name %>:
+      interfaces: [<%= @physical_interface %>]
+      dhcp4: true
