@@ -179,6 +179,7 @@ action :install do
     variables(
       vm_ip: node['overwatch']['vm_ip'],
       windows_user: node['overwatch']['windows_user'],
+      pcap_snapshots: node['overwatch']['pcap_snapshots'],
     )
   end
 

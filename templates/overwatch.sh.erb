@@ -301,6 +301,18 @@ ensure_services_stopped() {
     done
     [ "$changed" = true ] && sleep 1
 
+    # Stop Volt's embedded Postgres to free hugepages for the VM.
+    # Postgres huge_pages=try grabs from the pool reserved for QEMU.
+    local voltpg_data
+    voltpg_data=$(echo /home/${TARGET_USER}/.local/share/voltcode/postgres/*/data)
+    if [ -f "$voltpg_data/postmaster.pid" ]; then
+        local pg_ctl="${voltpg_data%/data}/bin/pg_ctl"
+        log "Stopping Volt Postgres..."
+        sudo -u "$TARGET_USER" "$pg_ctl" stop -D "$voltpg_data" -m fast 2>/dev/null || true
+    else
+        log "Volt Postgres not running"
+    fi
+
     if systemctl is-active --quiet gdm 2>/dev/null; then
         log "Stopping GDM..."
         systemctl stop gdm 2>/dev/null || true
@@ -676,6 +688,15 @@ ensure_services_running() {
             systemctl start "$svc" 2>/dev/null || true
         fi
     done
+
+    # Restart Volt's embedded Postgres if it was stopped for the VM
+    local voltpg_data
+    voltpg_data=$(echo /home/${TARGET_USER}/.local/share/voltcode/postgres/*/data)
+    if [ -d "$voltpg_data" ] && [ ! -f "$voltpg_data/postmaster.pid" ]; then
+        local pg_ctl="${voltpg_data%/data}/bin/pg_ctl"
+        log "Starting Volt Postgres..."
+        sudo -u "$TARGET_USER" "$pg_ctl" start -D "$voltpg_data" -l "$voltpg_data/../pg.log" -o "-p 54329 -h 127.0.0.1" 2>/dev/null || true
+    fi
 
     if systemctl is-active --quiet gdm 2>/dev/null; then
         log "GDM already running"

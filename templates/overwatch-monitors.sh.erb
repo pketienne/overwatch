@@ -6,6 +6,7 @@
 
 VM_IP="<%= @vm_ip %>"
 WINDOWS_USER="<%= @windows_user %>"
+PCAP_SNAPSHOTS="<%= @pcap_snapshots ? 'true' : 'false' %>"
 
 # --- Network monitor (2s poll, background) ---
 # Tag: NET_HOST
@@ -74,14 +75,16 @@ monitor_network() {
                 log "NET_HOST TRAFFIC_IDLE $vnet_if rx_rate=${d_rx_pkts}pkt/2s (${IDLE_CONFIRM} consecutive low polls)"
                 # Snapshot the pcap ring buffer at the moment of disconnect.
                 # Preserves pre-event data before the ring rolls forward.
-                local snap_ts snap_dir
-                snap_ts=$(date '+%Y%m%d-%H%M%S')
-                snap_dir="/var/log/overwatch/snapshots/${snap_ts}"
-                (
-                    mkdir -p "$snap_dir" 2>/dev/null && \
-                    cp /var/log/overwatch/overwatch.pcap* "$snap_dir/" 2>/dev/null && \
-                    log "PCAP: snapshot saved → $snap_dir"
-                ) &
+                if [ "$PCAP_SNAPSHOTS" = "true" ]; then
+                    local snap_ts snap_dir
+                    snap_ts=$(date '+%Y%m%d-%H%M%S')
+                    snap_dir="/var/log/overwatch/snapshots/${snap_ts}"
+                    (
+                        mkdir -p "$snap_dir" 2>/dev/null && \
+                        cp /var/log/overwatch/overwatch.pcap* "$snap_dir/" 2>/dev/null && \
+                        log "PCAP: snapshot saved → $snap_dir"
+                    ) &
+                fi
             fi
         else
             low_ticks=0

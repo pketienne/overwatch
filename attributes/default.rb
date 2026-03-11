@@ -93,6 +93,7 @@ default['overwatch']['host_ip']             = '' # must override
 default['overwatch']['vm_ip']               = '' # must override
 default['overwatch']['shutdown_signal_port'] = 9147
 default['overwatch']['transition_signal_port'] = 9148
+default['overwatch']['pcap_snapshots']         = false
 
 # =============================================================================
 # Host / User
