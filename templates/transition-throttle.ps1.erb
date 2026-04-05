@@ -1,11 +1,14 @@
 # transition-throttle.ps1 — OW2 transition freeze mitigation
 #
-# Monitors OW2's GPU utilization via Windows GPU Engine performance counters.
-# When a loading screen is detected (GPU drops below threshold), proactively
-# throttles OW2's CPU affinity to reduce GPU command submission rate, preventing
-# the VFIO TDR burst that causes "Rendering Device Lost" / screen freezes.
+# Starts OW2 in throttled mode (2 vCPUs, BelowNormal priority) to prevent
+# the VFIO TDR burst during menu→match loading transitions. Pause/Break
+# toggles between throttled and full mode. Auto-throttles on loading screen
+# detection (GPU drops below threshold).
 #
-# State machine: IDLE → STEADY → LOADING → THROTTLED → STEADY
+# Audio cues: two beeps = full mode, one beep = throttled mode.
+#
+# State machine: IDLE → THROTTLED ⇄ STEADY (via Pause/Break)
+#                STEADY → LOADING → THROTTLED (auto, on GPU drop)
 #
 # Deploy: C:\Scripts\transition-throttle.ps1
 # Task Scheduler: AtLogon, Interactive, Highest, indefinite
@@ -20,21 +23,84 @@
 #   Register-ScheduledTask -TaskName 'OW2 Transition Throttle' -Action $action `
 #     -Trigger $trigger -Principal $principal -Settings $settings
 
-# --- Hotkey (ScrollLock toggle) ---
+# --- Hide console window immediately (no visible terminal regardless of launch method) ---
+Add-Type -Name Window -Namespace Console -MemberDefinition '
+[DllImport("Kernel32.dll")]
+public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")]
+public static extern bool ShowWindow(IntPtr hWnd, Int32 nCmdShow);
+'
+$consolePtr = [Console.Window]::GetConsoleWindow()
+[void][Console.Window]::ShowWindow($consolePtr, 0)
+
+# --- Hotkey + Audio P/Invoke ---
 Add-Type -TypeDefinition 'using System.Runtime.InteropServices;
 public class User32 {
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
 }'
-$VK_SCROLL = 0x91
+$VK_PAUSE = 0x13
 
 function Test-HotkeyPressed {
-    ([User32]::GetAsyncKeyState($VK_SCROLL) -band 0x0001) -ne 0
+    ([User32]::GetAsyncKeyState($VK_PAUSE) -band 0x0001) -ne 0
+}
+
+# --- Audio cues ---
+# Pre-generate WAV tones via C# (fast) and play async (never blocks main loop).
+# Falls back silently if audio device is unavailable.
+Add-Type -ReferencedAssemblies System.dll -TypeDefinition '
+using System;
+using System.IO;
+using System.Media;
+public static class TonePlayer {
+    public static byte[] GenerateWav(int freq, int durationMs) {
+        int sampleRate = 44100;
+        int samples = sampleRate * durationMs / 1000;
+        int dataLen = samples * 2;
+        var ms = new MemoryStream(44 + dataLen);
+        var bw = new BinaryWriter(ms);
+        bw.Write(new byte[]{0x52,0x49,0x46,0x46}); // RIFF
+        bw.Write(36 + dataLen);
+        bw.Write(new byte[]{0x57,0x41,0x56,0x45,0x66,0x6D,0x74,0x20}); // WAVEfmt
+        bw.Write(16); bw.Write((short)1); bw.Write((short)1);
+        bw.Write(sampleRate); bw.Write(sampleRate * 2);
+        bw.Write((short)2); bw.Write((short)16);
+        bw.Write(new byte[]{0x64,0x61,0x74,0x61}); // data
+        bw.Write(dataLen);
+        for (int i = 0; i < samples; i++) {
+            short val = (short)(16000 * Math.Sin(2 * Math.PI * freq * i / sampleRate));
+            bw.Write(val);
+        }
+        bw.Flush();
+        return ms.ToArray();
+    }
+    public static void PlayAsync(byte[] wav) {
+        try {
+            var ms = new MemoryStream(wav);
+            var player = new SoundPlayer(ms);
+            player.Play(); // async, non-blocking
+        } catch {}
+    }
+}'
+
+$WAV_THROTTLE = [TonePlayer]::GenerateWav(600, 150)
+$WAV_FULL_1   = [TonePlayer]::GenerateWav(800, 100)
+$WAV_FULL_2   = [TonePlayer]::GenerateWav(1000, 100)
+
+function Play-ThrottledCue {
+    try { [TonePlayer]::PlayAsync($WAV_THROTTLE) } catch {}
+}
+
+function Play-FullCue {
+    try {
+        [TonePlayer]::PlayAsync($WAV_FULL_1)
+        Start-Sleep -Milliseconds 200
+        [TonePlayer]::PlayAsync($WAV_FULL_2)
+    } catch {}
 }
 
 # --- Configuration ---
 $POLL_IDLE_MS      = 2000    # Poll interval when OW2 not running
 $POLL_ACTIVE_MS    = 500     # Poll interval during gameplay
-$THROTTLE_SECS     = 15      # Max duration of throttle before auto-restore
 $GPU_LOW           = 15      # Below this = loading screen
 $LOADING_HOLD_MS   = 1000    # GPU must stay below GPU_LOW for this long before throttle
 $FULL_AFFINITY     = 0x3F    # All 6 vCPUs (bits 0-5)
@@ -60,9 +126,9 @@ function Send-Log($msg) {
 }
 
 # --- GPU counter reader ---
-function Get-OW2GpuUtil($pid) {
+function Get-OW2GpuUtil($procId) {
     try {
-        $samples = (Get-Counter "\GPU Engine(pid_${pid}_*engtype_3D)\Utilization Percentage" -ErrorAction Stop).CounterSamples
+        $samples = (Get-Counter "\GPU Engine(pid_${procId}_*engtype_3D)\Utilization Percentage" -ErrorAction Stop).CounterSamples
         $max = ($samples | Measure-Object -Property CookedValue -Maximum).Maximum
         [math]::Round($max, 1)
     } catch {
@@ -86,6 +152,7 @@ function Set-Restore($proc) {
 }
 
 # --- Main loop ---
+$ErrorActionPreference = 'Continue'
 try {
     Send-Log 'started'
 
@@ -102,33 +169,37 @@ try {
         $ow2pid = $ow2.Id
         Send-Log "ow2_detected pid=$ow2pid"
 
-        $state = 'STEADY'
+        # Start throttled — menus and loading are safe at reduced resources
+        try { Set-Throttle $ow2 } catch { Send-Log "ERROR set_throttle: $_" }
+        try { Play-ThrottledCue } catch { Send-Log "ERROR play_cue: $_" }
+        Send-Log "throttle_on gpu=startup"
+        $state = 'THROTTLED'
+        $throttleStart = [DateTime]::UtcNow
         $loadingStart = $null
-        $throttleStart = $null
-        $manualOverride = $false
 
         try {
             # Active loop while OW2 is running
-            while (-not $ow2.HasExited) {
-                $ow2.Refresh()
-                if ($ow2.HasExited) { break }
+            while ($true) {
+                try { $ow2.Refresh(); if ($ow2.HasExited) { break } } catch { Send-Log "ERROR refresh: $_"; break }
 
-                # --- Hotkey toggle ---
+                # --- Pause/Break toggle ---
                 if (Test-HotkeyPressed) {
-                    if ($state -ne 'THROTTLED') {
-                        Send-Log 'manual_throttle_on'
-                        Set-Throttle $ow2
-                        $throttleStart = [DateTime]::UtcNow
-                        $manualOverride = $true
-                        $state = 'THROTTLED'
-                    } else {
+                    if ($state -eq 'THROTTLED') {
+                        # Throttled → Full
+                        Set-Restore $ow2
                         $elapsed = ([DateTime]::UtcNow - $throttleStart).TotalSeconds
                         $duration = [math]::Round($elapsed, 1)
-                        Set-Restore $ow2
-                        Send-Log "manual_throttle_off duration=${duration}s"
+                        Send-Log "manual_full duration=${duration}s"
+                        Play-FullCue
                         $state = 'STEADY'
                         $throttleStart = $null
-                        $manualOverride = $false
+                    } else {
+                        # Full → Throttled
+                        Set-Throttle $ow2
+                        Send-Log 'manual_throttle_on'
+                        Play-ThrottledCue
+                        $throttleStart = [DateTime]::UtcNow
+                        $state = 'THROTTLED'
                     }
                 }
 
@@ -136,6 +207,7 @@ try {
 
                 switch ($state) {
                     'STEADY' {
+                        # Auto-throttle when loading screen detected
                         if ($gpu -ge 0 -and $gpu -lt $GPU_LOW) {
                             $loadingStart = [DateTime]::UtcNow
                             $state = 'LOADING'
@@ -147,26 +219,15 @@ try {
                             $state = 'STEADY'
                             $loadingStart = $null
                         } elseif (([DateTime]::UtcNow - $loadingStart).TotalMilliseconds -ge $LOADING_HOLD_MS) {
-                            Send-Log "throttle_on gpu=$gpu"
+                            # Confirmed loading screen — throttle and wait for manual restore
                             Set-Throttle $ow2
+                            Send-Log "throttle_on gpu=$gpu"
+                            Play-ThrottledCue
                             $throttleStart = [DateTime]::UtcNow
-                            $manualOverride = $false
                             $state = 'THROTTLED'
                         }
                     }
-                    'THROTTLED' {
-                        $elapsed = ([DateTime]::UtcNow - $throttleStart).TotalSeconds
-                        if ($elapsed -ge $THROTTLE_SECS -or (-not $manualOverride -and $gpu -ge $GPU_LOW -and $elapsed -ge 3)) {
-                            # Restore after timeout or GPU stabilized (min 3s to ride out initial spike)
-                            Set-Restore $ow2
-                            $duration = [math]::Round($elapsed, 1)
-                            $tag = if ($manualOverride) { 'manual_throttle_off' } else { 'throttle_off' }
-                            Send-Log "$tag duration=${duration}s gpu=$gpu"
-                            $state = 'STEADY'
-                            $throttleStart = $null
-                            $manualOverride = $false
-                        }
-                    }
+                    # THROTTLED: no auto-restore — wait for Pause/Break
                 }
 
                 Start-Sleep -Milliseconds $POLL_ACTIVE_MS
@@ -180,6 +241,8 @@ try {
 
         Send-Log "ow2_exited pid=$ow2pid"
     }
+} catch {
+    Send-Log "FATAL: $_"
 } finally {
     Send-Log 'stopped'
     $udp.Close()
