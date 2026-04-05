@@ -375,15 +375,15 @@ monitor_guest_network() {
 
 # --- Transition throttle event listener (background, UDP on port 9148) ---
 # Tag: TRANSITION
-# Receives messages from guest-side scripts/guest/transition-throttle.ps1.
+# Receives messages from guest-side transition-throttle.ps1.
 #
 # Log format (relayed from guest):
 #   TRANSITION started                      — script started on guest
 #   TRANSITION ow2_detected pid=N           — OW2 process found
+#   TRANSITION throttle_on gpu=startup      — OW2 started in throttled mode
 #   TRANSITION throttle_on gpu=N            — loading screen, affinity reduced to 0x3
-#   TRANSITION throttle_off duration=Ns gpu=N — affinity restored to 0x3F
-#   TRANSITION manual_throttle_on           — ScrollLock hotkey engaged
-#   TRANSITION manual_throttle_off duration=Ns — ScrollLock released / auto-timeout
+#   TRANSITION manual_full duration=Ns      — Pause/Break: throttled → full
+#   TRANSITION manual_throttle_on           — Pause/Break: full → throttled
 #   TRANSITION ow2_exited pid=N             — OW2 closed
 #   TRANSITION stopped                      — script exiting
 

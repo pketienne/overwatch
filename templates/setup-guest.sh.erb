@@ -75,7 +75,7 @@ if [ -z "$CMD" ]; then
     echo "  telemetry    Disable AMD telemetry (AUEPMaster)"
     echo "  display      Auto HDR off, Game Bar off, MPO off, HAGS off"
     echo "  shutdown     Shutdown signal script and scheduled task"
-    echo "  transition   Transition throttle script and scheduled task"
+    echo "  transition   Transition throttle scripts, tray icon, and scheduled tasks"
     echo "  synapse      Synapse delayed start (prevents windows on boot)"
     echo "  verify       Query all settings and report status"
     echo "  boot-timing  Show boot timing log from guest"
@@ -785,62 +785,105 @@ PYEOF
 ensure_transition_throttle() {
     log "=== Transition throttle ==="
     guest_python << 'PYEOF'
+import os
+
 # Ensure C:\Scripts exists
 run_ps(r"New-Item -ItemType Directory -Path 'C:\Scripts' -Force | Out-Null")
 
-# Check if script exists
-out = run_ps(
-    r"if(Test-Path 'C:\Scripts\transition-throttle.ps1'){ 'EXISTS' } else { 'MISSING' }"
-)
-script_exists = "EXISTS" in (out or "")
+# --- Deploy files ---
+host_dir = "/usr/local/share/overwatch"
+files = [
+    "transition-throttle.ps1",
+    "transition-throttle-tray.ps1",
+    "transition-throttle-launcher.vbs",
+    "transition-throttle-tray-launcher.vbs",
+]
 
-# Check if scheduled task exists
+any_written = False
+for fname in files:
+    host_path = os.path.join(host_dir, fname)
+    guest_path = rf"C:\Scripts\{fname}"
+
+    if not os.path.exists(host_path):
+        log(f"ERROR: {host_path} not found on host — deploy it first")
+        sys.exit(1)
+
+    with open(host_path, "rb") as f:
+        content = f.read()
+
+    # Check if guest file matches (skip if identical)
+    existing = run_ps(
+        f"if(Test-Path '{guest_path}'){{ 'EXISTS' }} else {{ 'MISSING' }}"
+    )
+    if "EXISTS" in (existing or ""):
+        # Compare content via hash
+        import hashlib
+        local_hash = hashlib.sha256(content).hexdigest()[:16]
+        remote_hash = run_ps(
+            f"(Get-FileHash '{guest_path}' -Algorithm SHA256).Hash.Substring(0,16).ToLower()"
+        )
+        if remote_hash and local_hash == remote_hash.strip().lower():
+            log(f"{fname}: up to date")
+            continue
+
+    if DRY_RUN:
+        log(f"[dry-run] Would write {guest_path}")
+        continue
+
+    if guest_file_write(guest_path, content):
+        log(f"Wrote {fname}")
+        any_written = True
+    else:
+        log(f"ERROR: Failed to write {fname}")
+        sys.exit(1)
+
+# --- Scheduled task: OW2 Transition Throttle (engine) ---
 task_out = run_ps(
     "$t = Get-ScheduledTask -TaskName 'OW2 Transition Throttle' -EA SilentlyContinue; "
     "if($t){ $t.State } else { 'MISSING' }"
 )
-task_exists = "MISSING" not in (task_out or "MISSING")
-
-if script_exists and task_exists:
-    log(f"Transition throttle: already configured (task={task_out})")
-    sys.exit(0)
-
-if DRY_RUN:
-    if not script_exists:
-        log("[dry-run] Would write C:\\Scripts\\transition-throttle.ps1")
-    if not task_exists:
+if "MISSING" in (task_out or "MISSING"):
+    if DRY_RUN:
         log("[dry-run] Would create 'OW2 Transition Throttle' scheduled task")
-    sys.exit(0)
-
-# Read the script from the host deployment path
-import os
-script_path = "/usr/local/share/overwatch/transition-throttle.ps1"
-if not os.path.exists(script_path):
-    log(f"ERROR: {script_path} not found on host — deploy it first")
-    sys.exit(1)
-
-with open(script_path, "rb") as f:
-    script_content = f.read()
-
-if guest_file_write(r"C:\Scripts\transition-throttle.ps1", script_content):
-    log("Wrote transition-throttle.ps1")
+    else:
+        run_ps(
+            "$action = New-ScheduledTaskAction -Execute 'powershell.exe' "
+            "-Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Scripts\\transition-throttle.ps1'; "
+            f"$trigger = New-ScheduledTaskTrigger -AtLogon -User '{WINDOWS_USER}'; "
+            f"$principal = New-ScheduledTaskPrincipal -UserId '{WINDOWS_USER}' -LogonType Interactive -RunLevel Highest; "
+            "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) "
+            "-RestartCount 3 -RestartInterval ([TimeSpan]::FromMinutes(1)) -AllowStartIfOnBatteries; "
+            "Unregister-ScheduledTask -TaskName 'OW2 Transition Throttle' -Confirm:$false -EA SilentlyContinue; "
+            "Register-ScheduledTask -TaskName 'OW2 Transition Throttle' -Action $action "
+            "-Trigger $trigger -Principal $principal -Settings $settings"
+        )
+        log("Created 'OW2 Transition Throttle' scheduled task (AtLogon)")
 else:
-    log("ERROR: Failed to write transition-throttle.ps1")
-    sys.exit(1)
+    log(f"Throttle engine task: already configured (state={task_out})")
 
-# Create scheduled task (AtLogon, Interactive, Highest, indefinite)
-run_ps(
-    "$action = New-ScheduledTaskAction -Execute 'powershell.exe' "
-    "-Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Scripts\\transition-throttle.ps1'; "
-    f"$trigger = New-ScheduledTaskTrigger -AtLogon -User '{WINDOWS_USER}'; "
-    f"$principal = New-ScheduledTaskPrincipal -UserId '{WINDOWS_USER}' -LogonType Interactive -RunLevel Highest; "
-    "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) "
-    "-RestartCount 3 -RestartInterval ([TimeSpan]::FromMinutes(1)) -AllowStartIfOnBatteries; "
-    "Unregister-ScheduledTask -TaskName 'OW2 Transition Throttle' -Confirm:$false -EA SilentlyContinue; "
-    "Register-ScheduledTask -TaskName 'OW2 Transition Throttle' -Action $action "
-    "-Trigger $trigger -Principal $principal -Settings $settings"
+# --- Scheduled task: OW2 Transition Throttle Tray (tray icon) ---
+tray_task_out = run_ps(
+    "$t = Get-ScheduledTask -TaskName 'OW2 Transition Throttle Tray' -EA SilentlyContinue; "
+    "if($t){ $t.State } else { 'MISSING' }"
 )
-log("Created 'OW2 Transition Throttle' scheduled task (AtLogon)")
+if "MISSING" in (tray_task_out or "MISSING"):
+    if DRY_RUN:
+        log("[dry-run] Would create 'OW2 Transition Throttle Tray' scheduled task")
+    else:
+        run_ps(
+            "$action = New-ScheduledTaskAction -Execute 'wscript.exe' "
+            "-Argument 'C:\\Scripts\\transition-throttle-tray-launcher.vbs'; "
+            f"$trigger = New-ScheduledTaskTrigger -AtLogon -User '{WINDOWS_USER}'; "
+            f"$principal = New-ScheduledTaskPrincipal -UserId '{WINDOWS_USER}' -LogonType Interactive -RunLevel Highest; "
+            "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) "
+            "-RestartCount 3 -RestartInterval ([TimeSpan]::FromMinutes(1)) -AllowStartIfOnBatteries; "
+            "Unregister-ScheduledTask -TaskName 'OW2 Transition Throttle Tray' -Confirm:$false -EA SilentlyContinue; "
+            "Register-ScheduledTask -TaskName 'OW2 Transition Throttle Tray' -Action $action "
+            "-Trigger $trigger -Principal $principal -Settings $settings"
+        )
+        log("Created 'OW2 Transition Throttle Tray' scheduled task (AtLogon)")
+else:
+    log(f"Throttle tray task: already configured (state={tray_task_out})")
 PYEOF
 }
 

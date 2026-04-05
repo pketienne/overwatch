@@ -350,6 +350,21 @@ action :install do
     )
   end
 
+  # Transition throttle tray icon, VBS launchers (read by setup-guest.sh)
+  %w(
+    transition-throttle-tray.ps1
+    transition-throttle-launcher.vbs
+    transition-throttle-tray-launcher.vbs
+  ).each do |f|
+    cookbook_file "/usr/local/share/overwatch/#{f}" do
+      source f
+      cookbook 'overwatch'
+      owner 'root'
+      group 'root'
+      mode '0644'
+    end
+  end
+
   # autounattend.xml for Windows reinstalls
   cookbook_file '/usr/local/share/overwatch/autounattend.xml' do
     source 'autounattend.xml'
