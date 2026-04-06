@@ -17,6 +17,7 @@
 #   shutdown     Install shutdown signal script and scheduled task
 #   transition   Deploy transition-throttle.ps1 and scheduled task
 #   synapse      Synapse delayed start (prevents windows on boot)
+#   lhm-drivers  Remove LHM kernel drivers that cause reboot hangs
 #   verify       Query all settings and report current vs expected
 #   boot-timing  Show boot timing log from guest
 #
@@ -77,6 +78,7 @@ if [ -z "$CMD" ]; then
     echo "  shutdown     Shutdown signal script and scheduled task"
     echo "  transition   Transition throttle scripts, tray icon, and scheduled tasks"
     echo "  synapse      Synapse delayed start (prevents windows on boot)"
+    echo "  lhm-drivers  Remove LHM kernel drivers that cause reboot hangs"
     echo "  verify       Query all settings and report status"
     echo "  boot-timing  Show boot timing log from guest"
     exit 1
@@ -1048,6 +1050,71 @@ PYEOF
 }
 
 # ============================================================
+# LHM kernel drivers (reboot hang mitigation)
+# ============================================================
+
+# LibreHardwareMonitor installs two kernel drivers that prevent the AMD
+# GPU driver from tearing down cleanly during Windows shutdown/reboot:
+#
+#   R0LibreHardwareMonitor  LHM's main sensor driver
+#   inpoutx64               legacy CPU port-I/O driver (primary culprit)
+#
+# With either driver loaded, the second consecutive `virsh reboot overwatch`
+# hangs: first reboot succeeds, second stalls at the Windows "Restarting"
+# screen with the guest agent unresponsive — only `virsh destroy` recovers.
+# Stopping the LHM user-mode process is NOT sufficient: the kernel drivers
+# stay loaded until the next boot, and the next boot is the one that hangs.
+#
+# Fix: delete the service registrations so the drivers never load at boot.
+# The .sys files stay on disk harmlessly; without service registration
+# Windows ignores them. Verified with 4/4 consecutive reboot cycles.
+#
+# LHM's user-mode component still runs and continues to expose most
+# sensors via WMI — only the sensors that require direct port I/O via
+# inpoutx64 are lost, which are not needed for AMD GPU telemetry.
+
+ensure_lhm_drivers_removed() {
+    log "=== LHM kernel drivers ==="
+    guest_python << 'PYEOF'
+drivers = ["inpoutx64", "R0LibreHardwareMonitor"]
+
+# Query current state via Win32_SystemDriver (covers kernel-mode services
+# that Get-Service does not always surface).
+def query(drv):
+    out = run_ps(
+        "$s = Get-CimInstance -ClassName Win32_SystemDriver "
+        "-Filter \"Name='" + drv + "'\" -EA SilentlyContinue; "
+        "if($s){ \"$($s.State)|$($s.StartMode)\" } else { 'NOT_REGISTERED' }"
+    )
+    return (out or "NOT_REGISTERED").strip()
+
+states = {drv: query(drv) for drv in drivers}
+
+if all(s == "NOT_REGISTERED" for s in states.values()):
+    log("LHM kernel drivers: already removed (inpoutx64 absent, R0LibreHardwareMonitor absent)")
+else:
+    for drv, state in states.items():
+        log(f"LHM driver {drv}: {state}")
+    if DRY_RUN:
+        log("[dry-run] Would stop and delete LHM kernel driver services")
+    else:
+        for drv in drivers:
+            if states[drv] == "NOT_REGISTERED":
+                continue
+            run_ps(
+                "sc.exe stop " + drv + " 2>&1 | Out-Null; "
+                "sc.exe delete " + drv + " 2>&1 | Out-Null"
+            )
+        # Verify removal
+        remaining = [drv for drv in drivers if query(drv) != "NOT_REGISTERED"]
+        if remaining:
+            log(f"WARNING: LHM drivers still present after removal: {', '.join(remaining)}")
+        else:
+            log("LHM kernel drivers removed (inpoutx64, R0LibreHardwareMonitor) — prevents reboot hang")
+PYEOF
+}
+
+# ============================================================
 # Boot timing log
 # ============================================================
 
@@ -1091,11 +1158,12 @@ do_all() {
     ensure_shutdown_signal
     ensure_transition_throttle
     ensure_synapse_delayed
+    ensure_lhm_drivers_removed
     log "=== Guest configuration complete ==="
 }
 
 case "$CMD" in
-    all|power|hda-audio|defender|telemetry|display|onedrive|suggestions|shutdown|transition|synapse|boot-timing)
+    all|power|hda-audio|defender|telemetry|display|onedrive|suggestions|shutdown|transition|synapse|lhm-drivers|boot-timing)
         ensure_guest_agent
         ;;&
     all)          do_all ;;
@@ -1109,6 +1177,7 @@ case "$CMD" in
     shutdown)     ensure_shutdown_signal ;;
     transition)   ensure_transition_throttle ;;
     synapse)      ensure_synapse_delayed ;;
+    lhm-drivers)  ensure_lhm_drivers_removed ;;
     boot-timing)  show_boot_timing ;;
     verify)       ensure_guest_agent && verify_guest ;;
     *)
