@@ -632,7 +632,44 @@ PYEOF
 ensure_onedrive_removed() {
     log "=== OneDrive removal ==="
     guest_python << 'PYEOF'
-# Check if OneDrive is installed (per-machine or per-user)
+# --- Always: clean up OneDrive/OneDriveSetup Run keys from every loaded
+# HKU hive. These persist after OneDrive removal — particularly under
+# the LocalService (S-1-5-19) and NetworkService (S-1-5-20) hives, where
+# Windows leaves a dead reference to OneDriveSetup.exe /thfirstsetup that
+# generates LoadLibrary 126 popups at service-account logon when the
+# OneDriveSetup.exe binary has been uninstalled.
+#
+# This block runs on every converge regardless of OneDrive's current
+# install state, since the dead keys can re-appear (after OneDrive
+# reinstalls + removes) and have nothing to do with OneDrive being
+# installed RIGHT NOW.
+if not DRY_RUN:
+    cleanup_out = run_ps(
+        "$cleaned = @(); "
+        "Get-ChildItem 'Registry::HKEY_USERS' | ForEach-Object { "
+        "  $hive = $_.Name; "
+        "  $runPath = \"Registry::$hive\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\"; "
+        "  if(Test-Path $runPath){ "
+        "    foreach($valueName in @('OneDrive','OneDriveSetup')){ "
+        "      $existing = (Get-ItemProperty -Path $runPath -Name $valueName -EA SilentlyContinue).$valueName; "
+        "      if($existing){ "
+        "        Remove-ItemProperty -Path $runPath -Name $valueName -EA SilentlyContinue; "
+        "        $cleaned += \"$hive::$valueName\" "
+        "      } "
+        "    } "
+        "  } "
+        "}; "
+        "if($cleaned.Count -eq 0){ 'NONE' } else { $cleaned -join ',' }"
+    )
+    cleaned = (cleanup_out or "NONE").strip()
+    if cleaned == "NONE":
+        log("OneDrive Run keys: none to clean (HKEY_USERS hives all clear)")
+    else:
+        log(f"OneDrive Run keys: removed dead entries: {cleaned}")
+else:
+    log("[dry-run] Would scan HKEY_USERS for dead OneDrive/OneDriveSetup Run keys and remove them")
+
+# --- Then: check if OneDrive is currently installed and remove it if so
 out = run_ps(
     "$paths = @("
     "  'C:\\Windows\\System32\\OneDriveSetup.exe',"
@@ -647,7 +684,7 @@ if "REMOVED" in (out or "REMOVED"):
 else:
     log("OneDrive: installed — removing")
     if DRY_RUN:
-        log("[dry-run] Would uninstall OneDrive and clean up scheduled tasks/Run key")
+        log("[dry-run] Would uninstall OneDrive and disable scheduled tasks")
     else:
         # Stop OneDrive process
         run_ps("Stop-Process -Name OneDrive -Force -EA SilentlyContinue")
@@ -666,16 +703,6 @@ else:
             "if(Test-Path $setup){ Start-Process $setup -ArgumentList '/uninstall' -Wait }"
         )
 
-        # Clean up per-user Run key (runs as SYSTEM, so check all loaded user hives)
-        run_ps(
-            "Get-ChildItem 'Registry::HKEY_USERS' | ForEach-Object { "
-            "  $runPath = \"Registry::$($_.Name)\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\"; "
-            "  if(Test-Path $runPath){ "
-            "    Remove-ItemProperty -Path $runPath -Name OneDrive -EA SilentlyContinue "
-            "  } "
-            "}"
-        )
-
         # Disable OneDrive scheduled tasks
         run_ps(
             "Get-ScheduledTask -TaskPath '\\' | "
@@ -684,6 +711,22 @@ else:
             "    Disable-ScheduledTask -TaskName $_.TaskName -EA SilentlyContinue; "
             "    Write-Output \"Disabled task: $($_.TaskName)\" "
             "  }"
+        )
+
+        # Re-run the Run key cleanup post-removal — the per-user uninstaller
+        # may have re-added entries that we want gone. The unconditional
+        # cleanup at the top of this function will catch them on next converge,
+        # but we run it once more here for immediate idempotence within a
+        # single converge.
+        run_ps(
+            "Get-ChildItem 'Registry::HKEY_USERS' | ForEach-Object { "
+            "  $runPath = \"Registry::$($_.Name)\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\"; "
+            "  if(Test-Path $runPath){ "
+            "    foreach($valueName in @('OneDrive','OneDriveSetup')){ "
+            "      Remove-ItemProperty -Path $runPath -Name $valueName -EA SilentlyContinue "
+            "    } "
+            "  } "
+            "}"
         )
 
         log("OneDrive: uninstalled and cleaned up")
