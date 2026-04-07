@@ -6,7 +6,9 @@
 
 VM_IP="<%= @vm_ip %>"
 WINDOWS_USER="<%= @windows_user %>"
+PCAP_CAPTURE="<%= @pcap_capture ? 'true' : 'false' %>"
 PCAP_SNAPSHOTS="<%= @pcap_snapshots ? 'true' : 'false' %>"
+TRANSITION_STALENESS_DETECTION="<%= @transition_staleness_detection ? 'true' : 'false' %>"
 
 # --- Network monitor (2s poll, background) ---
 # Tag: NET_HOST
@@ -117,6 +119,11 @@ monitor_network() {
 # Wireshark filter: udp && ip.addr == ${VM_IP}
 
 monitor_pcap() {
+    if [ "$PCAP_CAPTURE" != "true" ]; then
+        log "PCAP: rolling capture disabled (set node['overwatch']['pcap_capture'] = true to enable)"
+        return
+    fi
+
     if ! command -v tcpdump &>/dev/null; then
         log "PCAP: tcpdump not found — install with: apt install tcpdump"
         return
@@ -380,14 +387,30 @@ monitor_guest_network() {
 # Log format (relayed from guest):
 #   TRANSITION started                      — script started on guest
 #   TRANSITION ow2_detected pid=N           — OW2 process found
-#   TRANSITION throttle_on gpu=startup      — OW2 started in throttled mode
-#   TRANSITION throttle_on gpu=N            — loading screen, affinity reduced to 0x3
-#   TRANSITION manual_full duration=Ns      — Pause/Break: throttled → full
-#   TRANSITION manual_throttle_on           — Pause/Break: full → throttled
+#   TRANSITION throttle_on startup mode=M   — OW2 started in throttled mode
+#   TRANSITION auto_throttle gpu=N          — auto mode triggered (loading screen)
+#   TRANSITION hotkey_full                  — Pause/Break: throttled → full
+#   TRANSITION hotkey_throttle              — Pause/Break: full → throttled
+#   TRANSITION restored disabled            — registry flipped enabled=false
 #   TRANSITION ow2_exited pid=N             — OW2 closed
 #   TRANSITION stopped                      — script exiting
+#   TRANSITION throttle_reset stale=Ns      — (synthetic) staleness check found
+#                                             the throttle script gone without a
+#                                             clean 'stopped' message — only
+#                                             emitted when staleness_detection
+#                                             is enabled
 
 monitor_transition_events() {
+    if [ "$TRANSITION_STALENESS_DETECTION" = "true" ]; then
+        _monitor_transition_events_with_staleness
+    else
+        _monitor_transition_events_simple
+    fi
+}
+
+# Simple variant: blocking recvfrom, no liveness check.
+# Pure pass-through of guest-emitted UDP messages to the host log.
+_monitor_transition_events_simple() {
     python3 -uc "
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -399,6 +422,46 @@ while True:
 " 2>/dev/null | while IFS= read -r line; do
         log "$line"
     done
+}
+
+# Staleness-detection variant: 60s heartbeat poll. When the last received
+# state was 'throttled', a heartbeat triggers a guest-side check for the
+# transition-throttle.ps1 process. If the process is gone, emits a synthetic
+# 'TRANSITION throttle_reset stale=Ns' event so the host log doesn't have a
+# dangling throttle_on with no termination.
+_monitor_transition_events_with_staleness() {
+    python3 -uc "
+import socket, select
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('', ${TRANSITION_SIGNAL_PORT}))
+while True:
+    ready, _, _ = select.select([s], [], [], 60)
+    if ready:
+        data, _ = s.recvfrom(512)
+        print(data.decode('utf-8', 'replace'), flush=True)
+    else:
+        print('__heartbeat__', flush=True)
+" 2>/dev/null | { _tr_state=idle; _tr_epoch=0; while IFS= read -r line; do
+        if [ "$line" = "__heartbeat__" ]; then
+            if [ "$_tr_state" = "throttled" ]; then
+                local alive
+                alive=$(guest_run_ps 'if(Get-Process powershell -EA SilentlyContinue | Where-Object {$_.CommandLine -like "*transition-throttle.ps1*" -and $_.CommandLine -notlike "*tray*"}){"yes"}else{"no"}' 5 2>/dev/null) || true
+                if [ "$alive" = "no" ]; then
+                    local stale_sec=$(( $(date +%s) - _tr_epoch ))
+                    log "TRANSITION throttle_reset stale=${stale_sec}s (script not running)"
+                    _tr_state="idle"
+                fi
+            fi
+        else
+            log "$line"
+            _tr_epoch=$(date +%s)
+            case "$line" in
+                *throttle_on*|*hotkey_throttle*|*auto_throttle*) _tr_state="throttled" ;;
+                *hotkey_full*|*restored*|*ow2_exited*|*stopped*|*throttle_reset*) _tr_state="idle" ;;
+            esac
+        fi
+    done; }
 }
 
 # --- Deferred Tartarus attach (background) ---

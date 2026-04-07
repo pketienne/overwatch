@@ -1,0 +1,44 @@
+# Logrotate config for overwatch packet captures.
+#
+# Two responsibilities:
+#
+#   1. Rotate the rolling pcap ring buffer files written by tcpdump in
+#      monitor_pcap(). tcpdump's own -C/-W flags already handle the
+#      ring buffer (20 files × 50MB), so logrotate's actual rotation
+#      doesn't typically engage — but if a capture session is paused
+#      and the files age out, logrotate compresses and eventually
+#      removes them.
+#
+#   2. Prune the snapshot directories under /var/log/overwatch/snapshots/
+#      via a lastaction hook. This is conditionally rendered based on
+#      pcap_snapshot_keep — when 0, the prune block is omitted entirely
+#      and snapshots accumulate forever. When > 0, the lastaction script
+#      keeps only the N most recent snapshot directories.
+#
+# This file is rendered by Chef and is harmless to have in place when
+# pcap_capture is disabled — logrotate skips files that don't exist.
+
+/var/log/overwatch/overwatch.pcap* {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+<% if @pcap_snapshot_keep && @pcap_snapshot_keep.to_i > 0 -%>
+    lastaction
+        # Prune /var/log/overwatch/snapshots — keep the <%= @pcap_snapshot_keep %> most recent snapshot directories.
+        SNAPS_DIR="/var/log/overwatch/snapshots"
+        KEEP=<%= @pcap_snapshot_keep %>
+        if [ -d "$SNAPS_DIR" ]; then
+            count=$(ls -1d "$SNAPS_DIR"/*/ 2>/dev/null | wc -l)
+            if [ "$count" -gt "$KEEP" ]; then
+                ls -1d "$SNAPS_DIR"/*/ 2>/dev/null | head -n -"$KEEP" | while read -r old; do
+                    rm -rf "$old"
+                done
+            fi
+        fi
+    endscript
+<% end -%>
+}

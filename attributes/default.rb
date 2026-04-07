@@ -93,7 +93,29 @@ default['overwatch']['host_ip']             = '' # must override
 default['overwatch']['vm_ip']               = '' # must override
 default['overwatch']['shutdown_signal_port'] = 9147
 default['overwatch']['transition_signal_port'] = 9148
-default['overwatch']['pcap_snapshots']         = false
+
+# =============================================================================
+# Packet capture (br0 rolling tcpdump + on-disconnect snapshots)
+# =============================================================================
+# Three independent toggles:
+#
+#   pcap_capture        — false → monitor_pcap() exits early; no rolling capture
+#                         true  → tcpdump runs as a 20×50MB rolling ring buffer
+#                                 on br0 filtered to the VM IP
+#
+#   pcap_snapshots      — false → no snapshots saved on TRAFFIC_IDLE
+#                         true  → on each TRAFFIC_IDLE event, copies the live
+#                                 ring buffer to /var/log/overwatch/snapshots/
+#                                 YYYYMMDD-HHMMSS/ for post-incident Wireshark.
+#                                 Only meaningful when pcap_capture = true.
+#
+#   pcap_snapshot_keep  — 0 → no pruning (snapshots accumulate forever)
+#                         N → logrotate's lastaction prunes the snapshots
+#                             directory daily, keeping the N most recent.
+
+default['overwatch']['pcap_capture']         = false
+default['overwatch']['pcap_snapshots']       = false
+default['overwatch']['pcap_snapshot_keep']   = 0
 
 # =============================================================================
 # Transition Throttle
@@ -101,14 +123,21 @@ default['overwatch']['pcap_snapshots']         = false
 # Renders templates/transition-throttle.ps1.erb to a PowerShell script that
 # manages OW2's CPU affinity to mitigate VFIO TDR bursts on transitions.
 #
-#   enabled     — false → renders an exit-0 stub (script is a no-op)
-#                 true  → full throttle script with Pause/Break hotkey toggle
-#   auto_detect — only meaningful when enabled = true
-#                 false → manual hotkey toggle only (matches live VM behavior)
-#                 true  → adds GPU loading-screen detection that auto-throttles
+#   enabled              — false → renders an exit-0 stub (script is a no-op)
+#                          true  → full throttle script with Pause/Break hotkey
+#   auto_detect          — only meaningful when enabled = true
+#                          false → manual hotkey toggle only (matches live VM)
+#                          true  → adds GPU loading-screen detection
+#   staleness_detection  — host-side observability for the transition listener
+#                          false → simple blocking recvfrom (no liveness check)
+#                          true  → 60s heartbeat queries the guest for the
+#                                  throttle script process; emits a synthetic
+#                                  TRANSITION throttle_reset stale=Ns event if
+#                                  the script died without sending 'stopped'
 
-default['overwatch']['transition_throttle']['enabled']     = true
-default['overwatch']['transition_throttle']['auto_detect'] = false
+default['overwatch']['transition_throttle']['enabled']             = true
+default['overwatch']['transition_throttle']['auto_detect']         = false
+default['overwatch']['transition_throttle']['staleness_detection'] = false
 
 # =============================================================================
 # Host / User

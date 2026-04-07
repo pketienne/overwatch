@@ -179,7 +179,24 @@ action :install do
     variables(
       vm_ip: node['overwatch']['vm_ip'],
       windows_user: node['overwatch']['windows_user'],
+      pcap_capture: node['overwatch']['pcap_capture'],
       pcap_snapshots: node['overwatch']['pcap_snapshots'],
+      transition_staleness_detection: node['overwatch']['transition_throttle']['staleness_detection'],
+    )
+  end
+
+  # Logrotate config for the rolling pcap ring buffer + snapshot directory pruning.
+  # Always rendered (it's harmless when pcap_capture is disabled — logrotate
+  # silently skips missing files). The snapshot prune lastaction is conditionally
+  # included by the template based on pcap_snapshot_keep.
+  template '/etc/logrotate.d/overwatch-pcap' do
+    source 'logrotate-overwatch-pcap.erb'
+    cookbook 'overwatch'
+    owner 'root'
+    group 'root'
+    mode '0644'
+    variables(
+      pcap_snapshot_keep: node['overwatch']['pcap_snapshot_keep'],
     )
   end
 
