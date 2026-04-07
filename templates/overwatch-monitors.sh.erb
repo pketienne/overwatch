@@ -555,37 +555,20 @@ if r.get('out-data'):
 # wait loop doesn't fire — this loop catches it via the guest-agent
 # disconnect/reconnect signal instead.
 #
-# OPEN QUESTION — POSSIBLE REDUNDANCY:
-# The deferred-attach pattern (and this reboot-watching loop wrapping it)
-# was discovered during the April 2026 recovery session as a workaround
-# for a state where the Tartarus was bound to GENERIC Microsoft HID
-# drivers (HidUsb / kbdhid / mouhid / usbccgp) because the Razer driver
-# packages had been nuked by an unrelated pnputil incident. In that
-# state, Synapse couldn't talk to the device through the proper Razer
-# control surface and the only way to make it pick up the device's
-# profile was to provoke a USB-HID-arrival event after razerwdl was up.
+# OPEN QUESTION: this entire pattern (attach_tartarus_deferred +
+# tartarus_attach_loop) may be technical debt from the April 2026
+# recovery session and removable once Pass 3.5 (ensure_razer_drivers)
+# is in place. Hypothesis, validation procedure, and consequences are
+# tracked in the nerv epistemic store:
 #
-# It is NOT YET VALIDATED whether this loop (or even the underlying
-# attach_tartarus_deferred deferred-attach pattern) is still needed
-# once the Razer drivers are properly registered via the cookbook's
-# ensure_razer_drivers() function (Pass 3.5 of the symmetra rebuild).
-# With proper RzDev_<pid> / RzCommon drivers in place, Synapse may
-# detect and configure the Tartarus on every Windows boot directly,
-# without the host needing to detach + re-hot-plug the device.
+#   urn:sem:entry:01KNKM7J91M68R9XAK9WMWPQPQ
 #
-# To validate on mercy:
-#   1. Ensure ensure_razer_drivers() has run and Razer drivers are
-#      bound (verify via pnputil /enum-drivers showing Razer Inc entries)
-#   2. Set the Tartarus to be in the static VM XML (not deferred)
-#   3. Boot the VM, log in, confirm Synapse loads the profile and the
-#      Tartarus key bindings work
-#   4. Reboot the guest, confirm same after the second boot
-#   5. If both pass: REMOVE attach_tartarus_deferred + tartarus_attach_loop
-#      from this file, the static deferred call from overwatch.sh, and
-#      the TARTARUS_USB_XML constant. Move the Tartarus into the regular
-#      USB hostdev list in templates/overwatch-vm.xml.erb.
+# Query for the latest state with:
+#   sem graph entry show urn:sem:entry:01KNKM7J91M68R9XAK9WMWPQPQ \
+#       --store http://127.0.0.1:17800 \
+#       --graph https://sem.paradox.limited/o/nerv
 #
-# Until that validation passes, this loop stays.
+# Until validation closes that entry, this loop stays.
 
 tartarus_attach_loop() {
     local vm_start_epoch=$1
