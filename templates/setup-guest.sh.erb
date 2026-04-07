@@ -17,6 +17,7 @@
 #   shutdown     Install shutdown signal script and scheduled task
 #   transition   Deploy transition-throttle.ps1 and scheduled task
 #   synapse      Synapse delayed start (prevents windows on boot)
+#   synapse4-profiles  Stage Razer Synapse 4 profile bundle to D:\synapse4-profiles\
 #   lhm-drivers  Remove LHM kernel drivers that cause reboot hangs
 #   cnext-tasks  RECOVERY: disable broken AMD CNext scheduled tasks (escape hatch)
 #   onedrive-run-keys  RECOVERY: clean dead OneDrive/OneDriveSetup Run keys (escape hatch)
@@ -80,6 +81,7 @@ if [ -z "$CMD" ]; then
     echo "  shutdown     Shutdown signal script and scheduled task"
     echo "  transition   Transition throttle scripts, tray icon, and scheduled tasks"
     echo "  synapse      Synapse delayed start (prevents windows on boot)"
+    echo "  synapse4-profiles  Stage Razer Synapse 4 profile bundle to D:\\synapse4-profiles\\"
     echo "  lhm-drivers  Remove LHM kernel drivers that cause reboot hangs"
     echo "  cnext-tasks  RECOVERY: disable broken AMD CNext scheduled tasks"
     echo "  onedrive-run-keys  RECOVERY: clean dead OneDrive/OneDriveSetup Run keys"
@@ -1171,6 +1173,88 @@ PYEOF
 }
 
 # ============================================================
+# Synapse 4 profile bundle deployment
+# ============================================================
+#
+# Pushes the Razer Synapse 4 profile files (.synapse4) from the host
+# staging directory at /usr/local/share/overwatch/synapse4-profiles/
+# into the guest at D:\synapse4-profiles\. The files are then available
+# for manual import via the Synapse UI on first install (Synapse 4
+# does not expose a documented programmatic import API; UI import is
+# the supported path).
+#
+# Idempotent via SHA256 comparison — same pattern as
+# ensure_transition_throttle. Files that match the host SHA256 are
+# skipped; mismatches and missing files are written.
+#
+# This function only handles file STAGING (Part A). Programmatic
+# profile IMPORT into Synapse 4 (Part B) is out of scope; user must
+# import via Synapse UI on first run.
+
+ensure_synapse4_profiles() {
+    log "=== Synapse 4 profiles ==="
+    guest_python << 'PYEOF'
+import os
+import glob
+
+host_dir = "/usr/local/share/overwatch/synapse4-profiles"
+guest_dir = r"D:\synapse4-profiles"
+
+if not os.path.isdir(host_dir):
+    log(f"WARNING: {host_dir} not found on host — nothing to deploy")
+else:
+    profile_files = sorted(glob.glob(os.path.join(host_dir, "*.synapse4")))
+    if not profile_files:
+        log(f"WARNING: no .synapse4 files in {host_dir}")
+    else:
+        log(f"Found {len(profile_files)} profile file(s) on host")
+
+        # Ensure D:\synapse4-profiles exists. If D: itself isn't mounted,
+        # New-Item will fail and we log a clear error.
+        mkdir_out = run_ps(
+            f"if(Test-Path 'D:\\'){{ "
+            f"  New-Item -ItemType Directory -Path '{guest_dir}' -Force | Out-Null; "
+            f"  'OK' "
+            f"}} else {{ "
+            f"  'NO_D_DRIVE' "
+            f"}}"
+        )
+        if "NO_D_DRIVE" in (mkdir_out or ""):
+            log(f"ERROR: D:\\ drive not mounted on guest — cannot deploy synapse4 profiles")
+        else:
+            for host_path in profile_files:
+                fname = os.path.basename(host_path)
+                guest_path = os.path.join(guest_dir, fname).replace("/", "\\")
+
+                with open(host_path, "rb") as f:
+                    content = f.read()
+
+                # Hash compare with the guest's existing copy (if any)
+                existing = run_ps(
+                    f"if(Test-Path '{guest_path}'){{ 'EXISTS' }} else {{ 'MISSING' }}"
+                )
+                if "EXISTS" in (existing or ""):
+                    import hashlib
+                    local_hash = hashlib.sha256(content).hexdigest()[:16]
+                    remote_hash = run_ps(
+                        f"(Get-FileHash '{guest_path}' -Algorithm SHA256).Hash.Substring(0,16).ToLower()"
+                    )
+                    if remote_hash and local_hash == remote_hash.strip().lower():
+                        log(f"  {fname}: up to date")
+                        continue
+
+                if DRY_RUN:
+                    log(f"  [dry-run] Would write {guest_path}")
+                    continue
+
+                if guest_file_write(guest_path, content):
+                    log(f"  Wrote {fname} ({len(content)} bytes)")
+                else:
+                    log(f"  ERROR: Failed to write {fname}")
+PYEOF
+}
+
+# ============================================================
 # LHM kernel drivers (reboot hang mitigation)
 # ============================================================
 
@@ -1341,12 +1425,13 @@ do_all() {
     ensure_shutdown_signal
     ensure_transition_throttle
     ensure_synapse_delayed
+    ensure_synapse4_profiles
     ensure_lhm_drivers_removed
     log "=== Guest configuration complete ==="
 }
 
 case "$CMD" in
-    all|power|hda-audio|defender|telemetry|display|onedrive|suggestions|shutdown|transition|synapse|lhm-drivers|cnext-tasks|onedrive-run-keys|boot-timing)
+    all|power|hda-audio|defender|telemetry|display|onedrive|suggestions|shutdown|transition|synapse|synapse4-profiles|lhm-drivers|cnext-tasks|onedrive-run-keys|boot-timing)
         ensure_guest_agent
         ;;&
     all)          do_all ;;
@@ -1360,6 +1445,7 @@ case "$CMD" in
     shutdown)     ensure_shutdown_signal ;;
     transition)   ensure_transition_throttle ;;
     synapse)      ensure_synapse_delayed ;;
+    synapse4-profiles)  ensure_synapse4_profiles ;;
     lhm-drivers)  ensure_lhm_drivers_removed ;;
     cnext-tasks)  ensure_cnext_tasks_disabled ;;
     onedrive-run-keys)  ensure_onedrive_run_keys_cleaned ;;

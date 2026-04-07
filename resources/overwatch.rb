@@ -413,6 +413,22 @@ action :install do
     group 'root'
     mode '0644'
   end
+
+  # Razer Synapse 4 profile bundle — staged on host so setup-guest can
+  # push them to D:\synapse4-profiles\ on the guest. Manual import via
+  # the Synapse UI is still required on first install (Synapse has no
+  # documented programmatic import path); see Pass 3.6 design notes.
+  remote_directory '/usr/local/share/overwatch/synapse4-profiles' do
+    source 'synapse4-profiles'
+    cookbook 'overwatch'
+    owner 'root'
+    group 'root'
+    mode '0755'
+    files_owner 'root'
+    files_group 'root'
+    files_mode '0644'
+    purge true
+  end
 end
 
 # ============================================================
