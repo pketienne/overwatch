@@ -19,6 +19,7 @@
 #   synapse      Synapse delayed start (prevents windows on boot)
 #   lhm-drivers  Remove LHM kernel drivers that cause reboot hangs
 #   cnext-tasks  RECOVERY: disable broken AMD CNext scheduled tasks (escape hatch)
+#   onedrive-run-keys  RECOVERY: clean dead OneDrive/OneDriveSetup Run keys (escape hatch)
 #   verify       Query all settings and report current vs expected
 #   boot-timing  Show boot timing log from guest
 #
@@ -81,6 +82,7 @@ if [ -z "$CMD" ]; then
     echo "  synapse      Synapse delayed start (prevents windows on boot)"
     echo "  lhm-drivers  Remove LHM kernel drivers that cause reboot hangs"
     echo "  cnext-tasks  RECOVERY: disable broken AMD CNext scheduled tasks"
+    echo "  onedrive-run-keys  RECOVERY: clean dead OneDrive/OneDriveSetup Run keys"
     echo "  verify       Query all settings and report status"
     echo "  boot-timing  Show boot timing log from guest"
     exit 1
@@ -634,44 +636,16 @@ PYEOF
 ensure_onedrive_removed() {
     log "=== OneDrive removal ==="
     guest_python << 'PYEOF'
-# --- Always: clean up OneDrive/OneDriveSetup Run keys from every loaded
-# HKU hive. These persist after OneDrive removal — particularly under
-# the LocalService (S-1-5-19) and NetworkService (S-1-5-20) hives, where
-# Windows leaves a dead reference to OneDriveSetup.exe /thfirstsetup that
-# generates LoadLibrary 126 popups at service-account logon when the
-# OneDriveSetup.exe binary has been uninstalled.
+# --- Check if OneDrive is currently installed and remove it if so.
+# The post-removal Run-key cleanup at the end of the removal branch
+# handles dead 'OneDrive' AND 'OneDriveSetup' Run key entries that the
+# uninstaller leaves behind, so a fresh-install path (mercy) where the
+# cookbook removes OneDrive cleanly never produces dead keys.
 #
-# This block runs on every converge regardless of OneDrive's current
-# install state, since the dead keys can re-appear (after OneDrive
-# reinstalls + removes) and have nothing to do with OneDrive being
-# installed RIGHT NOW.
-if not DRY_RUN:
-    cleanup_out = run_ps(
-        "$cleaned = @(); "
-        "Get-ChildItem 'Registry::HKEY_USERS' | ForEach-Object { "
-        "  $hive = $_.Name; "
-        "  $runPath = \"Registry::$hive\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\"; "
-        "  if(Test-Path $runPath){ "
-        "    foreach($valueName in @('OneDrive','OneDriveSetup')){ "
-        "      $existing = (Get-ItemProperty -Path $runPath -Name $valueName -EA SilentlyContinue).$valueName; "
-        "      if($existing){ "
-        "        Remove-ItemProperty -Path $runPath -Name $valueName -EA SilentlyContinue; "
-        "        $cleaned += \"$hive::$valueName\" "
-        "      } "
-        "    } "
-        "  } "
-        "}; "
-        "if($cleaned.Count -eq 0){ 'NONE' } else { $cleaned -join ',' }"
-    )
-    cleaned = (cleanup_out or "NONE").strip()
-    if cleaned == "NONE":
-        log("OneDrive Run keys: none to clean (HKEY_USERS hives all clear)")
-    else:
-        log(f"OneDrive Run keys: removed dead entries: {cleaned}")
-else:
-    log("[dry-run] Would scan HKEY_USERS for dead OneDrive/OneDriveSetup Run keys and remove them")
-
-# --- Then: check if OneDrive is currently installed and remove it if so
+# For RETROFIT cases — VMs where OneDrive was removed in a prior session
+# (or by hand) and dead OneDriveSetup Run keys persist into the current
+# session — use the opt-in 'onedrive-run-keys' subcommand. See
+# ensure_onedrive_run_keys_cleaned() below.
 out = run_ps(
     "$paths = @("
     "  'C:\\Windows\\System32\\OneDriveSetup.exe',"
@@ -715,11 +689,9 @@ else:
             "  }"
         )
 
-        # Re-run the Run key cleanup post-removal — the per-user uninstaller
-        # may have re-added entries that we want gone. The unconditional
-        # cleanup at the top of this function will catch them on next converge,
-        # but we run it once more here for immediate idempotence within a
-        # single converge.
+        # Post-removal Run-key cleanup. The per-user uninstaller may
+        # leave OneDriveSetup entries; sweep both 'OneDrive' and
+        # 'OneDriveSetup' value names from every loaded HKU hive.
         run_ps(
             "Get-ChildItem 'Registry::HKEY_USERS' | ForEach-Object { "
             "  $runPath = \"Registry::$($_.Name)\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\"; "
@@ -732,6 +704,64 @@ else:
         )
 
         log("OneDrive: uninstalled and cleaned up")
+PYEOF
+}
+
+# ============================================================
+# OneDrive Run-key cleanup — RECOVERY ESCAPE HATCH (opt-in)
+# ============================================================
+#
+# Removes dead 'OneDrive' / 'OneDriveSetup' Run key entries from every
+# loaded HKU hive — particularly under HKU\\S-1-5-19 (LocalService) and
+# HKU\\S-1-5-20 (NetworkService), where Windows leaves a dead reference
+# to OneDriveSetup.exe /thfirstsetup that generates LoadLibrary 126
+# popups at service-account logon when the OneDriveSetup.exe binary
+# has been uninstalled.
+#
+# On a healthy fresh install (mercy), the cookbook removes OneDrive
+# AND cleans the Run keys atomically in the same converge via the
+# post-removal cleanup inside ensure_onedrive_removed(). The dead-key
+# state only exists on RETROFITTED VMs where OneDrive was removed in
+# a prior session (or by hand) without the Run key sweep — i.e., the
+# state we found yesterday on the live overwatch VM.
+#
+# NOT called from do_all. Invoke manually via:
+#   sudo /usr/local/share/overwatch/setup-guest.sh onedrive-run-keys
+#
+# REMOVE THIS FUNCTION ENTIRELY if mercy's fresh-install validation
+# (Pass 5 of the symmetra rebuild) confirms a clean OneDrive removal
+# never produces dead Run keys without this cleanup. The cookbook
+# should describe steady-state, not carry recovery escape hatches
+# indefinitely.
+
+ensure_onedrive_run_keys_cleaned() {
+    log "=== OneDrive Run-key cleanup (recovery escape hatch) ==="
+    guest_python << 'PYEOF'
+if DRY_RUN:
+    log("[dry-run] Would scan HKEY_USERS for dead OneDrive/OneDriveSetup Run keys and remove them")
+else:
+    cleanup_out = run_ps(
+        "$cleaned = @(); "
+        "Get-ChildItem 'Registry::HKEY_USERS' | ForEach-Object { "
+        "  $hive = $_.Name; "
+        "  $runPath = \"Registry::$hive\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\"; "
+        "  if(Test-Path $runPath){ "
+        "    foreach($valueName in @('OneDrive','OneDriveSetup')){ "
+        "      $existing = (Get-ItemProperty -Path $runPath -Name $valueName -EA SilentlyContinue).$valueName; "
+        "      if($existing){ "
+        "        Remove-ItemProperty -Path $runPath -Name $valueName -EA SilentlyContinue; "
+        "        $cleaned += \"$hive::$valueName\" "
+        "      } "
+        "    } "
+        "  } "
+        "}; "
+        "if($cleaned.Count -eq 0){ 'NONE' } else { $cleaned -join ',' }"
+    )
+    cleaned = (cleanup_out or "NONE").strip()
+    if cleaned == "NONE":
+        log("OneDrive Run keys: none to clean (HKEY_USERS hives all clear)")
+    else:
+        log(f"OneDrive Run keys: removed dead entries: {cleaned}")
 PYEOF
 }
 
@@ -1316,7 +1346,7 @@ do_all() {
 }
 
 case "$CMD" in
-    all|power|hda-audio|defender|telemetry|display|onedrive|suggestions|shutdown|transition|synapse|lhm-drivers|cnext-tasks|boot-timing)
+    all|power|hda-audio|defender|telemetry|display|onedrive|suggestions|shutdown|transition|synapse|lhm-drivers|cnext-tasks|onedrive-run-keys|boot-timing)
         ensure_guest_agent
         ;;&
     all)          do_all ;;
@@ -1332,6 +1362,7 @@ case "$CMD" in
     synapse)      ensure_synapse_delayed ;;
     lhm-drivers)  ensure_lhm_drivers_removed ;;
     cnext-tasks)  ensure_cnext_tasks_disabled ;;
+    onedrive-run-keys)  ensure_onedrive_run_keys_cleaned ;;
     boot-timing)  show_boot_timing ;;
     verify)       ensure_guest_agent && verify_guest ;;
     *)
