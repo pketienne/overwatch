@@ -338,7 +338,10 @@ action :install do
     )
   end
 
-  # Transition throttle script (read by setup-guest.sh for guest deployment)
+  # Transition throttle script — runtime config from HKCU registry,
+  # static template variables only for host_ip / port / windows_user.
+  # Mode + enabled flags are NOT baked into the script anymore; they
+  # come from HKCU:\Software\Overwatch\TransitionThrottle at runtime.
   template '/usr/local/share/overwatch/transition-throttle.ps1' do
     source 'transition-throttle.ps1.erb'
     cookbook 'overwatch'
@@ -346,19 +349,35 @@ action :install do
     group 'root'
     mode '0644'
     variables(
-      enabled: node['overwatch']['transition_throttle']['enabled'],
-      auto_detect: node['overwatch']['transition_throttle']['auto_detect'],
       host_ip: node['overwatch']['host_ip'],
       transition_signal_port: node['overwatch']['transition_signal_port'],
       windows_user: node['overwatch']['windows_user'],
     )
   end
 
-  # Transition throttle tray icon, VBS launchers (read by setup-guest.sh)
+  # Throttle registry init script — seeds HKCU values from cookbook
+  # attributes WITHOUT clobbering existing user-set values. Run once
+  # by setup-guest after first deploy; idempotent on re-runs.
+  template '/usr/local/share/overwatch/throttle-registry-init.ps1' do
+    source 'throttle-registry-init.ps1.erb'
+    cookbook 'overwatch'
+    owner 'root'
+    group 'root'
+    mode '0644'
+    variables(
+      enabled: node['overwatch']['transition_throttle']['enabled'],
+      auto_detect: node['overwatch']['transition_throttle']['auto_detect'],
+    )
+  end
+
+  # Transition throttle tray icon (controller) + AMD driver monitor tray
+  # (independent ULPS health watcher). Both have their own .vbs launchers.
   %w(
     transition-throttle-tray.ps1
     transition-throttle-launcher.vbs
     transition-throttle-tray-launcher.vbs
+    amd-driver-monitor-tray.ps1
+    amd-driver-monitor-launcher.vbs
   ).each do |f|
     cookbook_file "/usr/local/share/overwatch/#{f}" do
       source f

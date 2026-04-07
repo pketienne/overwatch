@@ -1,0 +1,40 @@
+# throttle-registry-init.ps1 — Seed HKCU registry with chef-default throttle state
+#
+# Sets the initial values of HKCU:\Software\Overwatch\TransitionThrottle
+# to the cookbook attribute defaults. Uses New-ItemProperty -Force to
+# CREATE missing values without overwriting existing ones — the user's
+# tray-issued runtime changes are preserved across chef converges.
+#
+# Cookbook attribute → registry value mapping:
+#   node['overwatch']['transition_throttle']['enabled']     → Enabled (DWord)
+#   node['overwatch']['transition_throttle']['auto_detect'] → Mode (String: 'auto' | 'manual')
+#
+# Run as the interactive user via setup-guest scheduled-task push.
+# Idempotent: safe to re-run on every chef converge.
+
+$ErrorActionPreference = 'Continue'
+$regPath = 'HKCU:\Software\Overwatch\TransitionThrottle'
+
+if (-not (Test-Path $regPath)) {
+    New-Item -Path $regPath -Force | Out-Null
+}
+
+$existing = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+
+# Enabled — set only if missing
+if ($null -eq $existing.Enabled) {
+    New-ItemProperty -Path $regPath -Name 'Enabled' `
+        -PropertyType DWord -Value <%= @enabled ? 1 : 0 %> -Force | Out-Null
+    Write-Output "seeded Enabled=<%= @enabled ? 1 : 0 %>"
+} else {
+    Write-Output "preserved Enabled=$($existing.Enabled)"
+}
+
+# Mode — set only if missing
+if ($null -eq $existing.Mode) {
+    New-ItemProperty -Path $regPath -Name 'Mode' `
+        -PropertyType String -Value '<%= @auto_detect ? "auto" : "manual" %>' -Force | Out-Null
+    Write-Output "seeded Mode=<%= @auto_detect ? "auto" : "manual" %>"
+} else {
+    Write-Output "preserved Mode=$($existing.Mode)"
+}

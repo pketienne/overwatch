@@ -785,7 +785,7 @@ PYEOF
 # ============================================================
 
 ensure_transition_throttle() {
-    log "=== Transition throttle ==="
+    log "=== Transition throttle + AMD driver monitor ==="
     guest_python << 'PYEOF'
 import os
 
@@ -793,12 +793,22 @@ import os
 run_ps(r"New-Item -ItemType Directory -Path 'C:\Scripts' -Force | Out-Null")
 
 # --- Deploy files ---
+# transition-throttle.ps1            - the throttle engine (registry-driven)
+# throttle-registry-init.ps1         - one-shot HKCU seeder run after deploy
+# transition-throttle-tray.ps1       - throttle controller tray (status + toggles)
+# transition-throttle-launcher.vbs   - silent launcher for the engine (legacy)
+# transition-throttle-tray-launcher.vbs - silent launcher for the throttle tray
+# amd-driver-monitor-tray.ps1        - independent AMD ULPS health watcher
+# amd-driver-monitor-launcher.vbs    - silent launcher for the AMD monitor tray
 host_dir = "/usr/local/share/overwatch"
 files = [
     "transition-throttle.ps1",
+    "throttle-registry-init.ps1",
     "transition-throttle-tray.ps1",
     "transition-throttle-launcher.vbs",
     "transition-throttle-tray-launcher.vbs",
+    "amd-driver-monitor-tray.ps1",
+    "amd-driver-monitor-launcher.vbs",
 ]
 
 any_written = False
@@ -839,53 +849,66 @@ for fname in files:
         log(f"ERROR: Failed to write {fname}")
         sys.exit(1)
 
-# --- Scheduled task: OW2 Transition Throttle (engine) ---
-task_out = run_ps(
-    "$t = Get-ScheduledTask -TaskName 'OW2 Transition Throttle' -EA SilentlyContinue; "
-    "if($t){ $t.State } else { 'MISSING' }"
-)
-if "MISSING" in (task_out or "MISSING"):
-    if DRY_RUN:
-        log("[dry-run] Would create 'OW2 Transition Throttle' scheduled task")
-    else:
-        run_ps(
-            "$action = New-ScheduledTaskAction -Execute 'powershell.exe' "
-            "-Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Scripts\\transition-throttle.ps1'; "
-            f"$trigger = New-ScheduledTaskTrigger -AtLogon -User '{WINDOWS_USER}'; "
-            f"$principal = New-ScheduledTaskPrincipal -UserId '{WINDOWS_USER}' -LogonType Interactive -RunLevel Highest; "
-            "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) "
-            "-RestartCount 3 -RestartInterval ([TimeSpan]::FromMinutes(1)) -AllowStartIfOnBatteries; "
-            "Unregister-ScheduledTask -TaskName 'OW2 Transition Throttle' -Confirm:$false -EA SilentlyContinue; "
-            "Register-ScheduledTask -TaskName 'OW2 Transition Throttle' -Action $action "
-            "-Trigger $trigger -Principal $principal -Settings $settings"
-        )
-        log("Created 'OW2 Transition Throttle' scheduled task (AtLogon)")
+# --- Run throttle-registry-init.ps1 to seed HKCU defaults ---
+# Idempotent: only writes values that are missing, never overwrites
+# user-set values from the tray. Run as the interactive user via a
+# one-shot scheduled task so the writes land in the user's HKCU hive.
+if not DRY_RUN:
+    init_task_name = f"OverwatchThrottleRegistryInit_{os.getpid()}"
+    run_ps(
+        f"$action = New-ScheduledTaskAction -Execute 'powershell.exe' "
+        f"-Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Scripts\\throttle-registry-init.ps1'; "
+        f"$principal = New-ScheduledTaskPrincipal -UserId '{WINDOWS_USER}' -LogonType Interactive -RunLevel Highest; "
+        f"$task = New-ScheduledTask -Action $action -Principal $principal; "
+        f"Register-ScheduledTask -TaskName '{init_task_name}' -InputObject $task -Force | Out-Null; "
+        f"Start-ScheduledTask -TaskName '{init_task_name}'; "
+        f"Start-Sleep -Seconds 2; "
+        f"Unregister-ScheduledTask -TaskName '{init_task_name}' -Confirm:$false -EA SilentlyContinue"
+    )
+    log("Ran throttle-registry-init.ps1 (HKCU seeded with cookbook defaults if missing)")
 else:
-    log(f"Throttle engine task: already configured (state={task_out})")
+    log("[dry-run] Would run throttle-registry-init.ps1 in user session")
 
-# --- Scheduled task: OW2 Transition Throttle Tray (tray icon) ---
-tray_task_out = run_ps(
-    "$t = Get-ScheduledTask -TaskName 'OW2 Transition Throttle Tray' -EA SilentlyContinue; "
-    "if($t){ $t.State } else { 'MISSING' }"
-)
-if "MISSING" in (tray_task_out or "MISSING"):
+# --- Helper: register a scheduled task that runs as the interactive user ---
+def ensure_logon_task(name, exec, args):
+    state = run_ps(
+        f"$t = Get-ScheduledTask -TaskName '{name}' -EA SilentlyContinue; "
+        f"if($t){{ $t.State }} else {{ 'MISSING' }}"
+    )
+    if "MISSING" not in (state or "MISSING"):
+        log(f"Task '{name}': already configured (state={state})")
+        return
     if DRY_RUN:
-        log("[dry-run] Would create 'OW2 Transition Throttle Tray' scheduled task")
-    else:
-        run_ps(
-            "$action = New-ScheduledTaskAction -Execute 'wscript.exe' "
-            "-Argument 'C:\\Scripts\\transition-throttle-tray-launcher.vbs'; "
-            f"$trigger = New-ScheduledTaskTrigger -AtLogon -User '{WINDOWS_USER}'; "
-            f"$principal = New-ScheduledTaskPrincipal -UserId '{WINDOWS_USER}' -LogonType Interactive -RunLevel Highest; "
-            "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) "
-            "-RestartCount 3 -RestartInterval ([TimeSpan]::FromMinutes(1)) -AllowStartIfOnBatteries; "
-            "Unregister-ScheduledTask -TaskName 'OW2 Transition Throttle Tray' -Confirm:$false -EA SilentlyContinue; "
-            "Register-ScheduledTask -TaskName 'OW2 Transition Throttle Tray' -Action $action "
-            "-Trigger $trigger -Principal $principal -Settings $settings"
-        )
-        log("Created 'OW2 Transition Throttle Tray' scheduled task (AtLogon)")
-else:
-    log(f"Throttle tray task: already configured (state={tray_task_out})")
+        log(f"[dry-run] Would create '{name}' scheduled task")
+        return
+    run_ps(
+        f"$action = New-ScheduledTaskAction -Execute '{exec}' -Argument '{args}'; "
+        f"$trigger = New-ScheduledTaskTrigger -AtLogon -User '{WINDOWS_USER}'; "
+        f"$principal = New-ScheduledTaskPrincipal -UserId '{WINDOWS_USER}' -LogonType Interactive -RunLevel Highest; "
+        f"$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) "
+        f"-RestartCount 3 -RestartInterval ([TimeSpan]::FromMinutes(1)) -AllowStartIfOnBatteries; "
+        f"Unregister-ScheduledTask -TaskName '{name}' -Confirm:$false -EA SilentlyContinue; "
+        f"Register-ScheduledTask -TaskName '{name}' -Action $action "
+        f"-Trigger $trigger -Principal $principal -Settings $settings"
+    )
+    log(f"Created '{name}' scheduled task (AtLogon)")
+
+# --- Three scheduled tasks ---
+ensure_logon_task(
+    'OW2 Transition Throttle',
+    'powershell.exe',
+    '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\\Scripts\\transition-throttle.ps1'
+)
+ensure_logon_task(
+    'OW2 Transition Throttle Tray',
+    'wscript.exe',
+    'C:\\Scripts\\transition-throttle-tray-launcher.vbs'
+)
+ensure_logon_task(
+    'AMD Driver Monitor',
+    'wscript.exe',
+    'C:\\Scripts\\amd-driver-monitor-launcher.vbs'
+)
 PYEOF
 }
 

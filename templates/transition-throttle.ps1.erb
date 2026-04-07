@@ -1,31 +1,28 @@
-# transition-throttle.ps1 — OW2 throttle control
+# transition-throttle.ps1 — OW2 throttle control (registry-driven, stateless)
 #
-<% if !@enabled -%>
-# DISABLED via cookbook attribute (overwatch.transition_throttle.enabled = false).
-# Script exits immediately. The tray icon (transition-throttle-tray.ps1) provides
-# AMD driver health monitoring independently.
+# Manages OW2's CPU affinity to mitigate VFIO TDR bursts during loading
+# transitions. Runtime configuration is read from the Windows registry,
+# allowing the system tray icon to flip mode without restarting this
+# script.
 #
-# Deploy: C:\Scripts\transition-throttle.ps1
-
-exit 0
-<% else -%>
-# Waits for OW2 to launch, then applies throttled mode (2 vCPUs, BelowNormal
-<% if @auto_detect -%>
-# priority). Pause/Break toggles between throttled and full mode. Auto-throttles
-# on loading screen detection (GPU drops below threshold).
-<% else -%>
-# priority). Pause/Break toggles between throttled and full mode. No automatic
-# GPU-based detection — all switching is manual.
-<% end -%>
+# Registry contract — HKCU:\Software\Overwatch\TransitionThrottle
+#   Enabled  REG_DWORD  0 = no-op (script idle, OW2 left alone)
+#                       1 = active (apply throttle decisions per Mode below)
+#   Mode     REG_SZ     'manual' = hotkey-only toggle (Pause/Break)
+#                       'auto'   = hotkey + GPU loading-screen detection
+#
+# State model: NONE. The script observes OW2's actual processor affinity
+# every iteration. Persistent memory across iterations is a single
+# timestamp ($lastLowGpu) used for hysteresis in auto mode. The OW2
+# process's affinity IS the de facto state — if any other tool (or the
+# tray's "Force" buttons) flips affinity directly, the script adapts
+# without confusion.
+#
+# Wakeups: change notifications via RegNotifyChangeKeyValue (kernel
+# event, no polling) interrupt the active loop's sleep so registry
+# changes apply within milliseconds.
 #
 # Audio cues: two beeps = full mode, one beep = throttled mode.
-#
-<% if @auto_detect -%>
-# State machine: IDLE → THROTTLED ⇄ STEADY (via Pause/Break)
-#                STEADY → LOADING → THROTTLED (auto, on GPU drop)
-<% else -%>
-# State machine: IDLE → THROTTLED ⇄ FULL (via Pause/Break)
-<% end -%>
 #
 # Deploy: C:\Scripts\transition-throttle.ps1
 # Task Scheduler: AtLogon, Interactive, Highest, indefinite
@@ -40,7 +37,7 @@ exit 0
 #   Register-ScheduledTask -TaskName 'OW2 Transition Throttle' -Action $action `
 #     -Trigger $trigger -Principal $principal -Settings $settings
 
-# --- Hide console window immediately (no visible terminal regardless of launch method) ---
+# --- Hide console window immediately ---
 Add-Type -Name Window -Namespace Console -MemberDefinition '
 [DllImport("Kernel32.dll")]
 public static extern IntPtr GetConsoleWindow();
@@ -60,6 +57,38 @@ $VK_PAUSE = 0x13
 function Test-HotkeyPressed {
     ([User32]::GetAsyncKeyState($VK_PAUSE) -band 0x0001) -ne 0
 }
+
+# --- Registry change notification (P/Invoke) ---
+# Opens HKCU:\Software\Overwatch\TransitionThrottle and registers an
+# async kernel event that fires when ANY value in the key changes.
+# The active loop's WaitOne() returns immediately on signal, so registry
+# updates from the tray icon are applied with sub-millisecond latency.
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public class Reg {
+    public const int KEY_NOTIFY     = 0x0010;
+    public const int KEY_QUERY_VALUE = 0x0001;
+    public const uint REG_NOTIFY_CHANGE_LAST_SET = 0x00000004;
+    public const long HKEY_CURRENT_USER = unchecked((long)0x80000001L);
+
+    [DllImport("Advapi32.dll", CharSet = CharSet.Unicode)]
+    public static extern int RegOpenKeyExW(IntPtr hKey, string subKey, uint options, int samDesired, out IntPtr phkResult);
+
+    [DllImport("Advapi32.dll")]
+    public static extern int RegNotifyChangeKeyValue(IntPtr hKey, bool watchSubtree, uint dwNotifyFilter, IntPtr hEvent, bool fAsynchronous);
+
+    [DllImport("Advapi32.dll")]
+    public static extern int RegCloseKey(IntPtr hKey);
+
+    [DllImport("Kernel32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr CreateEventW(IntPtr lpEventAttributes, bool bManualReset, bool bInitialState, string lpName);
+
+    [DllImport("Kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr hObject);
+}
+"@
 
 # --- Audio cues ---
 Add-Type -ReferencedAssemblies System.dll -TypeDefinition '
@@ -114,12 +143,12 @@ function Play-FullCue {
 }
 
 # --- Configuration ---
+$REG_PATH          = 'HKCU:\Software\Overwatch\TransitionThrottle'
+$REG_SUBKEY        = 'Software\Overwatch\TransitionThrottle'  # without HKCU prefix for P/Invoke
 $POLL_IDLE_MS      = 2000    # Poll interval when OW2 not running
-$POLL_ACTIVE_MS    = 500     # Poll interval during gameplay
-<% if @auto_detect -%>
-$GPU_LOW           = 15      # Below this = loading screen
-$LOADING_HOLD_MS   = 1000    # GPU must stay below GPU_LOW for this long before throttle
-<% end -%>
+$POLL_ACTIVE_MS    = 500     # Active loop wait (interrupted by registry event)
+$GPU_LOW           = 15      # Below this = loading screen (auto mode)
+$LOADING_HOLD_MS   = 1000    # GPU must stay below GPU_LOW for this long before auto-throttle
 $FULL_AFFINITY     = 0x3F    # All 6 vCPUs (bits 0-5)
 $THROTTLE_AFFINITY = 0x3     # vCPUs 0-1 only
 $HOST_IP           = '<%= @host_ip %>'
@@ -142,8 +171,38 @@ function Send-Log($msg) {
     } catch {}
 }
 
-<% if @auto_detect -%>
-# --- GPU counter reader (auto-detect mode only) ---
+# --- Registry state read ---
+function Get-ThrottleState {
+    $s = Get-ItemProperty -Path $REG_PATH -ErrorAction SilentlyContinue
+    if (-not $s) {
+        # Key missing — treat as enabled+manual default
+        return @{ Enabled = $true; Mode = 'manual' }
+    }
+    @{
+        Enabled = ([int]($s.Enabled) -ne 0)
+        Mode    = if ($s.Mode) { $s.Mode } else { 'manual' }
+    }
+}
+
+# --- Registry change notification setup ---
+function Open-RegNotifyHandle {
+    $hKey = [IntPtr]::Zero
+    $rc = [Reg]::RegOpenKeyExW([IntPtr]([Reg]::HKEY_CURRENT_USER), $REG_SUBKEY, 0, ([Reg]::KEY_NOTIFY -bor [Reg]::KEY_QUERY_VALUE), [ref]$hKey)
+    if ($rc -ne 0) {
+        Send-Log "WARN: RegOpenKeyExW rc=$rc — change notifications unavailable"
+        return $null
+    }
+    $hKey
+}
+
+function Register-RegChangeNotification($hKey, $hEvent) {
+    $rc = [Reg]::RegNotifyChangeKeyValue($hKey, $false, [Reg]::REG_NOTIFY_CHANGE_LAST_SET, $hEvent, $true)
+    if ($rc -ne 0) {
+        Send-Log "WARN: RegNotifyChangeKeyValue rc=$rc"
+    }
+}
+
+# --- GPU counter reader (used in auto mode only) ---
 function Get-OW2GpuUtil($procId) {
     try {
         $samples = (Get-Counter "\GPU Engine(pid_${procId}_*engtype_3D)\Utilization Percentage" -ErrorAction Stop).CounterSamples
@@ -154,24 +213,48 @@ function Get-OW2GpuUtil($procId) {
     }
 }
 
-<% end -%>
-# --- Throttle/restore ---
+# --- Throttle/restore (idempotent — only act if affinity actually differs) ---
 function Set-Throttle($proc) {
     try {
-        $proc.ProcessorAffinity = [IntPtr]$THROTTLE_AFFINITY
-        $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+        if ([int]$proc.ProcessorAffinity -ne $THROTTLE_AFFINITY) {
+            $proc.ProcessorAffinity = [IntPtr]$THROTTLE_AFFINITY
+            $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+            return $true
+        }
     } catch {}
+    $false
 }
 
 function Set-Restore($proc) {
     try {
-        $proc.ProcessorAffinity = [IntPtr]$FULL_AFFINITY
-        $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal
+        if ([int]$proc.ProcessorAffinity -ne $FULL_AFFINITY) {
+            $proc.ProcessorAffinity = [IntPtr]$FULL_AFFINITY
+            $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal
+            return $true
+        }
     } catch {}
+    $false
 }
 
 # --- Main loop ---
 $ErrorActionPreference = 'Continue'
+$lastLowGpu = $null
+
+# Open registry handle for change notifications. Falls back to pure
+# polling on RegOpenKeyEx failure (RegNotifyChangeKeyValue is best-effort).
+$hRegKey = Open-RegNotifyHandle
+$hEvent  = [Reg]::CreateEventW([IntPtr]::Zero, $true, $false, $null)
+$waitHandle = if ($hEvent -ne [IntPtr]::Zero) {
+    $h = New-Object Microsoft.Win32.SafeHandles.SafeWaitHandle($hEvent, $true)
+    $w = New-Object System.Threading.ManualResetEvent($false)
+    $w.SafeWaitHandle = $h
+    $w
+} else { $null }
+
+if ($hRegKey -and $hEvent -ne [IntPtr]::Zero) {
+    Register-RegChangeNotification $hRegKey $hEvent
+}
+
 try {
     Send-Log 'started'
 
@@ -188,86 +271,113 @@ try {
         $ow2pid = $ow2.Id
         Send-Log "ow2_detected pid=$ow2pid"
 
-        # Start throttled
-        try { Set-Throttle $ow2 } catch { Send-Log "ERROR set_throttle: $_" }
-        try { Play-ThrottledCue } catch { Send-Log "ERROR play_cue: $_" }
-        Send-Log 'throttle_on startup'
-        $state = 'THROTTLED'
-        $throttleStart = [DateTime]::UtcNow
-<% if @auto_detect -%>
-        $loadingStart = $null
-<% end -%>
+        # Apply initial throttle if currently enabled
+        $state = Get-ThrottleState
+        if ($state.Enabled) {
+            if (Set-Throttle $ow2) {
+                Play-ThrottledCue
+                Send-Log "throttle_on startup mode=$($state.Mode)"
+            }
+        }
 
         try {
             # Active loop while OW2 is running
             while ($true) {
                 try { $ow2.Refresh(); if ($ow2.HasExited) { break } } catch { Send-Log "ERROR refresh: $_"; break }
 
-                # --- Pause/Break toggle ---
-                if (Test-HotkeyPressed) {
-                    if ($state -eq 'THROTTLED') {
-                        Set-Restore $ow2
-                        $elapsed = ([DateTime]::UtcNow - $throttleStart).TotalSeconds
-                        $duration = [math]::Round($elapsed, 1)
-                        Send-Log "manual_full duration=${duration}s"
+                $state = Get-ThrottleState
+
+                # If disabled mid-session: restore to full and idle
+                if (-not $state.Enabled) {
+                    if (Set-Restore $ow2) {
                         Play-FullCue
-                        $state = '<%= @auto_detect ? "STEADY" : "FULL" %>'
-                        $throttleStart = $null
+                        Send-Log 'restored disabled'
+                    }
+                    if ($waitHandle) {
+                        $signaled = $waitHandle.WaitOne($POLL_ACTIVE_MS)
+                        if ($signaled) {
+                            $waitHandle.Reset() | Out-Null
+                            Register-RegChangeNotification $hRegKey $hEvent
+                        }
                     } else {
-                        Set-Throttle $ow2
-                        Send-Log 'manual_throttle_on'
+                        Start-Sleep -Milliseconds $POLL_ACTIVE_MS
+                    }
+                    continue
+                }
+
+                $isThrottled = ([int]$ow2.ProcessorAffinity -eq $THROTTLE_AFFINITY)
+
+                # --- Pause/Break hotkey toggle (works in both modes) ---
+                if (Test-HotkeyPressed) {
+                    if ($isThrottled) {
+                        Set-Restore $ow2 | Out-Null
+                        Send-Log 'hotkey_full'
+                        Play-FullCue
+                        $lastLowGpu = $null
+                    } else {
+                        Set-Throttle $ow2 | Out-Null
+                        Send-Log 'hotkey_throttle'
                         Play-ThrottledCue
-                        $throttleStart = [DateTime]::UtcNow
-                        $state = 'THROTTLED'
                     }
+                    if ($waitHandle) {
+                        $signaled = $waitHandle.WaitOne($POLL_ACTIVE_MS)
+                        if ($signaled) {
+                            $waitHandle.Reset() | Out-Null
+                            Register-RegChangeNotification $hRegKey $hEvent
+                        }
+                    } else {
+                        Start-Sleep -Milliseconds $POLL_ACTIVE_MS
+                    }
+                    continue
                 }
 
-<% if @auto_detect -%>
-                $gpu = Get-OW2GpuUtil $ow2pid
-
-                switch ($state) {
-                    'STEADY' {
-                        # Auto-throttle when loading screen detected
-                        if ($gpu -ge 0 -and $gpu -lt $GPU_LOW) {
-                            $loadingStart = [DateTime]::UtcNow
-                            $state = 'LOADING'
-                        }
-                    }
-                    'LOADING' {
-                        if ($gpu -ge $GPU_LOW) {
-                            # GPU recovered before hold time — false alarm
-                            $state = 'STEADY'
-                            $loadingStart = $null
-                        } elseif (([DateTime]::UtcNow - $loadingStart).TotalMilliseconds -ge $LOADING_HOLD_MS) {
-                            # Confirmed loading screen — throttle and wait for manual restore
-                            Set-Throttle $ow2
-                            Send-Log "throttle_on gpu=$gpu"
+                # --- Auto mode: GPU loading-screen detection ---
+                # Triggers throttle when GPU is below threshold for HOLD_MS.
+                # Never auto-unthrottles — user must hotkey/tray to exit.
+                if ($state.Mode -eq 'auto' -and -not $isThrottled) {
+                    $gpu = Get-OW2GpuUtil $ow2pid
+                    if ($gpu -ge 0 -and $gpu -lt $GPU_LOW) {
+                        if ($null -eq $lastLowGpu) { $lastLowGpu = [DateTime]::UtcNow }
+                        if (([DateTime]::UtcNow - $lastLowGpu).TotalMilliseconds -ge $LOADING_HOLD_MS) {
+                            Set-Throttle $ow2 | Out-Null
+                            Send-Log "auto_throttle gpu=$gpu"
                             Play-ThrottledCue
-                            $throttleStart = [DateTime]::UtcNow
-                            $state = 'THROTTLED'
+                            $lastLowGpu = $null
                         }
+                    } else {
+                        $lastLowGpu = $null
                     }
-                    # THROTTLED: no auto-restore — wait for Pause/Break
                 }
 
-<% end -%>
-                Start-Sleep -Milliseconds $POLL_ACTIVE_MS
+                # Wait for either time tick OR registry change
+                if ($waitHandle) {
+                    $signaled = $waitHandle.WaitOne($POLL_ACTIVE_MS)
+                    if ($signaled) {
+                        $waitHandle.Reset() | Out-Null
+                        Register-RegChangeNotification $hRegKey $hEvent
+                        Send-Log "registry_change_detected"
+                    }
+                } else {
+                    Start-Sleep -Milliseconds $POLL_ACTIVE_MS
+                }
             }
         } finally {
             # Always restore if OW2 exits while throttled
-            if ($state -eq 'THROTTLED' -and $ow2 -and -not $ow2.HasExited) {
-                Set-Restore $ow2
+            if ($ow2 -and -not $ow2.HasExited -and ([int]$ow2.ProcessorAffinity -eq $THROTTLE_AFFINITY)) {
+                Set-Restore $ow2 | Out-Null
             }
         }
 
+        $lastLowGpu = $null
         Send-Log "ow2_exited pid=$ow2pid"
     }
 } catch {
     Send-Log "FATAL: $_"
 } finally {
     Send-Log 'stopped'
+    if ($hRegKey) { [Reg]::RegCloseKey($hRegKey) | Out-Null }
+    if ($hEvent -ne [IntPtr]::Zero) { [Reg]::CloseHandle($hEvent) | Out-Null }
     $udp.Close()
     $mtx.ReleaseMutex()
     $mtx.Dispose()
 }
-<% end -%>
