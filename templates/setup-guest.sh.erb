@@ -18,6 +18,7 @@
 #   transition   Deploy transition-throttle.ps1 and scheduled task
 #   synapse      Synapse delayed start (prevents windows on boot)
 #   lhm-drivers  Remove LHM kernel drivers that cause reboot hangs
+#   cnext-tasks  RECOVERY: disable broken AMD CNext scheduled tasks (escape hatch)
 #   verify       Query all settings and report current vs expected
 #   boot-timing  Show boot timing log from guest
 #
@@ -79,6 +80,7 @@ if [ -z "$CMD" ]; then
     echo "  transition   Transition throttle scripts, tray icon, and scheduled tasks"
     echo "  synapse      Synapse delayed start (prevents windows on boot)"
     echo "  lhm-drivers  Remove LHM kernel drivers that cause reboot hangs"
+    echo "  cnext-tasks  RECOVERY: disable broken AMD CNext scheduled tasks"
     echo "  verify       Query all settings and report status"
     echo "  boot-timing  Show boot timing log from guest"
     exit 1
@@ -1204,6 +1206,68 @@ PYEOF
 }
 
 # ============================================================
+# CNext scheduled task disable — RECOVERY ESCAPE HATCH (opt-in)
+# ============================================================
+#
+# Disables the three AMD CNext scheduled tasks (\StartCN, \StartDVR,
+# \AMDRyzenMasterSDKTask) that get created by the AMD Adrenalin
+# installer and which break loudly (LoadLibrary 126 popups + stuck
+# RadeonSoftware/cncmd processes at logon) when the AMD GPU driver
+# packages have been partially nuked or corrupted.
+#
+# On a healthy fresh install with Adrenalin, these tasks work correctly
+# and disabling them strips legitimate Adrenalin functionality (Anti-Lag,
+# auto-game-detect, RadeonSoftware atlogon, etc.). This function is
+# here ONLY as a one-shot recovery tool for the broken state.
+#
+# NOT called from do_all. Invoke manually via:
+#   sudo /usr/local/share/overwatch/setup-guest.sh cnext-tasks
+#
+# REMOVE THIS FUNCTION ENTIRELY if mercy's fresh-install validation
+# (Pass 5 of the symmetra rebuild) confirms a clean Adrenalin install
+# never enters the broken state without this disable. The cookbook
+# should describe steady-state, not carry recovery escape hatches
+# indefinitely.
+
+ensure_cnext_tasks_disabled() {
+    log "=== CNext scheduled tasks (recovery escape hatch) ==="
+    guest_python << 'PYEOF'
+tasks = ['\\StartCN', '\\StartDVR', '\\AMDRyzenMasterSDKTask']
+
+# Detect current state per task
+def task_state(name):
+    out = run_ps(
+        "$t = Get-ScheduledTask -TaskName '" + name.lstrip('\\') + "' -EA SilentlyContinue; "
+        "if($t){ $t.State } else { 'MISSING' }"
+    )
+    return (out or "MISSING").strip()
+
+states = {t: task_state(t) for t in tasks}
+to_disable = [t for t, s in states.items() if s not in ('Disabled', 'MISSING')]
+
+for t, s in states.items():
+    log(f"  {t}: {s}")
+
+if not to_disable:
+    log("CNext tasks: nothing to do (all already Disabled or MISSING)")
+elif DRY_RUN:
+    log(f"[dry-run] Would disable: {', '.join(to_disable)}")
+else:
+    for t in to_disable:
+        run_ps(
+            "Disable-ScheduledTask -TaskName '" + t.lstrip('\\') + "' -EA SilentlyContinue | Out-Null"
+        )
+    # Verify
+    after = {t: task_state(t) for t in to_disable}
+    failed = [t for t, s in after.items() if s != 'Disabled']
+    if failed:
+        log(f"WARNING: failed to disable: {', '.join(failed)}")
+    else:
+        log(f"CNext tasks disabled: {', '.join(to_disable)}")
+PYEOF
+}
+
+# ============================================================
 # Boot timing log
 # ============================================================
 
@@ -1252,7 +1316,7 @@ do_all() {
 }
 
 case "$CMD" in
-    all|power|hda-audio|defender|telemetry|display|onedrive|suggestions|shutdown|transition|synapse|lhm-drivers|boot-timing)
+    all|power|hda-audio|defender|telemetry|display|onedrive|suggestions|shutdown|transition|synapse|lhm-drivers|cnext-tasks|boot-timing)
         ensure_guest_agent
         ;;&
     all)          do_all ;;
@@ -1267,6 +1331,7 @@ case "$CMD" in
     transition)   ensure_transition_throttle ;;
     synapse)      ensure_synapse_delayed ;;
     lhm-drivers)  ensure_lhm_drivers_removed ;;
+    cnext-tasks)  ensure_cnext_tasks_disabled ;;
     boot-timing)  show_boot_timing ;;
     verify)       ensure_guest_agent && verify_guest ;;
     *)
