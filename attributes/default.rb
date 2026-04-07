@@ -114,4 +114,9 @@ default['overwatch']['grub_cmdline_params'] = %w(
   isolcpus=domain,managed_irq,2-7
   nohz_full=2-7
   rcu_nocbs=2-7
+  vfio-pci.ids=1002:744c,1002:ab30
+  vfio-pci.disable_vga=1
+  kvm_amd.avic=1
+  kvm.ignore_msrs=1
+  kvm.report_ignored_msrs=0
 )

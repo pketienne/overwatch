@@ -313,12 +313,19 @@ ensure_services_stopped() {
         log "Volt Postgres not running"
     fi
 
-    if systemctl is-active --quiet gdm 2>/dev/null; then
-        log "Stopping GDM..."
-        systemctl stop gdm 2>/dev/null || true
-        sleep 3
+    # Only stop GDM if the dGPU was driving the host display (bound to amdgpu).
+    # With vfio-pci.ids claiming the dGPU at boot, the iGPU drives the host
+    # display independently and GDM should keep running.
+    if [ "$(gpu_driver "$GPU")" = "amdgpu" ]; then
+        if systemctl is-active --quiet gdm 2>/dev/null; then
+            log "Stopping GDM (dGPU was host display)..."
+            systemctl stop gdm 2>/dev/null || true
+            sleep 3
+        else
+            log "GDM already stopped"
+        fi
     else
-        log "GDM already stopped"
+        log "GDM left running (dGPU on vfio-pci, iGPU drives host display)"
     fi
 }
 

@@ -1,0 +1,23 @@
+{
+  "productId": 3077,
+  "deviceName": "",
+  "category": "MOUSEMAT",
+  "profiles": [
+    {
+      "name": "Ashes of Creation",
+      "payload": "eyJndWlkIjoiOWJhY2Y4NDAtMTQwNS00NjZiLWJlNDgtMDA1MzBmMjc5MGFjIiwibmFtZSI6IkFzaGVzIG9mIENyZWF0aW9uIiwiYnJpZ2h0bmVzcyI6eyJpc0VuYWJsZWQiOnRydWUsInZhbHVlIjo2Nn0sInN3aXRjaE9mZkxpZ2h0aW5nIjp7ImlzRGlzcGxheU9uIjpmYWxzZSwiaXNJZGxlRW5hYmxlZCI6ZmFsc2UsImlkbGVNaW51dGVzIjoxfSwicXVpY2tFZmZlY3RzIjp7InNlbGVjdGVkRWZmZWN0SWQiOjR9LCJtYXBwaW5ncyI6W10sImRldmljZUNvbnRhaW5lcklkIjoie0IyRURDMjcwLUQ1OUMtMTFFRi05RDUwLUQ4Q0I4QTFDNjBERn0iLCJzaWRlUGFuZWxNYXBwaW5ncyI6e319",
+      "hash": "b7ffe6814e4bd7443ca8966b430fd962"
+    },
+    {
+      "name": "Overwatch 2",
+      "payload": "eyJndWlkIjoiZjMzZTBiOGUtMjQ5Yy00MjQ3LTk3NTMtMzNmY2JmZmIxNzFkIiwibmFtZSI6Ik92ZXJ3YXRjaCAyIiwiYnJpZ2h0bmVzcyI6eyJpc0VuYWJsZWQiOnRydWUsInZhbHVlIjoxMDB9LCJzd2l0Y2hPZmZMaWdodGluZyI6eyJpc0Rpc3BsYXlPbiI6dHJ1ZSwiaXNJZGxlRW5hYmxlZCI6ZmFsc2UsImlkbGVNaW51dGVzIjoxfSwicXVpY2tFZmZlY3RzIjp7InNlbGVjdGVkRWZmZWN0SWQiOjEsInNlbGVjdGVkRWZmZWN0U2V0dGluZyI6eyJjb2xvcjEiOiIjZjc0ZjAwIn0sInJlZ2lvbklkIjowLCJjdXN0b21Db2xvcnMiOlt7ImNvbG9yIjoiI2JjNWYwMiIsInBpY2tlZCI6dHJ1ZX1dfSwibWFwcGluZ3MiOltdLCJkZXZpY2VDb250YWluZXJJZCI6IntCMkVEQzI3MC1ENTlDLTExRUYtOUQ1MC1EOENCOEExQzYwREZ9Iiwic2lkZVBhbmVsTWFwcGluZ3MiOnt9fQ==",
+      "hash": "ddfd328821a74b4d38be72def2aa09c5"
+    },
+    {
+      "name": "Starcraft 2",
+      "payload": "eyJndWlkIjoiMTkwMjgzYjktOGE2Mi00MGJiLWE1OGMtNGUwOGVkMzU2Y2RjIiwibmFtZSI6IlN0YXJjcmFmdCAyIiwiYnJpZ2h0bmVzcyI6eyJpc0VuYWJsZWQiOnRydWUsInZhbHVlIjoxMDB9LCJzd2l0Y2hPZmZMaWdodGluZyI6eyJpc0Rpc3BsYXlPbiI6dHJ1ZSwiaXNJZGxlRW5hYmxlZCI6ZmFsc2UsImlkbGVNaW51dGVzIjoxfSwicXVpY2tFZmZlY3RzIjp7InNlbGVjdGVkRWZmZWN0SWQiOjEsInJlZ2lvbklkIjowLCJzZWxlY3RlZEVmZmVjdFNldHRpbmciOnsiY29sb3IxIjoiIzAwMDBmZiJ9LCJjdXN0b21Db2xvcnMiOlt7ImNvbG9yIjoiI2JjNWYwMiIsInBpY2tlZCI6dHJ1ZX1dfSwibWFwcGluZ3MiOltdLCJzaWRlUGFuZWxNYXBwaW5ncyI6e319",
+      "hash": "e9b43ede1b6160bc8b9ee6a1df36f41d"
+    }
+  ],
+  "macros": []
+}

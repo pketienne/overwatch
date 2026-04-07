@@ -73,8 +73,11 @@
       <vpindex state='on'/>
       <runtime state='on'/>
       <synic state='on'/>
-      <stimer state='on'/>
+      <stimer state='on'>
+        <direct state='on'/>
+      </stimer>
       <frequencies state='on'/>
+      <reenlightenment state='on'/>
       <vendor_id state='on' value='AuthenticAMD'/>
     </hyperv>
     <!-- Anti-cheat vector 1: Hide KVM CPUID leaf 0x40000000 -->
@@ -88,6 +91,12 @@
   <cpu mode='host-passthrough' check='none' migratable='off'>
     <topology sockets='1' dies='1' cores='<%= @vm_vcpus %>' threads='1'/>
     <feature policy='require' name='topoext'/>
+    <!-- Disable split-lock detection for the guest. The AMD GPU driver issues
+         split-lock instructions; with host mitigation enabled, the kernel traps
+         and serializes each one, adding enough latency to trip the GPU hardware
+         watchdog (AMD_WATCHDOG / Event 141 TDR). Disabling per-VM prevents the
+         host from penalizing the guest while keeping host protection intact. -->
+    <feature policy='disable' name='split-lock-detect'/>
   </cpu>
   <clock offset='localtime'>
     <timer name='rtc' tickpolicy='catchup'/>
@@ -138,12 +147,11 @@
       <rom bar='off' file='<%= @gpu_rom %>'/>
     </hostdev>
 
-    <!-- GPU passthrough: Audio -->
-    <hostdev mode='subsystem' type='pci' managed='yes'>
-      <source>
-        <address domain='<%= audio_pci[:domain] %>' bus='<%= audio_pci[:bus] %>' slot='<%= audio_pci[:slot] %>' function='<%= audio_pci[:func] %>'/>
-      </source>
-    </hostdev>
+    <!-- GPU audio (03:00.1) intentionally NOT passed through. HDMI/DP audio
+         is unused; passing it through adds a device Windows can't drive, and
+         removing it eliminates any risk of stray interrupts or initialization
+         side-effects on the GPU function. The device stays on vfio-pci on the
+         host via vfio-pci.ids. -->
 
     <!-- Network: bridge, Realtek OUI to avoid QEMU 52:54:00 fingerprint -->
     <interface type='bridge'>
@@ -198,5 +206,8 @@
     <qemu:arg value='scsi-hd.vendor=Samsung'/>
     <qemu:arg value='-global'/>
     <qemu:arg value='scsi-hd.product=SSD 870 EVO 1TB'/>
+    <!-- 64GB MMIO space for 7900 XTX 24GB VRAM (default 32GB is insufficient) -->
+    <qemu:arg value='-fw_cfg'/>
+    <qemu:arg value='opt/ovmf/X-PciMmio64Mb,string=65536'/>
   </qemu:commandline>
 </domain>

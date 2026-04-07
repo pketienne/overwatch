@@ -1,14 +1,11 @@
-# transition-throttle-tray.ps1 — System tray status + toggle for OW2 Transition Throttle
+# transition-throttle-tray.ps1 — System tray AMD driver health indicator
 #
-# System tray icon reflects the live throttle state:
-#   Green  = OW2 at full performance (or system enabled, OW2 not running)
-#   Orange = OW2 throttled (reduced vCPUs / BelowNormal priority)
-#   Red    = system disabled (script stopped, task won't auto-start)
+# System tray icon monitors AMD GPU driver power management:
+#   Green = ULPS disabled (correct for VFIO passthrough)
+#   Red   = ULPS re-enabled (AMD driver update reset the setting)
 #
-# Pause/Break toggles are handled by transition-throttle.ps1 — this tray script
-# polls OW2's affinity every second and updates the icon to match.
-#
-# Left-click or context menu "Toggle" enables/disables the entire system.
+# Checks ULPS registry value once at startup and every 24 hours.
+# Shows a balloon notification when ULPS is found re-enabled.
 #
 # Deploy: C:\Scripts\transition-throttle-tray.ps1
 # Launch: wscript.exe C:\Scripts\transition-throttle-tray-launcher.vbs
@@ -32,10 +29,6 @@ if (-not $script:mtx.WaitOne(0)) {
     exit 0
 }
 
-$script:taskName = 'OW2 Transition Throttle'
-$script:FULL_AFFINITY     = 0x3F
-$script:THROTTLE_AFFINITY = 0x3
-
 # --- Icon generation ---
 function New-TrayIcon([System.Drawing.Color]$color) {
     $bmp = New-Object System.Drawing.Bitmap(16, 16)
@@ -51,141 +44,75 @@ function New-TrayIcon([System.Drawing.Color]$color) {
     $icon
 }
 
-$script:iconFull      = New-TrayIcon ([System.Drawing.Color]::FromArgb(0, 200, 0))
-$script:iconThrottled = New-TrayIcon ([System.Drawing.Color]::FromArgb(255, 165, 0))
-$script:iconOff       = New-TrayIcon ([System.Drawing.Color]::FromArgb(200, 0, 0))
+$script:iconOk    = New-TrayIcon ([System.Drawing.Color]::FromArgb(0, 200, 0))
+$script:iconAlert = New-TrayIcon ([System.Drawing.Color]::FromArgb(200, 0, 0))
 
-# --- State tracking ---
-$script:lastIcon = $null
-$script:enabled = $false
-$script:taskCheckCounter = 0
-
-# --- State detection ---
-function Get-ThrottleEnabled {
+# --- AMD driver power management check ---
+# ULPS (Ultra Low Power State) causes TDR in VFIO passthrough.
+# AMD driver updates reset EnableUlps back to 1.
+function Test-UlpsMisconfigured {
     try {
-        $task = Get-ScheduledTask -TaskName $script:taskName -ErrorAction Stop
-        $task.State -ne 'Disabled'
-    } catch {
-        $false
-    }
-}
-
-function Get-ScriptRunning {
-    $test = New-Object System.Threading.Mutex($false, 'Global\TransitionThrottle')
-    $acquired = $test.WaitOne(0)
-    if ($acquired) {
-        $test.ReleaseMutex()
-        $test.Dispose()
-        $false
-    } else {
-        $test.Dispose()
-        $true
-    }
-}
-
-# --- Toggle actions ---
-function Enable-Throttle {
-    Enable-ScheduledTask -TaskName $script:taskName -ErrorAction SilentlyContinue
-    if (-not (Get-ScriptRunning)) {
-        Start-Process wscript.exe -ArgumentList @(
-            'C:\Scripts\transition-throttle-launcher.vbs'
-        ) -Verb RunAs -WindowStyle Hidden
-    }
-}
-
-function Disable-Throttle {
-    Disable-ScheduledTask -TaskName $script:taskName -ErrorAction SilentlyContinue
-    Get-WmiObject Win32_Process -Filter "Name='powershell.exe'" | ForEach-Object {
-        if ($_.CommandLine -and $_.CommandLine -like '*transition-throttle.ps1*' -and
-            $_.CommandLine -notlike '*transition-throttle-tray.ps1*') {
-            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+        $regPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+        Get-ChildItem $regPath -ErrorAction Stop | ForEach-Object {
+            $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+            if ($props.DriverDesc -match 'AMD|Radeon') {
+                return ($props.EnableUlps -ne 0)
+            }
         }
-    }
-    Get-Process -Name 'Overwatch' -ErrorAction SilentlyContinue | ForEach-Object {
-        try {
-            $_.ProcessorAffinity = [IntPtr]$script:FULL_AFFINITY
-            $_.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::Normal
-        } catch {}
-    }
+    } catch {}
+    $false
 }
 
 # --- Tray setup ---
+$script:ulpsBad = Test-UlpsMisconfigured
+
 $script:notify = New-Object System.Windows.Forms.NotifyIcon
-$script:enabled = Get-ThrottleEnabled
-$script:notify.Icon = if ($script:enabled) { $script:iconFull } else { $script:iconOff }
-$script:notify.Text = if ($script:enabled) { 'OW2 Throttle: ON' } else { 'OW2 Throttle: OFF' }
+if ($script:ulpsBad) {
+    $script:notify.Icon = $script:iconAlert
+    $script:notify.Text = 'AMD Driver: ULPS ENABLED - run setup-guest.sh gpu'
+} else {
+    $script:notify.Icon = $script:iconOk
+    $script:notify.Text = 'AMD Driver: OK'
+}
 $script:notify.Visible = $true
 
 # Context menu
 $script:menu = New-Object System.Windows.Forms.ContextMenuStrip
-$script:toggleItem = $script:menu.Items.Add('Toggle')
 $script:exitItem = $script:menu.Items.Add('Exit')
 $script:notify.ContextMenuStrip = $script:menu
 
-# --- Polling timer: check OW2 affinity every second ---
+# Show balloon on startup if misconfigured
+if ($script:ulpsBad) {
+    $script:notify.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Error
+    $script:notify.BalloonTipTitle = 'AMD Driver: ULPS Enabled'
+    $script:notify.BalloonTipText = 'ULPS has been re-enabled by a driver update. Run setup-guest.sh gpu from the host to fix.'
+    $script:notify.ShowBalloonTip(10000)
+}
+
+# --- Daily ULPS check (86400s timer) ---
 $script:timer = New-Object System.Windows.Forms.Timer
-$script:timer.Interval = 1000
+$script:timer.Interval = 86400000  # 24 hours in ms
 
 $script:timer.Add_Tick({
-    $ow2 = Get-Process -Name 'Overwatch' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($ow2) {
-        try {
-            $aff = [int]$ow2.ProcessorAffinity
-            if ($aff -le $script:THROTTLE_AFFINITY) {
-                if ($script:lastIcon -ne 'throttled') {
-                    $script:notify.Icon = $script:iconThrottled
-                    $script:notify.Text = 'OW2 Throttle: THROTTLED'
-                    $script:lastIcon = 'throttled'
-                }
-            } else {
-                if ($script:lastIcon -ne 'full') {
-                    $script:notify.Icon = $script:iconFull
-                    $script:notify.Text = 'OW2 Throttle: FULL'
-                    $script:lastIcon = 'full'
-                }
-            }
-        } catch {}
-    } else {
-        $script:taskCheckCounter++
-        if ($script:taskCheckCounter -ge 5 -or $script:lastIcon -eq $null) {
-            $script:taskCheckCounter = 0
-            $script:enabled = Get-ThrottleEnabled
-            if ($script:enabled) {
-                if ($script:lastIcon -ne 'on') {
-                    $script:notify.Icon = $script:iconFull
-                    $script:notify.Text = 'OW2 Throttle: ON'
-                    $script:lastIcon = 'on'
-                }
-            } else {
-                if ($script:lastIcon -ne 'off') {
-                    $script:notify.Icon = $script:iconOff
-                    $script:notify.Text = 'OW2 Throttle: OFF'
-                    $script:lastIcon = 'off'
-                }
-            }
+    $wasBad = $script:ulpsBad
+    $script:ulpsBad = Test-UlpsMisconfigured
+
+    if ($script:ulpsBad) {
+        $script:notify.Icon = $script:iconAlert
+        $script:notify.Text = 'AMD Driver: ULPS ENABLED - run setup-guest.sh gpu'
+        if (-not $wasBad) {
+            $script:notify.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Error
+            $script:notify.BalloonTipTitle = 'AMD Driver Updated'
+            $script:notify.BalloonTipText = 'ULPS has been re-enabled. Run setup-guest.sh gpu from the host to fix.'
+            $script:notify.ShowBalloonTip(10000)
         }
+    } else {
+        $script:notify.Icon = $script:iconOk
+        $script:notify.Text = 'AMD Driver: OK'
     }
 })
 
 $script:timer.Start()
-
-# Left-click = toggle system on/off
-$script:notify.Add_Click({
-    if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
-        if ($script:enabled) { Disable-Throttle } else { Enable-Throttle }
-        Start-Sleep -Milliseconds 500
-        $script:enabled = Get-ThrottleEnabled
-        $script:lastIcon = $null
-    }
-})
-
-# Menu toggle
-$script:toggleItem.Add_Click({
-    if ($script:enabled) { Disable-Throttle } else { Enable-Throttle }
-    Start-Sleep -Milliseconds 500
-    $script:enabled = Get-ThrottleEnabled
-    $script:lastIcon = $null
-})
 
 # Menu exit
 $script:exitItem.Add_Click({
