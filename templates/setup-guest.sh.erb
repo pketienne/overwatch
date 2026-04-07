@@ -11,7 +11,7 @@
 #   hda-audio    Remove AMD HD Audio driver + block reinstall via policy
 #   defender     Defender exclusions (C:\ and D:\ drives)
 #   telemetry    Disable AMD telemetry (AUEPMaster)
-#   display      Auto HDR off, Game Bar off, toast off, MPO off, HAGS off
+#   display      Auto HDR off, Game Bar off, GameBarPresenceWriter off, toast off, MPO off, HAGS off
 #   onedrive     Remove OneDrive (per-machine + per-user)
 #   suggestions  Disable Windows suggestion toasts (ContentDeliveryManager)
 #   shutdown     Install shutdown signal script and scheduled task
@@ -74,7 +74,7 @@ if [ -z "$CMD" ]; then
     echo "  hda-audio    Remove AMD HD Audio driver + block reinstall"
     echo "  defender     Defender exclusions (C:\\ and D:\\ drives)"
     echo "  telemetry    Disable AMD telemetry (AUEPMaster)"
-    echo "  display      Auto HDR off, Game Bar off, MPO off, HAGS off"
+    echo "  display      Auto HDR off, Game Bar off, GameBarPresenceWriter off, MPO off, HAGS off"
     echo "  shutdown     Shutdown signal script and scheduled task"
     echo "  transition   Transition throttle scripts, tray icon, and scheduled tasks"
     echo "  synapse      Synapse delayed start (prevents windows on boot)"
@@ -553,7 +553,7 @@ else:
     log(f"User SID: {sid}")
 
     if DRY_RUN:
-        log("[dry-run] Would configure: Auto HDR off, SwapEffectUpgrade off, Game Bar off, toast off, MPO off, HAGS off")
+        log("[dry-run] Would configure: Auto HDR off, SwapEffectUpgrade off, Game Bar off, GameBarPresenceWriter off, toast off, MPO off, HAGS off")
     else:
         # Auto HDR off + SwapEffectUpgrade off (per-user)
         run_ps(
@@ -577,6 +577,23 @@ else:
         )
         log("Game Bar: disabled (policy + user settings)")
 
+        # GameBarPresenceWriter — COM-activated by BrokerInfrastructure on
+        # fullscreen game detection, respawns after kill. Disable via:
+        # 1. GameConfigStore registry (GameDVR_Enabled=0, FSEBehaviorMode=2)
+        # 2. IFEO debugger redirect to prevent launch entirely
+        # 3. Kill any running instance
+        run_ps(
+            "$gcs = \"Registry::HKEY_USERS\\" + sid + "\\System\\GameConfigStore\"; "
+            "if(-not (Test-Path $gcs)){ New-Item -Path $gcs -Force | Out-Null }; "
+            "Set-ItemProperty -Path $gcs -Name 'GameDVR_Enabled' -Value 0 -Type DWord; "
+            "Set-ItemProperty -Path $gcs -Name 'GameDVR_FSEBehaviorMode' -Value 2 -Type DWord; "
+            "$ifeo = 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\GameBarPresenceWriter.exe'; "
+            "New-Item -Path $ifeo -Force | Out-Null; "
+            "Set-ItemProperty -Path $ifeo -Name 'Debugger' -Value '%SystemRoot%\\System32\\systray.exe' -Type String; "
+            "Stop-Process -Name GameBarPresenceWriter -Force -EA SilentlyContinue"
+        )
+        log("GameBarPresenceWriter: blocked (IFEO redirect + GameConfigStore disabled)")
+
         # Auto HDR toast notification off (per-user)
         run_ps(
             "$toastPath = \"Registry::HKEY_USERS\\" + sid + "\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion"
@@ -587,11 +604,17 @@ else:
         log("Auto HDR toast: disabled")
 
         # MPO (Multiplane Overlay) off — reduces TDR under VFIO passthrough
+        # OverlayTestMode=5 is the legacy Win10/Win11≤23H2 mechanism.
+        # DisableMPO=1 is required on Win11 24H2+ where the WDDM 3.x runtime
+        # ignores OverlayTestMode for the new MPO code path. Both are set
+        # for forward+backward compatibility; setting both is harmless.
         run_ps(
             "New-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\Dwm' "
-            "-Name OverlayTestMode -Value 5 -PropertyType DWord -Force | Out-Null"
+            "-Name OverlayTestMode -Value 5 -PropertyType DWord -Force | Out-Null; "
+            "New-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers' "
+            "-Name DisableMPO -Value 1 -PropertyType DWord -Force | Out-Null"
         )
-        log("MPO: disabled (OverlayTestMode=5)")
+        log("MPO: disabled (OverlayTestMode=5 + DisableMPO=1)")
 
         # HAGS (Hardware Accelerated GPU Scheduling) off — reduces scheduling pressure
         run_ps(
