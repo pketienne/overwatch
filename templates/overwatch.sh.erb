@@ -795,10 +795,13 @@ _do_start() {
     apply_cpu_isolation &
     local cpu_iso_pid=$!
 
-    # Deferred Tartarus attach — waits for Synapse then hot-plugs
+    # Tartarus attach + reboot watcher — initial deferred attach + persistent
+    # loop that re-fires the attach after every guest reboot (not just at
+    # overwatch start). The loop runs for the lifetime of the VM and is
+    # killed by the existing cleanup section on real shutdown.
     local VM_START_EPOCH
     VM_START_EPOCH=$(date +%s)
-    attach_tartarus_deferred "$VM_START_EPOCH" &
+    tartarus_attach_loop "$VM_START_EPOCH" &
     local tartarus_pid=$!
 
     # Network monitor — polls vnet interface for drop events

@@ -531,3 +531,56 @@ if r.get('out-data'):
         log "WARNING: Tartarus attach failed after ${elapsed}s"
     fi
 }
+
+# --- Tartarus attach loop (background, lifetime of VM) ---
+# Tag: BOOT_TIMING (initial), TARTARUS_REATTACH (subsequent)
+#
+# Wraps attach_tartarus_deferred() in a guest-agent disconnect/reconnect
+# watcher so the deferred attach re-fires after every Windows reboot,
+# not just the initial overwatch start. Without this loop, a
+# guest-initiated reboot leaves the Tartarus detached because the
+# libvirt domain state stays "running" across the reboot and the
+# parent wait-for-shutdown loop in overwatch.sh doesn't notice.
+#
+# State machine:
+#   ga_alive → ga_alive   steady state, do nothing
+#   ga_alive → ga_dead    guest going down (reboot or real shutdown); wait
+#   ga_dead  → ga_alive   guest came back from a reboot; detach + re-attach
+#   ga_dead  → ga_dead    steady state, do nothing
+#
+# A real shutdown (where the libvirt domain transitions out of "running")
+# is handled by the parent script's wait-for-shutdown loop killing this
+# background process via the existing `kill "$tartarus_pid"` cleanup.
+# A guest-initiated reboot keeps the domain in "running" so the parent
+# wait loop doesn't fire — this loop catches it via the guest-agent
+# disconnect/reconnect signal instead.
+
+tartarus_attach_loop() {
+    local vm_start_epoch=$1
+
+    # Initial attach (existing behavior — fires once at overwatch start)
+    attach_tartarus_deferred "$vm_start_epoch"
+
+    # Then monitor guest-agent state for guest reboot cycles
+    local ga_alive=1
+    while true; do
+        sleep 5
+        if virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+            if [ "$ga_alive" -eq 0 ]; then
+                log "TARTARUS_REATTACH guest agent reconnected — re-running deferred attach"
+                # Best-effort detach so Synapse sees a fresh hot-plug
+                # arrival event. The detach may fail if the device
+                # isn't currently attached (expected on a fresh boot).
+                virsh detach-device overwatch /dev/stdin --live <<< "$TARTARUS_USB_XML" 2>/dev/null || true
+                sleep 2
+                attach_tartarus_deferred "$(date +%s)"
+                ga_alive=1
+            fi
+        else
+            if [ "$ga_alive" -eq 1 ]; then
+                log "TARTARUS_REATTACH guest agent disconnected — guest reboot or shutdown in progress"
+                ga_alive=0
+            fi
+        fi
+    done
+}
