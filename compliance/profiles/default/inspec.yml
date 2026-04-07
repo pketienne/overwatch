@@ -7,6 +7,3 @@ summary: Verifies GPU-passthrough VM host setup and VM definition
 version: 1.0.0
 supports:
   - platform-family: debian
-depends:
-  - name: symmetra_core
-    path: "../../../../symmetra_core/compliance/profiles/default"
