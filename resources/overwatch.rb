@@ -346,7 +346,11 @@ action :install do
     group 'root'
     mode '0644'
     variables(
+      enabled: node['overwatch']['transition_throttle']['enabled'],
+      auto_detect: node['overwatch']['transition_throttle']['auto_detect'],
       host_ip: node['overwatch']['host_ip'],
+      transition_signal_port: node['overwatch']['transition_signal_port'],
+      windows_user: node['overwatch']['windows_user'],
     )
   end
 

@@ -96,6 +96,21 @@ default['overwatch']['transition_signal_port'] = 9148
 default['overwatch']['pcap_snapshots']         = false
 
 # =============================================================================
+# Transition Throttle
+# =============================================================================
+# Renders templates/transition-throttle.ps1.erb to a PowerShell script that
+# manages OW2's CPU affinity to mitigate VFIO TDR bursts on transitions.
+#
+#   enabled     — false → renders an exit-0 stub (script is a no-op)
+#                 true  → full throttle script with Pause/Break hotkey toggle
+#   auto_detect — only meaningful when enabled = true
+#                 false → manual hotkey toggle only (matches live VM behavior)
+#                 true  → adds GPU loading-screen detection that auto-throttles
+
+default['overwatch']['transition_throttle']['enabled']     = true
+default['overwatch']['transition_throttle']['auto_detect'] = false
+
+# =============================================================================
 # Host / User
 # =============================================================================
 
