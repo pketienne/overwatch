@@ -38,6 +38,11 @@ SHUTDOWN_SIGNAL_PORT=<%= @shutdown_signal_port %>
 TRANSITION_SIGNAL_PORT=<%= @transition_signal_port %>
 WINDOWS_USER="<%= @windows_user %>"
 
+# Per-VM stage dir on the host where this script and its companion files
+# are deployed by the cookbook (e.g. /usr/local/share/overwatch/dva/).
+STAGE_DIR="/usr/local/share/overwatch/<%= @vm_name %>"
+export STAGE_DIR
+
 # --- Parse arguments ---
 
 DRY_RUN=false
@@ -900,7 +905,7 @@ run_ps(r"New-Item -ItemType Directory -Path 'C:\Scripts' -Force | Out-Null")
 # transition-throttle-tray-launcher.vbs - silent launcher for the throttle tray
 # amd-driver-monitor-tray.ps1        - independent AMD ULPS health watcher
 # amd-driver-monitor-launcher.vbs    - silent launcher for the AMD monitor tray
-host_dir = "/usr/local/share/overwatch"
+host_dir = "/usr/local/share/overwatch/<%= @vm_name %>"
 files = [
     "transition-throttle.ps1",
     "throttle-registry-init.ps1",
@@ -1197,7 +1202,7 @@ ensure_synapse4_profiles() {
 import os
 import glob
 
-host_dir = "/usr/local/share/overwatch/synapse4-profiles"
+host_dir = "/usr/local/share/overwatch/<%= @vm_name %>/synapse4-profiles"
 guest_dir = r"D:\synapse4-profiles"
 
 if not os.path.isdir(host_dir):

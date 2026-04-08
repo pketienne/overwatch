@@ -1,0 +1,41 @@
+# overwatch — instance config for <%= @vm_name %>
+#
+# Sourced by /usr/local/bin/overwatch at runtime to load per-VM values.
+# Managed by Chef (overwatch cookbook). Do not edit directly.
+
+# --- Identity ---
+VM_NAME="<%= @vm_name %>"
+VM_MAC="<%= @vm_mac %>"
+VM_IP="<%= @vm_ip %>"
+HOST_IP="<%= @host_ip %>"
+WINDOWS_USER="<%= @windows_user %>"
+TARGET_USER="<%= @target_user %>"
+
+# --- Capability toggles (true|false) ---
+GPU_PASSTHROUGH="<%= @gpu_passthrough ? 'true' : 'false' %>"
+TARTARUS_ATTACH="<%= @tartarus_attach ? 'true' : 'false' %>"
+
+# --- Host topology (only consulted when GPU_PASSTHROUGH=true) ---
+GPU="<%= @gpu %>"
+GPU_AUDIO="<%= @gpu_audio %>"
+IGPU="<%= @igpu %>"
+HOST_CPUS="<%= @host_cpus %>"
+
+# --- Per-instance listener ports (UDP) ---
+SHUTDOWN_SIGNAL_PORT=<%= @shutdown_signal_port %>
+TRANSITION_SIGNAL_PORT=<%= @transition_signal_port %>
+
+# --- Packet capture toggles ---
+PCAP_CAPTURE="<%= @pcap_capture ? 'true' : 'false' %>"
+PCAP_SNAPSHOTS="<%= @pcap_snapshots ? 'true' : 'false' %>"
+
+# --- Transition throttle observability ---
+TRANSITION_STALENESS_DETECTION="<%= @transition_staleness_detection ? 'true' : 'false' %>"
+
+# --- Per-VM filesystem layout (derived; consumers should not override) ---
+STAGE_DIR="/usr/local/share/overwatch/<%= @vm_name %>"
+SHARED_DIR="/usr/local/share/overwatch/shared"
+LOG_DIR="/var/log/overwatch/<%= @vm_name %>"
+STATE_DIR="/var/lib/overwatch/<%= @vm_name %>"
+LOCK_FILE="/run/overwatch/<%= @vm_name %>.lock"
+ACTIVE_VM_FILE="/run/overwatch/active-vm"

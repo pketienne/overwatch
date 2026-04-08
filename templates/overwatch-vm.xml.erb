@@ -1,4 +1,44 @@
-<%
+<%#
+  # ============================================================================
+  # !!! ANTI-CHEAT LOCKED CONSTANTS !!!
+  # ============================================================================
+  #
+  # The hardcoded values in this template contribute to the Windows hardware
+  # hash that OS licensing, MS Store activation, Razer Synapse cloud binding,
+  # and OW2 Ricochet anti-cheat use to fingerprint each VM. Once any instance
+  # has booted Windows for the first time, these values must NEVER change for
+  # that instance — changing them forces Windows re-registration and may
+  # trigger an anti-cheat ban review.
+  #
+  # Hardcoded fingerprint constants (search this file for them):
+  #
+  #   <cpu mode='host-passthrough' ...>     CPU model
+  #   <topology cores='<vm_vcpus>' ...>     vCPU count    [from instance attr]
+  #   <memory unit='KiB'><vm_ram_kib>       RAM size      [from instance attr]
+  #   <kvm><hidden state='on'/>             KVM hypervisor masking
+  #   <hyperv ... vendor_id='AuthenticAMD'> Hyper-V vendor masking
+  #   <controller ... model='virtio-scsi'>  Storage controller model
+  #   <serial>S6XWNG0R401283</serial>       C: drive SCSI serial
+  #   <serial>S6XWNG0R401297</serial>       D: drive SCSI serial
+  #   scsi-hd.vendor=Samsung                SCSI device vendor string
+  #   scsi-hd.product=SSD 870 EVO 1TB       SCSI device product string
+  #   <model type='virtio'/>                NIC model (bridge interface)
+  #   qemu-xhci ports='8'                   USB host controller model
+  #
+  # Per-instance fingerprint inputs (in policyfile attribute hash):
+  #
+  #   instances['<vm>']['vm_mac']           NIC MAC address
+  #   instance_defaults['vm_vcpus']         vCPU count (default 6)
+  #   instance_defaults['vm_ram_kib']       RAM size (default 48 GB)
+  #
+  # Host-wide fingerprint inputs (in policyfile attribute hash):
+  #
+  #   node['overwatch']['smbios'][...]      11 motherboard fields
+  #   node['overwatch']['gpu_rom']          GPU vBIOS file path
+  #
+  # See attributes/default.rb for the full per-attribute warnings.
+  # ============================================================================
+%><%
   # Parse PCI address "0000:03:00.0" into hex components
   def pci_parts(addr)
     parts = addr.split(/[:.]/)
@@ -10,18 +50,23 @@
     }
   end
 
-  gpu_pci   = pci_parts(@gpu)
-  audio_pci = pci_parts(@gpu_audio)
+  if @gpu_passthrough
+    gpu_pci   = pci_parts(@gpu)
+    audio_pci = pci_parts(@gpu_audio)
+  end
 -%>
 <domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
   <name><%= @vm_name %></name>
   <memory unit='KiB'><%= @vm_ram_kib %></memory>
   <currentMemory unit='KiB'><%= @vm_ram_kib %></currentMemory>
+<% if @gpu_passthrough -%>
   <memoryBacking>
     <hugepages/>
   </memoryBacking>
+<% end -%>
   <vcpu placement='static'><%= @vm_vcpus %></vcpu>
   <iothreads>1</iothreads>
+<% if @gpu_passthrough -%>
   <!-- CPU pinning: three-layer isolation for VFIO gaming performance.
        vCPUs pinned to dedicated cores; QEMU emulator + IO thread on host cores.
        overwatch.sh confines host OS (AllowedCPUs) and IRQs to host cores at
@@ -33,6 +78,7 @@
     <emulatorpin cpuset='<%= @emulator_cpuset %>'/>
     <iothreadpin iothread='1' cpuset='<%= @emulator_cpuset %>'/>
   </cputune>
+<% end -%>
   <!-- Anti-cheat vector 4: SMBIOS — real motherboard strings -->
   <sysinfo type='smbios'>
     <bios>
@@ -129,7 +175,7 @@
       <target dev='sdb' bus='scsi'/>
     </disk>
 
-<% if File.exist?(@virtio_iso) -%>
+<% if !@virtio_iso.empty? && File.exist?(@virtio_iso) -%>
     <!-- VirtIO drivers ISO (install-only, removed after Windows setup) -->
     <disk type='file' device='cdrom'>
       <driver name='qemu' type='raw'/>
@@ -139,6 +185,7 @@
     </disk>
 <% end -%>
 
+<% if @gpu_passthrough -%>
     <!-- Anti-cheat vector 5: Real GPU via VFIO passthrough -->
     <hostdev mode='subsystem' type='pci' managed='yes'>
       <source>
@@ -152,6 +199,17 @@
          removing it eliminates any risk of stray interrupts or initialization
          side-effects on the GPU function. The device stays on vfio-pci on the
          host via vfio-pci.ids. -->
+<% else -%>
+    <!-- No GPU passthrough — virtio-vga for headless / validation use.
+         The dGPU stays bound to the host via vfio-pci.ids (or amdgpu),
+         and this VM does not touch it. -->
+    <video>
+      <model type='virtio' heads='1' primary='yes'/>
+    </video>
+    <graphics type='vnc' port='-1' autoport='yes' listen='127.0.0.1'>
+      <listen type='address' address='127.0.0.1'/>
+    </graphics>
+<% end -%>
 
     <!-- Network: bridge, Realtek OUI to avoid QEMU 52:54:00 fingerprint -->
     <interface type='bridge'>
@@ -160,8 +218,7 @@
       <model type='virtio'/>
     </interface>
 
-    <!-- xHCI with 8 ports (keyboard, mouse, strider, tartarus (deferred),
-         steelseries, and spares) -->
+    <!-- xHCI with 8 ports -->
     <controller type='usb' model='qemu-xhci' ports='8'/>
 
 <% @usb_devices.each do |dev| -%>
@@ -174,8 +231,18 @@
     </hostdev>
 
 <% end -%>
+<% if @tartarus_attach -%>
     <!-- Razer Tartarus V2 keypad: NOT here — attached by overwatch.sh after
          Synapse is running so profiles apply on hot-plug (<%= @tartarus['vid'] %>:<%= @tartarus['pid'] %>) -->
+<% elsif @tartarus && !@tartarus.empty? -%>
+    <!-- Razer Tartarus V2 keypad (static USB hostdev) -->
+    <hostdev mode='subsystem' type='usb' managed='yes'>
+      <source>
+        <vendor id='<%= @tartarus['vid'] %>'/>
+        <product id='<%= @tartarus['pid'] %>'/>
+      </source>
+    </hostdev>
+<% end -%>
 
     <!-- QEMU guest agent channel -->
     <channel type='unix'>
@@ -206,8 +273,10 @@
     <qemu:arg value='scsi-hd.vendor=Samsung'/>
     <qemu:arg value='-global'/>
     <qemu:arg value='scsi-hd.product=SSD 870 EVO 1TB'/>
+<% if @gpu_passthrough -%>
     <!-- 64GB MMIO space for 7900 XTX 24GB VRAM (default 32GB is insufficient) -->
     <qemu:arg value='-fw_cfg'/>
     <qemu:arg value='opt/ovmf/X-PciMmio64Mb,string=65536'/>
+<% end -%>
   </qemu:commandline>
 </domain>

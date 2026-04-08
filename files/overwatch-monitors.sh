@@ -1,14 +1,11 @@
 #!/bin/bash
 # overwatch-monitors — background monitors and deferred boot tasks
 #
-# Sourced by overwatch.sh. All functions here run as background jobs during
-# the VM lifecycle. They rely on log() and guest_run_ps() from the main script.
-
-VM_IP="<%= @vm_ip %>"
-WINDOWS_USER="<%= @windows_user %>"
-PCAP_CAPTURE="<%= @pcap_capture ? 'true' : 'false' %>"
-PCAP_SNAPSHOTS="<%= @pcap_snapshots ? 'true' : 'false' %>"
-TRANSITION_STALENESS_DETECTION="<%= @transition_staleness_detection ? 'true' : 'false' %>"
+# Shared across all VM instances. Sourced by /usr/local/bin/overwatch AFTER
+# the per-VM instance.conf has been loaded, so VM_NAME / VM_IP / WINDOWS_USER
+# / ports / PCAP_* / TRANSITION_STALENESS_DETECTION are already in the
+# environment. All functions here run as background jobs during the VM
+# lifecycle and rely on log() and guest_run_ps() from the main script.
 
 # --- Network monitor (2s poll, background) ---
 # Tag: NET_HOST
@@ -27,7 +24,7 @@ TRANSITION_STALENESS_DETECTION="<%= @transition_staleness_detection ? 'true' : '
 #   TRAFFIC_IDLE + no LATENCY_HOST   → OW2/Blizzard-specific, host path fine
 #
 # On TRAFFIC_IDLE, monitor_network snapshots the pcap ring to
-# /var/log/overwatch/snapshots/YYYYMMDD-HHMMSS/ for post-mortem Wireshark.
+# /var/log/overwatch/${VM_NAME}/snapshots/YYYYMMDD-HHMMSS/ for post-mortem Wireshark.
 
 monitor_network() {
     local vnet_if
@@ -80,10 +77,10 @@ monitor_network() {
                 if [ "$PCAP_SNAPSHOTS" = "true" ]; then
                     local snap_ts snap_dir
                     snap_ts=$(date '+%Y%m%d-%H%M%S')
-                    snap_dir="/var/log/overwatch/snapshots/${snap_ts}"
+                    snap_dir="${LOG_DIR}/snapshots/${snap_ts}"
                     (
                         mkdir -p "$snap_dir" 2>/dev/null && \
-                        cp /var/log/overwatch/overwatch.pcap* "$snap_dir/" 2>/dev/null && \
+                        cp "${LOG_DIR}/${VM_NAME}.pcap"* "$snap_dir/" 2>/dev/null && \
                         log "PCAP: snapshot saved → $snap_dir"
                     ) &
                 fi
@@ -108,19 +105,19 @@ monitor_network() {
 # Tag: PCAP
 # Captures all traffic on br0 filtered to VM IP ${VM_IP}.
 # Rolling ring buffer: 20 files × 50MB = 1GB max.
-# Stored in /var/log/overwatch/. Requires tcpdump (apt install tcpdump).
+# Stored in ${LOG_DIR} (/var/log/overwatch/<vm>/). Requires tcpdump.
 #
 # On TRAFFIC_IDLE, monitor_network() snapshots the ring to
-# /var/log/overwatch/snapshots/YYYYMMDD-HHMMSS/ preserving pre-event data.
+# ${LOG_DIR}/snapshots/YYYYMMDD-HHMMSS/ preserving pre-event data.
 #
 # Retrieve for Wireshark:
-#   scp -r host:/var/log/overwatch/snapshots/YYYYMMDD-HHMMSS /tmp/
-#   scp host:/var/log/overwatch/overwatch.pcap* /tmp/  # live ring
+#   scp -r host:/var/log/overwatch/<vm>/snapshots/YYYYMMDD-HHMMSS /tmp/
+#   scp host:/var/log/overwatch/<vm>/<vm>.pcap* /tmp/  # live ring
 # Wireshark filter: udp && ip.addr == ${VM_IP}
 
 monitor_pcap() {
     if [ "$PCAP_CAPTURE" != "true" ]; then
-        log "PCAP: rolling capture disabled (set node['overwatch']['pcap_capture'] = true to enable)"
+        log "PCAP: rolling capture disabled (set instance pcap_capture = true to enable)"
         return
     fi
 
@@ -129,7 +126,7 @@ monitor_pcap() {
         return
     fi
 
-    local pcap_dir="/var/log/overwatch"
+    local pcap_dir="$LOG_DIR"
     if [ ! -d "$pcap_dir" ]; then
         mkdir -p "$pcap_dir" 2>/dev/null || { log "PCAP: cannot create $pcap_dir — skipping"; return; }
         log "PCAP: created $pcap_dir"
@@ -139,9 +136,9 @@ monitor_pcap() {
     chown root:tcpdump "$pcap_dir" 2>/dev/null || true
     chmod 775 "$pcap_dir" 2>/dev/null || true
 
-    log "PCAP: starting rolling capture on br0 (host=${VM_IP}, 20×50MB=1GB, dir=$pcap_dir)"
+    log "PCAP: starting rolling capture on br0 (vm=${VM_NAME} host=${VM_IP}, 20×50MB=1GB, dir=$pcap_dir)"
     exec tcpdump -i br0 -n \
-        -w "${pcap_dir}/overwatch.pcap" \
+        -w "${pcap_dir}/${VM_NAME}.pcap" \
         -C 50 \
         -W 20 \
         "host ${VM_IP}" \
@@ -255,7 +252,7 @@ log_guest_diagnostics() {
     # Delay to avoid contention with attach_tartarus_deferred during boot
     sleep 120
 
-    if ! virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+    if ! virsh qemu-agent-command "$VM_NAME" '{"execute":"guest-ping"}' &>/dev/null; then
         log "SHUTDOWN_DIAG: guest agent unavailable — skipping diagnostics"
         return
     fi
@@ -311,7 +308,7 @@ monitor_guest_perf() {
     # Delay past boot-time contention window
     sleep 120
 
-    if ! virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+    if ! virsh qemu-agent-command "$VM_NAME" '{"execute":"guest-ping"}' &>/dev/null; then
         log "PERF_GUEST: guest agent unavailable — skipping guest perf monitor"
         return
     fi
@@ -326,7 +323,7 @@ monitor_guest_perf() {
 
     log "PERF_GUEST: starting 60s poll loop via LHM WMI"
 
-    while virsh domstate overwatch 2>/dev/null | grep -q "running"; do
+    while virsh domstate "$VM_NAME" 2>/dev/null | grep -q "running"; do
         local out
         out=$(guest_run_ps '$s=Get-WmiObject -Namespace "root\LibreHardwareMonitor" -Class Sensor -EA SilentlyContinue; function g($t,$n){($s|?{$_.SensorType -eq $t -and $_.Name -match $n}|select -f 1).Value}; "load=$(g Load Core)% tcore=$(g Temperature Core)C thot=$(g Temperature Hot)C tmem=$(g Temperature Memory)C clkCore=$(g Clock Core)MHz clkMem=$(g Clock Memory)MHz pwr=$(g Power Package)W vram=$(g SmallData Used)/$(g SmallData Total)MB"' 20) || true
         [ -n "$out" ] && log "PERF_GUEST $out"
@@ -350,7 +347,7 @@ monitor_guest_perf() {
 monitor_guest_network() {
     sleep 120  # avoid boot contention (same as other guest monitors)
 
-    if ! virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+    if ! virsh qemu-agent-command "$VM_NAME" '{"execute":"guest-ping"}' &>/dev/null; then
         log "NET_GUEST: guest agent unavailable -- skipping guest network monitor"
         return
     fi
@@ -358,7 +355,7 @@ monitor_guest_network() {
     log "NET_GUEST: starting 10s poll for NetworkProfile events (ID 10000/10001)"
     local last_seen_id=0
 
-    while virsh domstate overwatch 2>/dev/null | grep -q "running"; do
+    while virsh domstate "$VM_NAME" 2>/dev/null | grep -q "running"; do
         local out
         out=$(guest_run_ps 'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-NetworkProfile/Operational";Id=10000,10001} -MaxEvents 5 -EA SilentlyContinue | Sort-Object RecordId | ForEach-Object { $_.RecordId.ToString() + "|" + $_.Id.ToString() + "|" + $_.TimeCreated.ToString("HH:mm:ss") + "|" + ($_.Message -replace "\n"," " -replace "\s+"," ").Substring(0,[Math]::Min(80,$_.Message.Length)) }' 20) || true
 
@@ -483,7 +480,7 @@ attach_tartarus_deferred() {
     # Wait for guest agent (up to 120s)
     local i elapsed
     for i in $(seq 1 60); do
-        if virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+        if virsh qemu-agent-command "$VM_NAME" '{"execute":"guest-ping"}' &>/dev/null; then
             elapsed=$(( $(date +%s) - start_epoch ))
             log "BOOT_TIMING guest_agent=${elapsed}s"
             break
@@ -496,13 +493,13 @@ attach_tartarus_deferred() {
     # RazerAppEngine starts ~10s earlier but profiles aren't ready until razerwdl is up.
     for i in $(seq 1 60); do
         local ps_out pid status_out
-        ps_out=$(virsh qemu-agent-command overwatch \
+        ps_out=$(virsh qemu-agent-command "$VM_NAME" \
             '{"execute":"guest-exec","arguments":{"path":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe","arg":["-Command","if(Get-Process razerwdl -EA SilentlyContinue){\"RUNNING\"}else{\"WAITING\"}"],"capture-output":true}}' 2>/dev/null) || true
         if [ -n "$ps_out" ]; then
             pid=$(echo "$ps_out" | python3 -c "import sys,json; print(json.load(sys.stdin)['return']['pid'])" 2>/dev/null) || true
             if [ -n "$pid" ]; then
                 sleep 3
-                status_out=$(virsh qemu-agent-command overwatch \
+                status_out=$(virsh qemu-agent-command "$VM_NAME" \
                     "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}" 2>/dev/null) || true
                 if echo "$status_out" | python3 -c "
 import sys,json,base64
@@ -523,7 +520,7 @@ if r.get('out-data'):
     sleep 5
 
     # Attach Tartarus via virsh
-    if virsh attach-device overwatch /dev/stdin --live <<< "$TARTARUS_USB_XML" 2>/dev/null; then
+    if virsh attach-device "$VM_NAME" /dev/stdin --live <<< "$TARTARUS_USB_XML" 2>/dev/null; then
         elapsed=$(( $(date +%s) - start_epoch ))
         log "BOOT_TIMING tartarus=${elapsed}s"
     else
@@ -580,13 +577,13 @@ tartarus_attach_loop() {
     local ga_alive=1
     while true; do
         sleep 5
-        if virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+        if virsh qemu-agent-command "$VM_NAME" '{"execute":"guest-ping"}' &>/dev/null; then
             if [ "$ga_alive" -eq 0 ]; then
                 log "TARTARUS_REATTACH guest agent reconnected — re-running deferred attach"
                 # Best-effort detach so Synapse sees a fresh hot-plug
                 # arrival event. The detach may fail if the device
                 # isn't currently attached (expected on a fresh boot).
-                virsh detach-device overwatch /dev/stdin --live <<< "$TARTARUS_USB_XML" 2>/dev/null || true
+                virsh detach-device "$VM_NAME" /dev/stdin --live <<< "$TARTARUS_USB_XML" 2>/dev/null || true
                 sleep 2
                 attach_tartarus_deferred "$(date +%s)"
                 ga_alive=1

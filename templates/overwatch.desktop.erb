@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=Overwatch
-Comment=Start the Overwatch Windows VM with GPU passthrough
-Exec=bash -c "sudo systemctl start overwatch"
+Name=Overwatch (<%= @vm_name %>)
+Comment=Start the <%= @vm_name %> Windows VM (overwatch instance)
+Exec=bash -c "sudo systemctl start overwatch@<%= @vm_name %>.service"
 Icon=computer
 Terminal=false
 Categories=System;
