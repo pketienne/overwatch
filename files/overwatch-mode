@@ -1,0 +1,187 @@
+#!/bin/bash
+# overwatch-mode — host-mode / vm-mode reboot-based switching helper
+#
+# Used by:
+#   - overwatch@<vm>.service       ExecStartPre=overwatch-mode require vm %i
+#   - ollama.service drop-in       ExecStartPre=overwatch-mode require host
+#   - overwatch-resume.service     ExecStart=overwatch-mode resume
+#
+# Mode is read from /proc/cmdline (overwatch.mode=host|vm) — set at boot
+# by one of the two custom GRUB menuentries written by 40_overwatch_modes.
+#
+# Subcommands:
+#   current                Print current mode (host|vm|unknown).
+#   require vm <vm>        If in vm-mode, exit 0. Otherwise: stash <vm> as the
+#                          pending boot intent, set the next-boot GRUB entry
+#                          to overwatch-vm-mode, schedule a reboot in 2s, and
+#                          exit 1 so the calling unit fails (the reboot is
+#                          already in flight, so the failure is moot).
+#   require host           If in host-mode, exit 0. Otherwise: stash 'host'
+#                          as the pending boot intent, set the next-boot GRUB
+#                          entry to overwatch-host-mode, schedule a reboot,
+#                          exit 1.
+#   resume                 Read /proc/cmdline + /var/lib/overwatch/pending-*
+#                          and start the appropriate service. Run from
+#                          overwatch-resume.service at boot.
+#   clear-pending          Remove the pending state files (manual recovery).
+#
+# Managed by Chef (overwatch cookbook). Do not edit directly.
+
+set -uo pipefail
+
+PENDING_DIR="/var/lib/overwatch"
+PENDING_VM_FILE="${PENDING_DIR}/pending-vm"
+PENDING_HOST_FILE="${PENDING_DIR}/pending-host"
+
+log() {
+    echo "overwatch-mode: $*" >&2
+    logger -t overwatch-mode "$*" 2>/dev/null || true
+}
+
+current_mode() {
+    # /proc/cmdline tokens are space-separated; match overwatch.mode=...
+    local tok mode=unknown
+    for tok in $(cat /proc/cmdline 2>/dev/null); do
+        case "$tok" in
+            overwatch.mode=host) mode=host ;;
+            overwatch.mode=vm)   mode=vm ;;
+        esac
+    done
+    echo "$mode"
+}
+
+ensure_pending_dir() {
+    mkdir -p "$PENDING_DIR" 2>/dev/null || true
+    chmod 0755 "$PENDING_DIR" 2>/dev/null || true
+}
+
+trigger_reboot() {
+    local target_entry="$1"
+    log "setting next-boot GRUB entry to '${target_entry}' and scheduling reboot"
+    if ! grub-reboot "$target_entry" 2>/dev/null; then
+        log "ERROR: grub-reboot '${target_entry}' failed — refusing to reboot"
+        return 1
+    fi
+    # Schedule reboot ~2s out so the calling systemctl client gets a clean
+    # response and any pre-reboot logging flushes. systemd-run --on-active
+    # avoids tying the reboot to the current unit's lifecycle.
+    if ! systemd-run --quiet --on-active=2 systemctl reboot 2>/dev/null; then
+        log "ERROR: systemd-run for reboot failed — falling back to systemctl reboot"
+        systemctl reboot &
+    fi
+    return 0
+}
+
+require_vm() {
+    local vm="${1:-}"
+    if [ -z "$vm" ]; then
+        log "ERROR: require vm needs a VM name argument"
+        return 2
+    fi
+    local mode
+    mode=$(current_mode)
+    if [ "$mode" = "vm" ]; then
+        log "already in vm-mode — proceeding with start of '${vm}'"
+        return 0
+    fi
+
+    ensure_pending_dir
+    echo "$vm" > "$PENDING_VM_FILE"
+    rm -f "$PENDING_HOST_FILE" 2>/dev/null || true
+    log "current mode='${mode}', need vm-mode — pending=${vm}, rebooting"
+    trigger_reboot overwatch-vm-mode || return 1
+    return 1
+}
+
+require_host() {
+    local mode
+    mode=$(current_mode)
+    if [ "$mode" = "host" ]; then
+        log "already in host-mode — proceeding"
+        return 0
+    fi
+
+    ensure_pending_dir
+    : > "$PENDING_HOST_FILE"
+    rm -f "$PENDING_VM_FILE" 2>/dev/null || true
+    log "current mode='${mode}', need host-mode — rebooting"
+    trigger_reboot overwatch-host-mode || return 1
+    return 1
+}
+
+# Boot-time auto-start. Reads mode + pending intent and starts the appropriate
+# service. Always exits 0 so a missing/empty pending file doesn't fail the
+# overwatch-resume.service unit (the service is best-effort observability).
+do_resume() {
+    local mode
+    mode=$(current_mode)
+    log "resume: mode=${mode}"
+
+    case "$mode" in
+        vm)
+            if [ -s "$PENDING_VM_FILE" ]; then
+                local vm
+                vm=$(head -1 "$PENDING_VM_FILE" | tr -d '[:space:]')
+                if [ -n "$vm" ]; then
+                    log "resume: starting overwatch@${vm}.service"
+                    systemctl start "overwatch@${vm}.service" 2>/dev/null || \
+                        log "resume: overwatch@${vm}.service start failed"
+                    rm -f "$PENDING_VM_FILE" 2>/dev/null || true
+                else
+                    log "resume: pending-vm file empty — no VM to start"
+                fi
+            else
+                log "resume: vm-mode boot with no pending VM — nothing to start"
+            fi
+            ;;
+        host)
+            log "resume: starting ollama.service"
+            systemctl start ollama.service 2>/dev/null || \
+                log "resume: ollama.service start failed (already running, masked, or not installed)"
+            rm -f "$PENDING_HOST_FILE" 2>/dev/null || true
+            ;;
+        *)
+            log "resume: cmdline has no overwatch.mode=* marker — doing nothing"
+            ;;
+    esac
+    return 0
+}
+
+clear_pending() {
+    rm -f "$PENDING_VM_FILE" "$PENDING_HOST_FILE" 2>/dev/null || true
+    log "cleared pending state files"
+    return 0
+}
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: overwatch-mode <subcommand> [args]
+
+Subcommands:
+  current               Print current mode (host|vm|unknown)
+  require vm <vm>       Ensure host is in vm-mode for VM <vm> (reboots if needed)
+  require host          Ensure host is in host-mode (reboots if needed)
+  resume                Boot-time auto-start (used by overwatch-resume.service)
+  clear-pending         Remove pending state files
+EOF
+}
+
+CMD="${1:-}"
+shift || true
+
+case "$CMD" in
+    current)         current_mode ;;
+    require)
+        SUB="${1:-}"
+        shift || true
+        case "$SUB" in
+            vm)    require_vm "${1:-}" ;;
+            host)  require_host ;;
+            *)     usage; exit 2 ;;
+        esac
+        ;;
+    resume)          do_resume ;;
+    clear-pending)   clear_pending ;;
+    -h|--help|"")    usage; exit 1 ;;
+    *)               usage; exit 2 ;;
+esac
