@@ -1,0 +1,32 @@
+[Unit]
+Description=Overwatch VM lifecycle (instance %i)
+After=libvirtd.service
+Requires=libvirtd.service
+
+[Service]
+Type=simple
+
+# Mode gate: refuse to start if the host isn't booted in vm-mode. If we're
+# in host-mode (or any other mode), overwatch-mode stashes %i as the pending
+# boot intent, sets the next-boot GRUB entry to overwatch-vm-mode, schedules
+# a reboot, and exits non-zero — which fails the unit, but the reboot is
+# already in flight so the failure is moot. After the reboot, the boot lands
+# in vm-mode and overwatch-resume.service auto-starts overwatch@%i.
+ExecStartPre=/usr/local/bin/overwatch-mode require vm %i
+
+# Mutex: refuse to start if another overwatch instance owns /run/overwatch/active-vm.
+# acquire-mutex writes %i atomically with O_EXCL; fails non-zero on conflict so
+# systemd marks the unit failed and never reaches ExecStart.
+ExecStartPre=/usr/local/bin/overwatch acquire-mutex %i
+
+ExecStart=/usr/local/bin/overwatch start %i
+
+# Always release the mutex on stop, regardless of how the unit exited.
+ExecStopPost=/usr/local/bin/overwatch release-mutex %i
+
+TimeoutStartSec=infinity
+TimeoutStopSec=120
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

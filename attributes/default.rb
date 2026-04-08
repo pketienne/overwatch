@@ -4,12 +4,29 @@
 # Cookbook:: overwatch
 # Attributes:: default
 #
-# Generic defaults. Override machine-specific values (SMBIOS, network,
-# user, etc.) in a policyfile or node attributes.
+# Multi-instance attribute model.
+#
+# Each VM is declared as a key in node['overwatch']['instances']:
+#
+#   default['overwatch']['instances']['dva'] = {
+#     'vm_mac'           => '34:5a:60:b2:e7:41',
+#     'vm_ip'            => '192.168.0.111',
+#     'gpu_passthrough'  => true,
+#     'tartarus_attach'  => true,
+#     ...
+#   }
+#
+# Top-level node['overwatch'][...] keys define cookbook-wide defaults
+# that each instance inherits unless explicitly overridden in the
+# instance hash. The resource merges them at converge time.
+#
+# This file does NOT declare any instances. Per-(host, vm) policyfiles
+# (in symmetra: policyfiles/overwatch/<host>-<vm>.rb) populate the
+# instances hash with concrete values.
 #
 
 # =============================================================================
-# Additional Packages (beyond libvirt cookbook)
+# Cookbook-wide defaults (host-level)
 # =============================================================================
 
 default['overwatch']['packages'] = %w(
@@ -20,147 +37,219 @@ default['overwatch']['packages'] = %w(
   bridge-utils
 )
 
-# =============================================================================
-# VM Definition
-# =============================================================================
+# Linux user that owns the host-side overwatch ergonomics (Desktop shortcut,
+# group memberships). One per host, not per VM.
+default['overwatch']['target_user'] = '' # must override
 
-default['overwatch']['vm_name']      = 'overwatch'
-default['overwatch']['vm_disk_path'] = '/var/lib/libvirt/images/overwatch.qcow2'
-default['overwatch']['vm_disk_size'] = '200G'
-default['overwatch']['vm_app_disk_path'] = '/var/lib/libvirt/images/overwatch-app.qcow2'
-default['overwatch']['vm_ram_kib']   = 50_331_648 # 48 GB
-default['overwatch']['vm_vcpus']     = 6
-default['overwatch']['vm_mac']       = '' # must override
-
-# =============================================================================
-# GPU / PCI (topology-specific — override per host)
-# =============================================================================
-
-default['overwatch']['gpu']       = '0000:03:00.0'
-default['overwatch']['gpu_audio'] = '0000:03:00.1'
-default['overwatch']['igpu']      = '0000:74:00.0'
-default['overwatch']['gpu_rom']   = '/usr/share/qemu/gpu-rom.bin'
-
-# =============================================================================
-# CPU Pinning
-# =============================================================================
-
-default['overwatch']['host_cpus']       = '0-1'
-default['overwatch']['emulator_cpuset'] = '0-1'
-default['overwatch']['vcpu_pins'] = [
-  { 'vcpu' => 0, 'cpuset' => '2' },
-  { 'vcpu' => 1, 'cpuset' => '3' },
-  { 'vcpu' => 2, 'cpuset' => '4' },
-  { 'vcpu' => 3, 'cpuset' => '5' },
-  { 'vcpu' => 4, 'cpuset' => '6' },
-  { 'vcpu' => 5, 'cpuset' => '7' },
-]
-
-# =============================================================================
-# SMBIOS (match real host hardware for anti-cheat — override per host)
-# =============================================================================
-
-default['overwatch']['smbios'] = {
-  'bios_vendor'        => 'American Megatrends International, LLC.',
-  'bios_version'       => '',
-  'bios_date'          => '',
-  'sys_manufacturer'   => '',
-  'sys_product'        => '',
-  'sys_version'        => '1.0',
-  'board_manufacturer' => '',
-  'board_product'      => '',
-  'board_version'      => '1.0',
-  'board_serial'       => 'To be filled by O.E.M.',
-  'sys_serial'         => 'To be filled by O.E.M.',
-}
-
-# =============================================================================
-# USB Devices (passthrough to VM)
-# =============================================================================
-
-default['overwatch']['usb_devices'] = []
-
-# Tartarus V2: attached at runtime by overwatch.sh after Synapse is running
-default['overwatch']['tartarus'] = { 'vid' => '0x1532', 'pid' => '0x022b' }
-
-# =============================================================================
-# Network
-# =============================================================================
-
+# Network bridge & uplink (one per host)
 default['overwatch']['bridge_name']         = 'br0'
 default['overwatch']['physical_interface']  = '' # must override
 default['overwatch']['host_ip']             = '' # must override
-default['overwatch']['vm_ip']               = '' # must override
-default['overwatch']['shutdown_signal_port'] = 9147
-default['overwatch']['transition_signal_port'] = 9148
 
-# =============================================================================
-# Packet capture (br0 rolling tcpdump + on-disconnect snapshots)
-# =============================================================================
-# Three independent toggles:
+# vm_mac + vm_ip are HOST-WIDE, not per-instance.
 #
-#   pcap_capture        — false → monitor_pcap() exits early; no rolling capture
-#                         true  → tcpdump runs as a 20×50MB rolling ring buffer
-#                                 on br0 filtered to the VM IP
+# !!! ANTI-CHEAT LOCKED !!!
+# All overwatch instances on this host share a single Windows registration,
+# Razer Synapse cloud binding, Battle.net hardware identity, and OW2 Ricochet
+# hardware-fingerprint hash. Windows binds these to the NIC MAC + SMBIOS +
+# disk serials + CPU + RAM. Two instances with the same MAC + SMBIOS look
+# like one machine to Windows — a fresh install on either activates against
+# the same entitlement.
 #
-#   pcap_snapshots      — false → no snapshots saved on TRAFFIC_IDLE
-#                         true  → on each TRAFFIC_IDLE event, copies the live
-#                                 ring buffer to /var/log/overwatch/snapshots/
-#                                 YYYYMMDD-HHMMSS/ for post-incident Wireshark.
-#                                 Only meaningful when pcap_capture = true.
+# Concurrency safety (same MAC on the same L2 segment is normally a disaster):
+#   1. /run/overwatch/active-vm  cross-VM mutex (refuses concurrent starts)
+#   2. libvirt lock manager      on the shared D: qcow2
+#   3. /run/overwatch/<vm>.lock  per-VM flock (auto-released on crash)
+# These three layers ensure only one instance is ever on the bridge.
 #
-#   pcap_snapshot_keep  — 0 → no pruning (snapshots accumulate forever)
-#                         N → logrotate's lastaction prunes the snapshots
-#                             directory daily, keeping the N most recent.
+# Once registered, vm_mac MUST NEVER change. Editing it forces Windows
+# re-registration and may trigger an anti-cheat ban review.
+default['overwatch']['vm_mac'] = '' # must override per host
+default['overwatch']['vm_ip']  = '' # must override per host
 
-default['overwatch']['pcap_capture']         = false
-default['overwatch']['pcap_snapshots']       = false
-default['overwatch']['pcap_snapshot_keep']   = 0
+# Windows computer name — also HOST-WIDE for the same shared-registration
+# reasons as vm_mac. The Windows hostname is part of how Razer Synapse,
+# Battle.net, and (some) anti-cheat systems identify "the same machine I
+# saw last time". Every overwatch instance on this host boots into a
+# Windows install that uses this hostname (autounattend.xml during fresh
+# install; preserved across reboots thereafter). Once an instance has
+# registered Windows under this hostname, it must NEVER change without
+# planning re-registration.
+default['overwatch']['windows_hostname'] = '' # must override per host
 
-# =============================================================================
-# Transition Throttle
-# =============================================================================
-# Renders templates/transition-throttle.ps1.erb to a PowerShell script that
-# manages OW2's CPU affinity to mitigate VFIO TDR bursts on transitions.
+# GRUB kernel parameters (host-wide).
 #
-#   enabled              — false → renders an exit-0 stub (script is a no-op)
-#                          true  → full throttle script with Pause/Break hotkey
-#   auto_detect          — only meaningful when enabled = true
-#                          false → manual hotkey toggle only (matches live VM)
-#                          true  → adds GPU loading-screen detection
-#   staleness_detection  — host-side observability for the transition listener
-#                          false → simple blocking recvfrom (no liveness check)
-#                          true  → 60s heartbeat queries the guest for the
-#                                  throttle script process; emits a synthetic
-#                                  TRANSITION throttle_reset stale=Ns event if
-#                                  the script died without sending 'stopped'
-
-default['overwatch']['transition_throttle']['enabled']             = true
-default['overwatch']['transition_throttle']['auto_detect']         = false
-default['overwatch']['transition_throttle']['staleness_detection'] = false
-
-# =============================================================================
-# Host / User
-# =============================================================================
-
-default['overwatch']['target_user']  = '' # must override (Linux username)
-default['overwatch']['windows_user'] = '' # must override (Windows guest username)
-default['overwatch']['virtio_iso']   = '' # path to virtio-win.iso (optional)
-
-# =============================================================================
-# GRUB Kernel Parameters
-# =============================================================================
-
-default['overwatch']['grub_cmdline_params'] = %w(
+# Two boot-time modes selected via custom GRUB menuentries (see
+# templates/40_overwatch_modes.erb). The mode marker (overwatch.mode=host|vm)
+# is read by /usr/local/bin/overwatch-mode at runtime to gate service starts.
+#
+#   host-mode (default): dGPU on amdgpu, ollama can use it for inference,
+#                        full host CPU/RAM available, no hugepages reserved.
+#                        Browser can use the dGPU per-app via DRI_PRIME=1.
+#   vm-mode:             dGPU on vfio-pci at boot, hugepages reserved,
+#                        host CPUs 2-7 isolated for vCPU pinning, VM auto-
+#                        started by overwatch-resume.service after boot.
+#
+# Mode switching is reboot-based: `systemctl start overwatch@<vm>` (or the
+# desktop shortcut) calls `overwatch-mode require vm` which sets a one-shot
+# next-boot entry via grub-reboot, then triggers a reboot. Same for ollama
+# via the systemd drop-in installed by this cookbook.
+default['overwatch']['grub_cmdline_common'] = %w(
   amd_iommu=on
   iommu=pt
+  kvm_amd.avic=1
+  kvm.ignore_msrs=1
+  kvm.report_ignored_msrs=0
+)
+
+default['overwatch']['grub_cmdline_host_mode'] = %w(
+  overwatch.mode=host
+)
+
+default['overwatch']['grub_cmdline_vm_mode'] = %w(
+  overwatch.mode=vm
   hugepages=24576
   isolcpus=domain,managed_irq,2-7
   nohz_full=2-7
   rcu_nocbs=2-7
   vfio-pci.ids=1002:744c,1002:ab30
   vfio-pci.disable_vga=1
-  kvm_amd.avic=1
-  kvm.ignore_msrs=1
-  kvm.report_ignored_msrs=0
 )
+
+# Per-host GPU topology (passthrough VMs reference this; non-passthrough VMs ignore)
+default['overwatch']['gpu']       = '0000:03:00.0'
+default['overwatch']['gpu_audio'] = '0000:03:00.1'
+default['overwatch']['igpu']      = '0000:74:00.0'
+
+# gpu_rom: !!! ANTI-CHEAT RELEVANT !!!
+# The vBIOS file QEMU loads for the passthrough GPU. Its contents
+# determine the device subsystem ID and init sequence Windows sees on
+# boot. Replacing this file changes how the dGPU appears to the guest
+# and may affect Ricochet's hardware-fingerprint hash. Don't swap it
+# unless you've also planned for re-registration.
+default['overwatch']['gpu_rom'] = '/usr/share/qemu/gpu-rom.bin'
+
+# Reserved host CPU set (used by passthrough launcher to confine host work)
+default['overwatch']['host_cpus']       = '0-1'
+default['overwatch']['emulator_cpuset'] = '0-1'
+
+# Optional virtio-win.iso (used during fresh Windows install only)
+default['overwatch']['virtio_iso'] = ''
+
+# SMBIOS — host motherboard fingerprint shown to every guest for anti-cheat.
+# Tied to the physical host, not the VM, so it's host-wide. Each VM presents
+# the SAME smbios to its guest, matching the real hardware on this host.
+# Override the populated values in the host-(or per-(host,vm)) policyfile.
+#
+# !!! ANTI-CHEAT LOCKED !!!
+# Every field in this hash contributes to the Windows hardware hash that
+# OS licensing, MS Store activation, Razer Synapse cloud binding, and OW2
+# Ricochet anti-cheat use to fingerprint the machine. Once an instance has
+# booted Windows for the first time, these values must NEVER change for
+# that instance. Edit only when the actual host hardware (motherboard /
+# BIOS) is replaced; then plan a Windows re-registration.
+default['overwatch']['smbios'] = {
+  'bios_vendor' => 'American Megatrends International, LLC.',
+  'bios_version' => '',
+  'bios_date' => '',
+  'sys_manufacturer' => '',
+  'sys_product' => '',
+  'sys_version' => '1.0',
+  'board_manufacturer' => '',
+  'board_product' => '',
+  'board_version' => '1.0',
+  'board_serial' => 'To be filled by O.E.M.',
+  'sys_serial' => 'To be filled by O.E.M.',
+}
+
+# Shared application disk (D:) — single qcow2 holding the OW2 install,
+# referenced by EVERY instance XML. libvirt's lock manager prevents two
+# VMs from opening it simultaneously, and the launcher mutex enforces
+# single-VM at the systemd layer. OW2 progress lives on C: + Battle.net
+# cloud, so the shared D: has no per-VM state to conflict over.
+default['overwatch']['shared_app_disk_path'] = '/var/lib/libvirt/images/overwatch/shared-app.qcow2'
+default['overwatch']['shared_app_disk_size'] = '128G'
+
+# =============================================================================
+# Instance defaults (template merged into each instance hash)
+# =============================================================================
+#
+# A policyfile sets node['overwatch']['instances']['<vm>'] = { ... }; the
+# resource deep-merges these defaults underneath so policyfiles only need to
+# specify the keys that differ from the default.
+
+default['overwatch']['instance_defaults'] = {
+  # --- VM topology ---
+  #
+  # !!! ANTI-CHEAT LOCKED FIELDS !!!
+  # vm_ram_kib and vm_vcpus feed the Windows hardware hash used by OS
+  # licensing, MS Store activation, Razer Synapse cloud binding, and OW2
+  # Ricochet anti-cheat. All instances on this host share a single
+  # registration (see node['overwatch']['vm_mac'] / smbios), so editing
+  # these for one instance breaks the shared fingerprint for all of them.
+  # Once any instance has booted Windows for the first time, these values
+  # must NEVER change.
+  'vm_disk_size' => '200G',
+  'vm_ram_kib' => 50_331_648, # 48 GB
+  'vm_vcpus' => 6,
+
+  # --- Capability toggles ---
+  # gpu_passthrough = true  → launcher runs the full vfio handoff dance,
+  #                           XML includes the dGPU hostdev, host CPU isolation
+  #                           is applied, services (gdm/openrgb/ollama) cycle
+  # gpu_passthrough = false → launcher just `virsh start`s the VM as-is,
+  #                           XML uses virtio-vga, no host disruption
+  'gpu_passthrough' => true,
+
+  # tartarus_attach = true  → launcher runs the deferred Tartarus hot-plug
+  #                           loop after Synapse is ready (and re-fires on
+  #                           every guest reboot). Tartarus is NOT in the
+  #                           static XML in this case.
+  # tartarus_attach = false → no deferred attach loop; Tartarus (if any) is
+  #                           in the static USB hostdev list
+  'tartarus_attach' => false,
+
+  # --- vCPU pinning (only used when gpu_passthrough = true) ---
+  'vcpu_pins' => [
+    { 'vcpu' => 0, 'cpuset' => '2' },
+    { 'vcpu' => 1, 'cpuset' => '3' },
+    { 'vcpu' => 2, 'cpuset' => '4' },
+    { 'vcpu' => 3, 'cpuset' => '5' },
+    { 'vcpu' => 4, 'cpuset' => '6' },
+    { 'vcpu' => 5, 'cpuset' => '7' },
+  ],
+
+  # --- USB devices (libvirt static hostdev list) ---
+  'usb_devices' => [],
+
+  # --- Tartarus device id (consumed by deferred-attach when enabled) ---
+  'tartarus' => { 'vid' => '0x1532', 'pid' => '0x022b' },
+
+  # --- Per-VM listener ports ---
+  # Distinct per instance even though only one VM ever runs at a time
+  # (the launcher mutex enforces single-instance). Distinct ports keep
+  # journald log lines unambiguous about which VM emitted what.
+  'shutdown_signal_port' => 9147,
+  'transition_signal_port' => 9148,
+
+  # --- Guest user ---
+  'windows_user' => '', # must override per instance
+
+  # --- Packet capture toggles ---
+  'pcap_capture' => false,
+  'pcap_snapshots' => false,
+  'pcap_snapshot_keep' => 0,
+
+  # --- Transition throttle (only meaningful when gpu_passthrough = true) ---
+  'transition_throttle' => {
+    'enabled' => true,
+    'auto_detect' => false,
+    'staleness_detection' => false,
+  },
+}
+
+# =============================================================================
+# Instances — populated by per-(host, vm) policyfiles, NOT here
+# =============================================================================
+
+default['overwatch']['instances'] = {}
