@@ -149,6 +149,52 @@ gpu_driver() {
     fi
 }
 
+# Reads /proc/cmdline for the overwatch.mode=host|vm marker. Echoes one of
+# "host", "vm", or "unknown". Used by _do_start and _do_stop to branch
+# between the Pass 4 reboot-based mode-switching path (vm-mode: GPU is
+# already on vfio-pci from boot, no in-uptime rebind needed) and the
+# legacy in-uptime rebind path ("unknown" means we booted before Pass 4
+# was active, so fall back to the GPU dance).
+boot_mode() {
+    local tok
+    for tok in $(cat /proc/cmdline 2>/dev/null); do
+        case "$tok" in
+            overwatch.mode=host) echo host; return 0 ;;
+            overwatch.mode=vm)   echo vm;   return 0 ;;
+        esac
+    done
+    echo unknown
+}
+
+# Defense-in-depth precondition check for the Pass 4 vm-mode start path.
+# Called from _do_start when boot_mode==vm. Verifies that the kernel really
+# was booted with overwatch.mode=vm AND that the dGPU + audio function are
+# already on vfio-pci (which they should be, since vfio-pci.ids in the
+# vm-mode cmdline claims them at boot). If either check fails, something
+# rebound the GPU since boot, or the cmdline marker is missing — refuse to
+# start and let the user diagnose.
+ensure_vm_mode_ready() {
+    local mode gpu_drv audio_drv
+    mode=$(boot_mode)
+    if [ "$mode" != "vm" ]; then
+        log "ERROR: host boot mode is '${mode}', not 'vm'"
+        log "       use 'systemctl start overwatch@${VM_NAME}.service' (which triggers"
+        log "       'overwatch-mode require vm') or run 'overwatch-mode require vm ${VM_NAME}'"
+        log "       to one-shot reboot into vm-mode."
+        return 1
+    fi
+    gpu_drv=$(gpu_driver "$GPU")
+    audio_drv=$(gpu_driver "$GPU_AUDIO")
+    if [ "$gpu_drv" != "vfio-pci" ] || [ "$audio_drv" != "vfio-pci" ]; then
+        log "ERROR: vm-mode boot but GPU not on vfio-pci (gpu=$gpu_drv, audio=$audio_drv)"
+        log "       this should not happen — vfio-pci.ids in the cmdline should claim"
+        log "       both devices at boot. Check dmesg for vfio-pci probe failures."
+        return 1
+    fi
+    log "vm-mode preconditions OK (gpu=$gpu_drv, audio=$audio_drv)"
+    return 0
+}
+
 # PCIe Secondary Bus Reset + readiness poll via setpci.
 # RX 7900 XTX only supports SBR (no FLR); resets both 03:00.0 and 03:00.1.
 # Logs: reset completion time and vendor ID readiness.
@@ -769,14 +815,30 @@ ensure_services_running() {
 _do_stop() {
     log "=== Restoring host state ==="
 
+    local _mode
+    _mode=$(boot_mode)
+
+    # Always: stop the VM and restore host CPU tunables. Both are safe in
+    # both boot modes (VM stop is a libvirt op; CPU tunables are host-side
+    # scheduling config).
     ensure_vm_stopped
     ensure_cpu_defaults
-    ensure_gpu_unbound_from_vfio
-    set_igpu_blank 0 unblank || true
-    ensure_services_running
-    # GPU rebind last — user already has desktop on iGPU via GDM.
-    # If this hangs or fails, the session is still usable.
-    ensure_gpu_on_host || log "WARNING: Could not restore GPU to host — iGPU only"
+
+    if [ "$_mode" = "vm" ]; then
+        # Pass 4 vm-mode: dGPU stays on vfio-pci. Returning to host-mode
+        # (amdgpu, ollama on dGPU) is a reboot, not a runtime op. No
+        # in-uptime rebind dance, no iGPU blanking dance, no service
+        # coordination — the kernel command line pins everything at boot.
+        log "vm-mode stop complete — dGPU stays on vfio-pci (host-mode is a reboot away)"
+    else
+        # Legacy path: reverse the in-uptime rebind dance.
+        ensure_gpu_unbound_from_vfio
+        set_igpu_blank 0 unblank || true
+        ensure_services_running
+        # GPU rebind last — user already has desktop on iGPU via GDM.
+        # If this hangs or fails, the session is still usable.
+        ensure_gpu_on_host || log "WARNING: Could not restore GPU to host — iGPU only"
+    fi
 
     log "=== Host restored ==="
 }
@@ -784,50 +846,94 @@ _do_stop() {
 _do_start() {
     log "=== Starting Overwatch VM ==="
 
-    # --- SIGTERM deferral during GPU handoff ---
-    # The GPU handoff (host → vfio → VM) puts the system in a transitional state.
-    # If SIGTERM (from systemctl stop) arrives mid-handoff and we immediately try
-    # to reverse the GPU operations, the half-unbound GPU causes a kernel panic.
-    # Solution: defer SIGTERM during the critical section, then handle it once
-    # the system is in a stable state (VM running, or fully rolled back).
-    local SIGTERM_DEFERRED=false
-    trap 'SIGTERM_DEFERRED=true; log "SIGTERM deferred — GPU handoff in progress"' TERM
+    local _mode
+    _mode=$(boot_mode)
 
-    # Refuse if VM already running
-    if virsh domstate "$VM_NAME" 2>/dev/null | grep -q "running"; then
-        log "ERROR: VM is already running. Use 'systemctl stop overwatch' to stop it."
-        exit 1
+    if [ "$_mode" = "vm" ]; then
+        # --- Pass 4 vm-mode path: dGPU already on vfio-pci from boot ---
+        # No SIGTERM deferral needed (no critical GPU handoff section).
+        # No GPU dance, no service coordination, no VT unbind, no iGPU blank.
+        # Just verify preconditions and start the VM.
+
+        # Refuse if VM already running
+        if virsh domstate "$VM_NAME" 2>/dev/null | grep -q "running"; then
+            log "ERROR: VM is already running. Use 'systemctl stop overwatch@${VM_NAME}.service' to stop it."
+            exit 1
+        fi
+
+        # Defense-in-depth: verify the cmdline marker + dGPU binding.
+        ensure_vm_mode_ready || { log "ERROR: vm-mode preconditions not met"; exit 1; }
+
+        # Start the VM. libvirt domain XML references the already-bound
+        # vfio-pci GPU via hostdev PCI address.
+        ensure_vm_running || { log "ERROR: VM start failed"; exit 1; }
+
+        # Install SIGTERM handler for the monitor loop
+        _on_sigterm() {
+            log "Received SIGTERM (systemctl stop) — shutting down..."
+            _do_stop
+            exit 0
+        }
+        trap '_on_sigterm' TERM
+
+        # Post-VM-start performance tuning (non-critical, continue on failure)
+        ensure_performance_tuning
+        apply_sched_fifo
+
+        log "vm-mode start complete — GPU on vfio-pci from boot"
+    else
+        # --- Legacy boot_mode=unknown path: in-uptime GPU rebind dance ---
+        # Kept for backwards compat during the Pass 4 migration. Removed in
+        # iter J after Pass 4 is validated end-to-end on erasimus. When the
+        # kernel was booted without an `overwatch.mode=*` marker, boot_mode()
+        # returns "unknown" and this branch runs — preserving the pre-Pass-4
+        # behavior so dva keeps working during the migration transition.
+
+        # --- SIGTERM deferral during GPU handoff ---
+        # The GPU handoff (host → vfio → VM) puts the system in a transitional state.
+        # If SIGTERM (from systemctl stop) arrives mid-handoff and we immediately try
+        # to reverse the GPU operations, the half-unbound GPU causes a kernel panic.
+        # Solution: defer SIGTERM during the critical section, then handle it once
+        # the system is in a stable state (VM running, or fully rolled back).
+        local SIGTERM_DEFERRED=false
+        trap 'SIGTERM_DEFERRED=true; log "SIGTERM deferred — GPU handoff in progress"' TERM
+
+        # Refuse if VM already running
+        if virsh domstate "$VM_NAME" 2>/dev/null | grep -q "running"; then
+            log "ERROR: VM is already running. Use 'systemctl stop overwatch' to stop it."
+            exit 1
+        fi
+
+        # === CRITICAL SECTION: GPU handoff (SIGTERM deferred) ===
+        ensure_services_stopped
+        ensure_device_fds_released
+        ensure_vt_unbound
+        ensure_gpu_unbound_from_host
+        ensure_gpu_on_vfio || { log "ERROR: VFIO bind failed"; _do_stop; exit 1; }
+        ensure_vm_running || { log "ERROR: VM start failed"; _do_stop; exit 1; }
+        # === END CRITICAL SECTION ===
+
+        # Stable state reached: VM running, GPU on vfio-pci.
+        # If SIGTERM arrived during handoff, do a clean shutdown now.
+        if [ "$SIGTERM_DEFERRED" = true ]; then
+            log "Processing deferred SIGTERM — stopping VM..."
+            _do_stop
+            exit 0
+        fi
+
+        # Install interruptible SIGTERM handler for the wait loop
+        _on_sigterm() {
+            log "Received SIGTERM (systemctl stop) — shutting down..."
+            _do_stop
+            exit 0
+        }
+        trap '_on_sigterm' TERM
+
+        # Post-VM-start setup (non-critical, continue on failure)
+        set_igpu_blank 4 blank || true
+        ensure_performance_tuning
+        apply_sched_fifo
     fi
-
-    # === CRITICAL SECTION: GPU handoff (SIGTERM deferred) ===
-    ensure_services_stopped
-    ensure_device_fds_released
-    ensure_vt_unbound
-    ensure_gpu_unbound_from_host
-    ensure_gpu_on_vfio || { log "ERROR: VFIO bind failed"; _do_stop; exit 1; }
-    ensure_vm_running || { log "ERROR: VM start failed"; _do_stop; exit 1; }
-    # === END CRITICAL SECTION ===
-
-    # Stable state reached: VM running, GPU on vfio-pci.
-    # If SIGTERM arrived during handoff, do a clean shutdown now.
-    if [ "$SIGTERM_DEFERRED" = true ]; then
-        log "Processing deferred SIGTERM — stopping VM..."
-        _do_stop
-        exit 0
-    fi
-
-    # Install interruptible SIGTERM handler for the wait loop
-    _on_sigterm() {
-        log "Received SIGTERM (systemctl stop) — shutting down..."
-        _do_stop
-        exit 0
-    }
-    trap '_on_sigterm' TERM
-
-    # Post-VM-start setup (non-critical, continue on failure)
-    set_igpu_blank 4 blank || true
-    ensure_performance_tuning
-    apply_sched_fifo
 
     log_state "vm_running"
     log "VM running. Waiting for shutdown..."
