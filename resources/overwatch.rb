@@ -144,10 +144,19 @@ action :install do
     # Explicitly NOT setting GRUB_RECORDFAIL_TIMEOUT so the Ubuntu default
     # behavior (show menu until user intervention on recordfail) is preserved
     # as a troubleshooting escape hatch.
+    #
+    # GRUB_CMDLINE_LINUX_DEFAULT is cleaned to just "quiet splash" so
+    # 40_overwatch_modes.erb's distro_cmdline inheritance doesn't drag in
+    # stale pre-Pass-4 params (vfio-pci.ids, hugepages, isolcpus, etc.)
+    # that would make host-mode no longer actually host-mode. The per-mode
+    # params now come exclusively from grub_cmdline_common +
+    # grub_cmdline_{host,vm}_mode baked into the menuentries. The plain
+    # Ubuntu entry (from 10_linux) becomes a clean "rescue" option.
     grub_settings = {
-      'GRUB_DEFAULT'       => 'saved',
-      'GRUB_TIMEOUT'       => '10',
-      'GRUB_TIMEOUT_STYLE' => 'menu',
+      'GRUB_DEFAULT'              => 'saved',
+      'GRUB_TIMEOUT'              => '10',
+      'GRUB_TIMEOUT_STYLE'        => 'menu',
+      'GRUB_CMDLINE_LINUX_DEFAULT' => '"quiet splash"',
     }
 
     ruby_block 'configure_grub_defaults' do
