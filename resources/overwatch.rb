@@ -283,6 +283,34 @@ action :install do
     notifies :run, 'execute[systemctl-daemon-reload]', :immediately
   end
 
+  # --- Pass 3.7 migration bridge (drop-in for legacy overwatch.service) ---
+  #
+  # See attributes/default.rb for the legacy_overwatch_service_bridge
+  # toggle. Only deployed when that attribute is true (set by the
+  # transitional current-state policyfile during migration iterations 2-3).
+  # Lets the pre-Pass-3.7 overwatch.service unit continue managing dva
+  # after the launcher has been replaced, by overriding its ExecStart to
+  # pass "dva" as the VM_NAME arg that the new launcher requires.
+  #
+  # REMOVED (both this block and the attribute) from the cookbook after
+  # iteration 3 of the migration, when dva is cut over to the new
+  # overwatch@dva.service template unit.
+  if node['overwatch']['legacy_overwatch_service_bridge']
+    directory '/etc/systemd/system/overwatch.service.d' do
+      owner 'root'
+      group 'root'
+      mode '0755'
+    end
+
+    cookbook_file '/etc/systemd/system/overwatch.service.d/execstart-dva.conf' do
+      source 'execstart-dva.conf'
+      owner 'root'
+      group 'root'
+      mode '0644'
+      notifies :run, 'execute[systemctl-daemon-reload]', :immediately
+    end
+  end
+
   execute 'systemctl-daemon-reload' do
     command 'systemctl daemon-reload'
     action :nothing

@@ -232,3 +232,23 @@ default['overwatch']['instance_defaults'] = {
 # =============================================================================
 
 default['overwatch']['instances'] = {}
+
+# =============================================================================
+# Migration bridges — temporary, removed when migration is complete
+# =============================================================================
+
+# Pass 3.7 migration bridge: when true, the cookbook deploys a drop-in at
+# /etc/systemd/system/overwatch.service.d/execstart-dva.conf that overrides
+# the legacy overwatch.service unit's ExecStart to pass "dva" as an arg to
+# the new parameterized launcher. This lets the pre-Pass-3.7 systemd unit
+# continue managing dva AFTER the launcher has been replaced by the Pass 3.7
+# version during the first converge, without requiring a restart of dva.
+#
+# Set to true in the transitional current-state policyfile
+# (symmetra/policyfiles/overwatch/erasimus-current.rb) during Pass 3.7
+# migration iterations 2-3. The desired-state policyfile leaves this false.
+# The attribute and the resources it guards are REMOVED from the cookbook
+# after iteration 3 of the migration, when dva is cut over to the new
+# overwatch@dva.service template unit and the old overwatch.service + this
+# drop-in are deleted.
+default['overwatch']['legacy_overwatch_service_bridge'] = false
