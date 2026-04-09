@@ -33,7 +33,7 @@ action_class do
     merged = Chef::Mixin::DeepMerge.deep_merge(raw.to_h, defaults)
     merged['vm_name']         = vm_name
     merged['vm_disk_path']    = "/var/lib/libvirt/images/overwatch/#{vm_name}.qcow2"
-    merged['vm_app_disk_path'] = node['overwatch']['shared_app_disk_path']
+    merged['vm_app_disk_path'] = "/var/lib/libvirt/images/overwatch/#{vm_name}-app.qcow2"
     merged['stage_dir']       = "/usr/local/share/overwatch/#{vm_name}"
     merged['log_dir']         = "/var/log/overwatch/#{vm_name}"
     merged['state_dir']       = "/var/lib/overwatch/#{vm_name}"
@@ -302,13 +302,12 @@ action :install do
     )
   end
 
-  # Shared application disk (D:) — single qcow2 referenced by every instance XML.
-  # libvirt's lock manager prevents concurrent open; the launcher mutex enforces
-  # single-VM at the systemd layer.
-  execute 'create-shared-app-disk' do
-    command "qemu-img create -f qcow2 #{node['overwatch']['shared_app_disk_path']} #{node['overwatch']['shared_app_disk_size']}"
-    not_if { ::File.exist?(node['overwatch']['shared_app_disk_path']) }
-  end
+  # Per-VM application disk (D:) is now created inside the instance loop
+  # alongside the per-VM C: disk. Each instance gets its own
+  # <vm_name>-app.qcow2 so instances are fully isolated — no shared D:,
+  # no libvirt lock contention, no cross-contamination risk. The launcher
+  # mutex still enforces single-instance at the systemd layer (anti-cheat
+  # + dGPU passthrough singleton).
 
   # Static cookbook_files used by ALL VMs (each instance's setup-guest pushes
   # them from /usr/local/share/overwatch/<vm>/, so symlink each per-VM stage
@@ -417,6 +416,12 @@ action :install do
     execute "create-vm-disk-#{vm_name}" do
       command "qemu-img create -f qcow2 #{inst['vm_disk_path']} #{inst['vm_disk_size']}"
       not_if { ::File.exist?(inst['vm_disk_path']) }
+    end
+
+    # Per-VM D: application disk. Each instance has its own; no shared D:.
+    execute "create-vm-app-disk-#{vm_name}" do
+      command "qemu-img create -f qcow2 #{inst['vm_app_disk_path']} #{node['overwatch']['vm_app_disk_size']}"
+      not_if { ::File.exist?(inst['vm_app_disk_path']) }
     end
 
     # Per-VM libvirt domain XML + define

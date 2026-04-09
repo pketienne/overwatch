@@ -143,13 +143,11 @@ default['overwatch']['smbios'] = {
   'sys_serial' => 'To be filled by O.E.M.',
 }
 
-# Shared application disk (D:) — single qcow2 holding the OW2 install,
-# referenced by EVERY instance XML. libvirt's lock manager prevents two
-# VMs from opening it simultaneously, and the launcher mutex enforces
-# single-VM at the systemd layer. OW2 progress lives on C: + Battle.net
-# cloud, so the shared D: has no per-VM state to conflict over.
-default['overwatch']['shared_app_disk_path'] = '/var/lib/libvirt/images/overwatch/shared-app.qcow2'
-default['overwatch']['shared_app_disk_size'] = '128G'
+# Per-VM application disk (D:) default size. Each instance gets its own
+# <vm_name>-app.qcow2 (path derived from vm_name in resources/overwatch.rb's
+# instance_for method). No shared D: — instances are fully isolated to
+# avoid cross-contamination between production (dva) and test (mercy) VMs.
+default['overwatch']['vm_app_disk_size'] = '128G'
 
 # =============================================================================
 # Instance defaults (template merged into each instance hash)
