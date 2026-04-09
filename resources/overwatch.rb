@@ -263,12 +263,31 @@ action :install do
         mode '0755'
       end
 
-      cookbook_file "#{unit_d_dir}/overwatch-mode.conf" do
+      # Drop-in filename is '00-overwatch-mode.conf' (not 'overwatch-mode.conf')
+      # so it sorts alphabetically BEFORE any other drop-ins the target unit
+      # might have. This matters because systemd reads drop-ins in alphabetical
+      # order and processes ExecStartPre directives in that order — if another
+      # drop-in's ExecStartPre exits non-zero first, the overwatch-mode gate
+      # never runs and the reboot-to-host-mode never triggers.
+      #
+      # Example: on erasimus, an existing gpu-check.conf drop-in on
+      # ollama.service has ExecStartPre=/usr/local/bin/ollama-gpu-check which
+      # exits 1 when the dGPU isn't on amdgpu. Without the 00- prefix, that
+      # ran before overwatch-mode require host and blocked the reboot trigger.
+      cookbook_file "#{unit_d_dir}/00-overwatch-mode.conf" do
         source 'host-mode-require.conf'
         cookbook 'overwatch'
         owner 'root'
         group 'root'
         mode '0644'
+        notifies :run, 'execute[systemctl-daemon-reload]', :immediately
+      end
+
+      # Clean up the old-named drop-in from pre-fix deployments. Idempotent
+      # (no-op if absent). Can be removed in iter J along with the rest of
+      # the Pass 4 transitional scaffolding.
+      file "#{unit_d_dir}/overwatch-mode.conf" do
+        action :delete
         notifies :run, 'execute[systemctl-daemon-reload]', :immediately
       end
 
