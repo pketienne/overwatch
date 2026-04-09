@@ -13,7 +13,13 @@ Type=simple
 # grub-set-default), schedules a reboot, and exits non-zero. systemd fails
 # the unit but the reboot is in flight. After the reboot, overwatch-resume.service
 # auto-starts overwatch@%i in vm-mode.
-ExecStartPre=/usr/local/bin/overwatch-mode require vm %i
+#
+# The `+` prefix runs this ExecStartPre as root regardless of any User=/Group=
+# directive — overwatch-mode needs root to write /var/lib/overwatch/pending-vm,
+# run grub-set-default, and invoke systemd-run. overwatch@<vm>.service currently
+# defaults to root (no User= set) so the `+` is redundant here, but it
+# documents intent and is defensive against future changes that add User=.
+ExecStartPre=+/usr/local/bin/overwatch-mode require vm %i
 <% end -%>
 
 # Mutex: refuse to start if another overwatch instance owns /run/overwatch/active-vm.
