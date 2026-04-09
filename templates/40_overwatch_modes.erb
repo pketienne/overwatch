@@ -47,7 +47,30 @@ distro_cmdline="${GRUB_CMDLINE_LINUX:-} ${GRUB_CMDLINE_LINUX_DEFAULT:-}"
 # Strip any pre-existing overwatch.mode=* tokens so our entries always win.
 distro_cmdline=$(echo "$distro_cmdline" | sed -E 's/(^|[[:space:]])overwatch\.mode=[^[:space:]]*//g' | xargs)
 
+# Early initrd images (e.g., GRUB_EARLY_INITRD_LINUX_CUSTOM=ivrs-override.img,
+# which is required on this AMD platform to patch the IVRS table so vfio-pci
+# can claim the dGPU — without it, the firmware-marked "1:1 IOMMU mapping"
+# requirement makes vfio_iommu_type1 reject container setup at QEMU start).
+# Mirrors what /etc/grub.d/10_linux does for the regular Ubuntu menuentry.
+early_initrds=""
+if [ -n "${GRUB_EARLY_INITRD_LINUX_CUSTOM:-}" ]; then
+    for img in $GRUB_EARLY_INITRD_LINUX_CUSTOM; do
+        if [ -r "/boot/$img" ]; then
+            early_initrds="$early_initrds /boot/$img"
+        fi
+    done
+fi
+# Trim leading whitespace
+early_initrds=$(echo "$early_initrds" | xargs)
+
 # --- Emit menuentries ---
+
+# Build the initrd line: early initrds first (if any), then the regular initrd.
+if [ -n "$early_initrds" ]; then
+    initrd_line="initrd $early_initrds /boot/initrd.img-${kver}"
+else
+    initrd_line="initrd /boot/initrd.img-${kver}"
+fi
 
 cat <<EOF
 menuentry 'Overwatch (host-mode) — ollama, full host' --id overwatch-host-mode {
@@ -61,7 +84,7 @@ menuentry 'Overwatch (host-mode) — ollama, full host' --id overwatch-host-mode
     echo 'Loading Linux ${kver} (overwatch host-mode) ...'
     linux /boot/vmlinuz-${kver} root=UUID=${root_uuid} ro ${distro_cmdline} ${CMDLINE_COMMON} ${CMDLINE_HOST_MODE}
     echo 'Loading initial ramdisk ...'
-    initrd /boot/initrd.img-${kver}
+    ${initrd_line}
 }
 
 menuentry 'Overwatch (vm-mode) — GPU passthrough' --id overwatch-vm-mode {
@@ -75,6 +98,6 @@ menuentry 'Overwatch (vm-mode) — GPU passthrough' --id overwatch-vm-mode {
     echo 'Loading Linux ${kver} (overwatch vm-mode) ...'
     linux /boot/vmlinuz-${kver} root=UUID=${root_uuid} ro ${distro_cmdline} ${CMDLINE_COMMON} ${CMDLINE_VM_MODE}
     echo 'Loading initial ramdisk ...'
-    initrd /boot/initrd.img-${kver}
+    ${initrd_line}
 }
 EOF
