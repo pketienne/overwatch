@@ -1,6 +1,13 @@
-# Allow the desktop user to drive the overwatch instance services without
-# a password. Wildcards cover all instance names since the same desktop user
-# owns every instance shortcut on this host.
+# Allow the desktop user to drive the overwatch instance services and the
+# host-mode mode-swap trigger (`systemctl start ollama`) without a password.
+# Wildcards cover all instance names since the same desktop user owns every
+# instance shortcut on this host. The ollama entries are benign if ollama
+# isn't used — Pass 4's host-mode reboot trigger is via the ollama.service
+# drop-in's ExecStartPre=overwatch-mode require host.
 <%= @target_user %> ALL=(ALL) NOPASSWD: \
     /usr/bin/systemctl start overwatch@*.service, \
-    /usr/bin/systemctl stop overwatch@*.service
+    /usr/bin/systemctl stop overwatch@*.service, \
+    /usr/bin/systemctl start ollama.service, \
+    /usr/bin/systemctl start ollama, \
+    /usr/bin/systemctl stop ollama.service, \
+    /usr/bin/systemctl stop ollama

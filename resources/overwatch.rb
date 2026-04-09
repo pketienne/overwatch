@@ -68,29 +68,44 @@ action :install do
   end
 
   # --- GRUB: kernel parameters for VFIO passthrough ---
-  grub_params = node['overwatch']['grub_cmdline_params']
+  #
+  # Two paths:
+  # - Legacy (pass4_enabled=false): monolithic cmdline merged into
+  #   GRUB_CMDLINE_LINUX_DEFAULT. Same cmdline on every boot. Launcher
+  #   does in-uptime GPU rebind dance to swap between vfio and amdgpu.
+  # - Pass 4 (pass4_enabled=true): 3-way cmdline split, rendered into
+  #   two custom grub menuentries (overwatch-host-mode, overwatch-vm-mode)
+  #   via /etc/grub.d/40_overwatch_modes. Mode switching = reboot. Launcher
+  #   takes the simpler boot_mode="vm" runtime dispatch path.
+  unless node['overwatch']['pass4_enabled']
+    grub_params = node['overwatch']['grub_cmdline_params']
 
-  ruby_block 'configure_grub_cmdline' do
-    block do
-      grub_file = '/etc/default/grub'
-      content = ::File.read(grub_file)
-      if content =~ /^GRUB_CMDLINE_LINUX_DEFAULT="([^"]*)"/
-        current = Regexp.last_match(1)
-        missing = grub_params.reject { |p| current.include?(p.split('=').first) }
-        unless missing.empty?
-          new_val = "#{current} #{missing.join(' ')}".strip
-          content.sub!(/^GRUB_CMDLINE_LINUX_DEFAULT="[^"]*"/, "GRUB_CMDLINE_LINUX_DEFAULT=\"#{new_val}\"")
-          ::File.write(grub_file, content)
+    ruby_block 'configure_grub_cmdline' do
+      block do
+        grub_file = '/etc/default/grub'
+        content = ::File.read(grub_file)
+        if content =~ /^GRUB_CMDLINE_LINUX_DEFAULT="([^"]*)"/
+          current = Regexp.last_match(1)
+          missing = grub_params.reject { |p| current.include?(p.split('=').first) }
+          unless missing.empty?
+            new_val = "#{current} #{missing.join(' ')}".strip
+            content.sub!(/^GRUB_CMDLINE_LINUX_DEFAULT="[^"]*"/, "GRUB_CMDLINE_LINUX_DEFAULT=\"#{new_val}\"")
+            ::File.write(grub_file, content)
+          end
         end
       end
+      not_if do
+        content = ::File.read('/etc/default/grub')
+        grub_params.all? { |p| content.include?(p) }
+      end
+      notifies :run, 'execute[update-grub]', :immediately
     end
-    not_if do
-      content = ::File.read('/etc/default/grub')
-      grub_params.all? { |p| content.include?(p) }
-    end
-    notifies :run, 'execute[update-grub]', :immediately
   end
 
+  # GRUB_EARLY_INITRD_LINUX_CUSTOM applies to every boot entry (10_linux +
+  # 40_overwatch_modes both), so this runs unconditionally regardless of
+  # pass4_enabled. The ivrs-override.img early initrd carries the AMD IOMMU
+  # override tables that must load before amdgpu and vfio-pci probe.
   ruby_block 'configure_grub_early_initrd' do
     block do
       grub_file = '/etc/default/grub'
@@ -102,6 +117,129 @@ action :install do
     end
     not_if 'grep -q "GRUB_EARLY_INITRD_LINUX_CUSTOM" /etc/default/grub'
     notifies :run, 'execute[update-grub]', :immediately
+  end
+
+  # --- Pass 4: reboot-based host-mode / vm-mode switching (attribute-guarded) ---
+  if node['overwatch']['pass4_enabled']
+    # Render the grub.d drop-in that emits the two custom menuentries.
+    cmdline_common    = node['overwatch']['grub_cmdline_common'].join(' ')
+    cmdline_host_mode = node['overwatch']['grub_cmdline_host_mode'].join(' ')
+    cmdline_vm_mode   = node['overwatch']['grub_cmdline_vm_mode'].join(' ')
+
+    template '/etc/grub.d/40_overwatch_modes' do
+      source '40_overwatch_modes.erb'
+      cookbook 'overwatch'
+      owner 'root'
+      group 'root'
+      mode '0755'
+      variables(
+        cmdline_common: cmdline_common,
+        cmdline_host_mode: cmdline_host_mode,
+        cmdline_vm_mode: cmdline_vm_mode
+      )
+      notifies :run, 'execute[update-grub]', :immediately
+    end
+
+    # Edit /etc/default/grub to use grubenv saved_entry + visible 10s menu.
+    # Explicitly NOT setting GRUB_RECORDFAIL_TIMEOUT so the Ubuntu default
+    # behavior (show menu until user intervention on recordfail) is preserved
+    # as a troubleshooting escape hatch.
+    grub_settings = {
+      'GRUB_DEFAULT'       => 'saved',
+      'GRUB_TIMEOUT'       => '10',
+      'GRUB_TIMEOUT_STYLE' => 'menu',
+    }
+
+    ruby_block 'configure_grub_defaults' do
+      block do
+        grub_file = '/etc/default/grub'
+        content = ::File.read(grub_file)
+        changed = false
+        grub_settings.each do |key, value|
+          if content =~ /^#{Regexp.escape(key)}=.*$/
+            if Regexp.last_match(0) != "#{key}=#{value}"
+              content.sub!(/^#{Regexp.escape(key)}=.*$/, "#{key}=#{value}")
+              changed = true
+            end
+          else
+            content << "\n#{key}=#{value}\n"
+            changed = true
+          end
+        end
+        ::File.write(grub_file, content) if changed
+      end
+      not_if do
+        content = ::File.read('/etc/default/grub')
+        grub_settings.all? { |k, v| content =~ /^#{Regexp.escape(k)}=#{Regexp.escape(v)}$/ }
+      end
+      notifies :run, 'execute[update-grub]', :immediately
+    end
+
+    # Initialize grubenv's saved_entry to host-mode on first Pass 4 deployment.
+    # The not_if guard skips re-writing if saved_entry is already set (either
+    # by a previous converge or by a runtime `grub-set-default` from the
+    # overwatch-mode helper), so user runtime mode changes aren't clobbered.
+    execute 'grub-set-default-host-mode-initial' do
+      command 'grub-set-default overwatch-host-mode'
+      not_if 'grub-editenv list 2>/dev/null | grep -q "^saved_entry="'
+    end
+
+    # Install the mode-switching helper binary. Used by:
+    #   - overwatch@<vm>.service  ExecStartPre=overwatch-mode require vm %i
+    #   - ollama.service drop-in   ExecStartPre=overwatch-mode require host
+    #   - overwatch-resume.service ExecStart=overwatch-mode resume
+    cookbook_file '/usr/local/bin/overwatch-mode' do
+      source 'overwatch-mode'
+      cookbook 'overwatch'
+      owner 'root'
+      group 'root'
+      mode '0755'
+    end
+
+    # ollama.service drop-in: refuses to start in wrong mode, triggers
+    # reboot to host-mode via `overwatch-mode require host`.
+    directory '/etc/systemd/system/ollama.service.d' do
+      owner 'root'
+      group 'root'
+      mode '0755'
+    end
+
+    cookbook_file '/etc/systemd/system/ollama.service.d/overwatch-mode.conf' do
+      source 'ollama-overwatch-mode.conf'
+      cookbook 'overwatch'
+      owner 'root'
+      group 'root'
+      mode '0644'
+      notifies :run, 'execute[systemctl-daemon-reload]', :immediately
+    end
+
+    # Boot-time auto-start: reads /proc/cmdline + pending files, starts
+    # either overwatch@<vm>.service (vm-mode) or ollama.service (host-mode).
+    # Single owner of "what runs after boot" — both target services are
+    # disabled so resume is the only trigger.
+    template '/etc/systemd/system/overwatch-resume.service' do
+      source 'overwatch-resume.service.erb'
+      cookbook 'overwatch'
+      owner 'root'
+      group 'root'
+      mode '0644'
+      notifies :run, 'execute[systemctl-daemon-reload]', :immediately
+    end
+
+    service 'overwatch-resume' do
+      action :enable
+      subscribes :restart, 'template[/etc/systemd/system/overwatch-resume.service]', :delayed
+    end
+
+    # ollama.service must be disabled so it doesn't auto-start in the wrong
+    # mode — overwatch-resume.service starts it explicitly when (and only
+    # when) /proc/cmdline has overwatch.mode=host. This avoids a reboot loop
+    # where systemd-enabled ollama auto-starts in vm-mode, fails the mode
+    # check, and triggers a reboot back to host-mode.
+    service 'ollama' do
+      action :disable
+      only_if 'systemctl list-unit-files ollama.service 2>/dev/null | grep -q ollama.service'
+    end
   end
 
   execute 'update-grub' do
@@ -280,6 +418,7 @@ action :install do
     owner 'root'
     group 'root'
     mode '0644'
+    variables(pass4_enabled: node['overwatch']['pass4_enabled'])
     notifies :run, 'execute[systemctl-daemon-reload]', :immediately
   end
 
