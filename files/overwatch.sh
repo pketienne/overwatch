@@ -241,7 +241,7 @@ do_status() {
     gpu_power=$(cat "/sys/bus/pci/devices/$GPU/power_state" 2>/dev/null) || true
     gpu_power=${gpu_power:-unknown}
 
-    vm_state=$(virsh domstate overwatch 2>/dev/null) || true
+    vm_state=$(virsh domstate "$VM_NAME" 2>/dev/null) || true
     vm_state=$(echo "$vm_state" | xargs)
     vm_state=${vm_state:-unknown}
 
@@ -331,7 +331,7 @@ log_state() {
     local gpu_drv gpu_audio_drv vm_state
     gpu_drv=$(gpu_driver "$GPU")
     gpu_audio_drv=$(gpu_driver "$GPU_AUDIO")
-    vm_state=$(virsh domstate overwatch 2>/dev/null || echo "unknown")
+    vm_state=$(virsh domstate "$VM_NAME" 2>/dev/null || echo "unknown")
     log "STATE [$checkpoint] gpu=$gpu_drv audio=$gpu_audio_drv vm=$vm_state"
 }
 
@@ -465,12 +465,12 @@ ensure_gpu_on_vfio() {
 }
 
 ensure_vm_running() {
-    if virsh domstate overwatch 2>/dev/null | grep -q "running"; then
+    if virsh domstate "$VM_NAME" 2>/dev/null | grep -q "running"; then
         log "ERROR: VM already running"
         return 1
     fi
     log "Starting VM..."
-    if ! virsh start overwatch; then
+    if ! virsh start "$VM_NAME"; then
         log "ERROR: virsh start failed"
         return 1
     fi
@@ -525,7 +525,7 @@ ensure_performance_tuning() {
 apply_cpu_isolation() {
     local deadline=$(($(date +%s) + 120))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        if virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
+        if virsh qemu-agent-command "$VM_NAME" '{"execute":"guest-ping"}' &>/dev/null; then
             log "Guest agent up — applying CPU isolation (AllowedCPUs=$HOST_CPUS)"
             systemctl set-property --runtime -- system.slice AllowedCPUs=$HOST_CPUS 2>/dev/null || true
             systemctl set-property --runtime -- user.slice AllowedCPUs=$HOST_CPUS 2>/dev/null || true
@@ -542,7 +542,7 @@ apply_cpu_isolation() {
 
 apply_sched_fifo() {
     local qemu_pid count=0
-    qemu_pid=$(pgrep -f "qemu-system.*overwatch" 2>/dev/null | head -1) || true
+    qemu_pid=$(pgrep -f "qemu-system.*$VM_NAME" 2>/dev/null | head -1) || true
     if [ -z "$qemu_pid" ]; then
         log "SCHED_FIFO: QEMU PID not found, skipping"
         return
@@ -579,12 +579,12 @@ print(json.dumps({
     }
 }))" "$cmd" 2>/dev/null) || return 1
 
-    ps_out=$(virsh qemu-agent-command overwatch "$req" 2>/dev/null) || return 1
+    ps_out=$(virsh qemu-agent-command "$VM_NAME" "$req" 2>/dev/null) || return 1
     pid=$(echo "$ps_out" | python3 -c "import sys,json; print(json.load(sys.stdin)['return']['pid'])" 2>/dev/null) || return 1
     [ -z "$pid" ] && return 1
 
     for i in $(seq 1 "$max_wait"); do
-        status_out=$(virsh qemu-agent-command overwatch \
+        status_out=$(virsh qemu-agent-command "$VM_NAME" \
             "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}" 2>/dev/null) || return 1
         exited=$(echo "$status_out" | python3 -c \
             "import sys,json; print(json.load(sys.stdin)['return'].get('exited',False))" 2>/dev/null) || break
@@ -606,17 +606,17 @@ if r.get('out-data'):
 
 ensure_vm_stopped() {
     local vm_check
-    vm_check=$(virsh domstate overwatch 2>/dev/null) || true
+    vm_check=$(virsh domstate "$VM_NAME" 2>/dev/null) || true
     if [ -z "$vm_check" ] || ! echo "$vm_check" | grep -q "running"; then
         log "VM not running"
         return 0
     fi
     log "Shutting down VM (graceful)..."
-    virsh shutdown overwatch 2>/dev/null || true
+    virsh shutdown "$VM_NAME" 2>/dev/null || true
     local waited=0
     while true; do
         local vm_poll
-        vm_poll=$(virsh domstate overwatch 2>/dev/null) || true
+        vm_poll=$(virsh domstate "$VM_NAME" 2>/dev/null) || true
         if [ -n "$vm_poll" ] && ! echo "$vm_poll" | grep -q "running"; then
             break
         fi
@@ -624,7 +624,7 @@ ensure_vm_stopped() {
         waited=$((waited + 5))
         if [ $waited -ge 60 ]; then
             log "WARNING: VM still running after ${waited}s — forcing destroy"
-            virsh destroy overwatch 2>/dev/null || true
+            virsh destroy "$VM_NAME" 2>/dev/null || true
             sleep 2
             break
         fi
@@ -794,7 +794,7 @@ _do_start() {
     trap 'SIGTERM_DEFERRED=true; log "SIGTERM deferred — GPU handoff in progress"' TERM
 
     # Refuse if VM already running
-    if virsh domstate overwatch 2>/dev/null | grep -q "running"; then
+    if virsh domstate "$VM_NAME" 2>/dev/null | grep -q "running"; then
         log "ERROR: VM is already running. Use 'systemctl stop overwatch' to stop it."
         exit 1
     fi
@@ -894,7 +894,7 @@ open('/tmp/.overwatch-shutdown-ts','w').write(str(int(time.time())))" \
     # Accept definitive non-running state OR domain-not-found (libvirtd lost track).
     # Transient empty output (libvirtd hiccup) is treated as "keep waiting".
     local qemu_pid prev_qemu_state=""
-    qemu_pid=$(pgrep -f "guest=overwatch" 2>/dev/null) || true
+    qemu_pid=$(pgrep -f "guest=$VM_NAME" 2>/dev/null) || true
     local domain_missing=0
     while true; do
         # Track QEMU process state transitions (S=sleeping, D=uninterruptible, exited)
@@ -908,14 +908,14 @@ open('/tmp/.overwatch-shutdown-ts','w').write(str(int(time.time())))" \
         fi
 
         local vm_poll
-        vm_poll=$(virsh domstate overwatch 2>&1) || true
+        vm_poll=$(virsh domstate "$VM_NAME" 2>&1) || true
 
         if echo "$vm_poll" | grep -q "failed to get domain"; then
             domain_missing=$((domain_missing + 1))
             if [ $domain_missing -ge 3 ]; then
                 log "WARNING: Domain not found in libvirt — treating as shutdown"
                 local orphan_pid
-                orphan_pid=$(pgrep -f "guest=overwatch" 2>/dev/null) || true
+                orphan_pid=$(pgrep -f "guest=$VM_NAME" 2>/dev/null) || true
                 if [ -n "$orphan_pid" ]; then
                     log "Killing orphaned QEMU (pid $orphan_pid)"
                     kill "$orphan_pid" 2>/dev/null || true
