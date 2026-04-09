@@ -263,18 +263,22 @@ action :install do
         mode '0755'
       end
 
-      # Drop-in filename is '00-overwatch-mode.conf' (not 'overwatch-mode.conf')
-      # so it sorts alphabetically BEFORE any other drop-ins the target unit
-      # might have. This matters because systemd reads drop-ins in alphabetical
-      # order and processes ExecStartPre directives in that order — if another
-      # drop-in's ExecStartPre exits non-zero first, the overwatch-mode gate
-      # never runs and the reboot-to-host-mode never triggers.
-      #
-      # Example: on erasimus, an existing gpu-check.conf drop-in on
-      # ollama.service has ExecStartPre=/usr/local/bin/ollama-gpu-check which
-      # exits 1 when the dGPU isn't on amdgpu. Without the 00- prefix, that
-      # ran before overwatch-mode require host and blocked the reboot trigger.
-      cookbook_file "#{unit_d_dir}/00-overwatch-mode.conf" do
+      # Drop-in filename is '00-host-mode-require.conf':
+      #   - The 00- prefix sorts it alphabetically BEFORE any other drop-ins
+      #     the target unit might have. systemd reads drop-ins in alphabetical
+      #     order and processes ExecStartPre directives in that order — if
+      #     another drop-in's ExecStartPre exits non-zero first, the host-mode
+      #     gate never runs and the reboot trigger never fires. Example: on
+      #     erasimus, ollama.service has a pre-existing gpu-check.conf drop-in
+      #     whose ExecStartPre exits 1 when the dGPU isn't on amdgpu; without
+      #     the 00- prefix it would block the gate.
+      #   - The name 'host-mode-require' describes the function (this service
+      #     requires the host to be booted in host-mode), not the binary that
+      #     happens to enforce it. This matches the source file in the cookbook
+      #     (files/host-mode-require.conf) and avoids confusion with the
+      #     /usr/local/bin/overwatch-mode helper, where 'overwatch-' is the
+      #     cookbook namespace, not a mode name.
+      cookbook_file "#{unit_d_dir}/00-host-mode-require.conf" do
         source 'host-mode-require.conf'
         cookbook 'overwatch'
         owner 'root'
@@ -283,12 +287,18 @@ action :install do
         notifies :run, 'execute[systemctl-daemon-reload]', :immediately
       end
 
-      # Clean up the old-named drop-in from pre-fix deployments. Idempotent
-      # (no-op if absent). Can be removed in iter J along with the rest of
-      # the Pass 4 transitional scaffolding.
-      file "#{unit_d_dir}/overwatch-mode.conf" do
-        action :delete
-        notifies :run, 'execute[systemctl-daemon-reload]', :immediately
+      # Clean up old-named drop-ins from prior Pass 4 iterations. Idempotent
+      # (no-op if absent). Both can be removed in iter J along with the rest
+      # of the Pass 4 transitional scaffolding once no host has these names.
+      #   - 'overwatch-mode.conf'    : original Pass 4.2 name (no 00- prefix)
+      #   - '00-overwatch-mode.conf' : iter H rename (kept overwatch-mode in
+      #                                the filename even though it wasn't a
+      #                                mode named "overwatch")
+      ['overwatch-mode.conf', '00-overwatch-mode.conf'].each do |old_name|
+        file "#{unit_d_dir}/#{old_name}" do
+          action :delete
+          notifies :run, 'execute[systemctl-daemon-reload]', :immediately
+        end
       end
 
       # Strip .service suffix for Chef's service resource name (it adds it
