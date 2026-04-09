@@ -85,13 +85,15 @@ These attributes have sensible defaults but may need adjustment per host:
 |---|---|---|
 | `gpu` | `0000:03:00.0` | dGPU PCI address (`lspci -D \| grep VGA`) |
 | `gpu_audio` | `0000:03:00.1` | GPU HDMI/DP audio function |
-| `igpu` | `0000:74:00.0` | iGPU PCI address (for display switching) |
 | `host_cpus` | `0-1` | CPUs reserved for host (not pinned to VM) |
 | `emulator_cpuset` | `0-1` | CPUs for QEMU emulator threads |
 | `vcpu_pins` | cores 2-7 | vCPU-to-physical-core pinning map |
 | `vm_ram_kib` | 50331648 (48G) | VM RAM in KiB |
 | `vm_vcpus` | 6 | Number of vCPUs |
-| `grub_cmdline_params` | IOMMU + hugepages + CPU isolation | Kernel parameters |
+| `grub_cmdline_common` | IOMMU + AVIC | Kernel params shared by both modes |
+| `grub_cmdline_host_mode` | `overwatch.mode=host` | host-mode-only kernel params |
+| `grub_cmdline_vm_mode` | vfio-pci.ids + hugepages + isolcpus | vm-mode-only kernel params |
+| `host_mode_services` | `['ollama.service']` | Units gated to host-mode boots |
 | `virtio_iso` | (empty) | Path to `virtio-win.iso` for driver install |
 
 ## Prerequisites
@@ -188,23 +190,20 @@ Windows Defender and Tamper Protection must always remain on.
 
 ## Template strategy
 
-The lifecycle script is split into two files: `overwatch.sh.erb` (~920
-lines) for core logic and `overwatch-monitors.sh.erb` (~465 lines) for
-background monitors and deferred boot tasks (sourced at runtime). The
-guest setup script is `setup-guest.sh.erb` (~1075 lines). All three
-template only a small block of machine-specific constants in the header;
-the rest is verbatim bash. This keeps them maintainable and diffable.
+The lifecycle script (`files/overwatch.sh`) and the monitors library
+(`files/overwatch-monitors.sh`) are static cookbook_files — fully
+verbatim bash, no per-host substitution. Per-VM values are loaded at
+runtime by sourcing `/usr/local/share/overwatch/<vm>/instance.conf`,
+which is rendered from `templates/instance.conf.erb` and carries
+identity, host topology, listener ports, and capability toggles for the
+running instance.
 
-Templated constants in `overwatch.sh.erb`: `GPU`, `GPU_AUDIO`, `IGPU`,
-`HOST_CPUS`, `SHUTDOWN_SIGNAL_PORT`, `TRANSITION_SIGNAL_PORT`, `VM_NAME`.
+The guest setup script (`templates/setup-guest.sh.erb`) is a per-VM
+template since it bakes guest-side ports + the Windows user into a
+script that gets pushed into the VM.
 
-Templated constants in `overwatch-monitors.sh.erb`: `VM_IP`,
-`WINDOWS_USER`.
-
-Templated constants in `setup-guest.sh.erb`: `VM_NAME`, `HOST_IP`,
-`SHUTDOWN_SIGNAL_PORT`, `TRANSITION_SIGNAL_PORT`.
-
-The VM XML (`overwatch-vm.xml.erb`) is fully generated from attributes.
+The VM XML (`templates/overwatch-vm.xml.erb`) is fully generated from
+attributes.
 
 ## Anti-cheat design
 
@@ -219,14 +218,33 @@ by anti-cheat software:
 
 ## GRUB kernel parameters
 
-The cookbook manages these via `node['overwatch']['grub_cmdline_params']`:
+Mode switching is reboot-based via two custom GRUB menuentries
+(`overwatch-host-mode`, `overwatch-vm-mode`), rendered into
+`/etc/grub.d/40_overwatch_modes`. The kernel cmdline is split across
+three attributes:
 
-- `amd_iommu=on` — enable IOMMU for VFIO passthrough
-- `iommu=pt` — passthrough mode (only VFIO devices use IOMMU)
-- `hugepages=24576` — 48GiB of 2MB huge pages for VM memory
-- `isolcpus=domain,managed_irq,2-7` — isolate vCPU cores from host scheduler
-- `nohz_full=2-7` — disable periodic timer tick on vCPU cores
-- `rcu_nocbs=2-7` — move RCU callbacks off vCPU cores
+- `grub_cmdline_common` — shared by both modes:
+  - `amd_iommu=on` — enable IOMMU
+  - `iommu=pt` — passthrough mode (only VFIO devices use IOMMU)
+  - `kvm_amd.avic=1`, `kvm.ignore_msrs=1`, `kvm.report_ignored_msrs=0`
+- `grub_cmdline_host_mode` — host-mode only:
+  - `overwatch.mode=host` — runtime mode marker (read by launcher + drop-ins)
+- `grub_cmdline_vm_mode` — vm-mode only:
+  - `overwatch.mode=vm`
+  - `vfio-pci.ids=...` — claim dGPU + audio at boot, no in-uptime rebind
+  - `vfio-pci.disable_vga=1`
+  - `hugepages=24576` — 48GiB of 2MB huge pages for VM memory
+  - `isolcpus=domain,managed_irq,2-7` — isolate vCPU cores from host scheduler
+  - `nohz_full=2-7` — disable periodic timer tick on vCPU cores
+  - `rcu_nocbs=2-7` — move RCU callbacks off vCPU cores
+
+The active mode is persisted in grubenv (`saved_entry`) and switched by
+`/usr/local/bin/overwatch-mode require {host|vm <name>}`, which sets the
+saved entry and schedules a reboot. After the reboot,
+`overwatch-resume.service` reads `/proc/cmdline` and the
+`/run/overwatch/pending-vm` marker, then either starts the requested
+`overwatch@<vm>.service` (vm-mode) or starts each unit in
+`host_mode_services` (host-mode).
 
 An IVRS ACPI override (`/boot/ivrs-override.img` via
 `GRUB_EARLY_INITRD_LINUX_CUSTOM`) patches the MSI X870E firmware's
