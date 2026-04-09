@@ -311,6 +311,65 @@ action :install do
     end
   end
 
+  # --- Pass 3.7 migration cleanup (iteration 3 only) ---
+  #
+  # See attributes/default.rb for the remove_legacy_overwatch_service
+  # toggle. This block runs during iteration 3 of the Pass 3.7 migration
+  # only. It stops the pre-Pass-3.7 overwatch.service unit (the running
+  # launcher's SIGTERM handler cleanly shuts down the VM + restores host
+  # state), deletes the unit file + bridge drop-in + stale flat-path lock,
+  # and transitions each declared instance onto the new overwatch@<vm>.service
+  # template unit.
+  #
+  # REMOVED (both the attribute and this block) from the cookbook after
+  # iteration 3 converges successfully — this is the very dead code the
+  # migration is cleaning up.
+  if node['overwatch']['remove_legacy_overwatch_service']
+    # Step 1: stop + disable the legacy unit. Blocks up to TimeoutStopSec
+    # (120s in the old unit) while the old launcher's _do_stop handler
+    # shuts down the VM and restores host state. Idempotent — if the unit
+    # is already stopped (e.g., operator pre-stopped it), :stop is a no-op.
+    service 'overwatch' do
+      action [:stop, :disable]
+      only_if 'test -f /etc/systemd/system/overwatch.service'
+    end
+
+    # Step 2: delete the bridging drop-in (file first, then dir)
+    file '/etc/systemd/system/overwatch.service.d/execstart-dva.conf' do
+      action :delete
+    end
+
+    directory '/etc/systemd/system/overwatch.service.d' do
+      recursive true
+      action :delete
+    end
+
+    # Step 3: delete the legacy unit file + pick up the change
+    file '/etc/systemd/system/overwatch.service' do
+      action :delete
+      notifies :run, 'execute[systemctl-daemon-reload]', :immediately
+    end
+
+    # Step 4: remove the stale flat-path lock file left by the pre-Pass-3.7
+    # launcher. Idempotent — clean exit of the old launcher should have
+    # removed it already via its EXIT trap; this is a safety net in case
+    # systemd had to SIGKILL the old process (TimeoutStopSec exceeded).
+    file '/run/overwatch.lock' do
+      action :delete
+    end
+
+    # Step 5: enable + start the new template unit for each declared
+    # instance. Chef's service resource is idempotent — if the unit is
+    # already enabled/started, these are no-ops. Runs AFTER the legacy
+    # unit is gone so the launcher mutex has no stale state to contend
+    # with on ExecStartPre.
+    node['overwatch']['instances'].each_key do |vm_name|
+      service "overwatch@#{vm_name}" do
+        action [:enable, :start]
+      end
+    end
+  end
+
   execute 'systemctl-daemon-reload' do
     command 'systemctl daemon-reload'
     action :nothing

@@ -246,9 +246,25 @@ default['overwatch']['instances'] = {}
 #
 # Set to true in the transitional current-state policyfile
 # (symmetra/policyfiles/overwatch/erasimus-current.rb) during Pass 3.7
-# migration iterations 2-3. The desired-state policyfile leaves this false.
+# migration iteration 2. The desired-state policyfile leaves this false.
 # The attribute and the resources it guards are REMOVED from the cookbook
 # after iteration 3 of the migration, when dva is cut over to the new
 # overwatch@dva.service template unit and the old overwatch.service + this
 # drop-in are deleted.
 default['overwatch']['legacy_overwatch_service_bridge'] = false
+
+# Pass 3.7 migration cleanup: when true, the cookbook stops and removes
+# the legacy overwatch.service unit + its bridging drop-in, deletes the
+# stale pre-Pass-3.7 flat-path lock file, and enables+starts the new
+# overwatch@<vm>.service template unit for each declared instance.
+#
+# MUTUALLY EXCLUSIVE with legacy_overwatch_service_bridge: the iteration 3
+# policyfile must set bridge=false AND cleanup=true simultaneously, so the
+# bridge resources stop being declared while the cleanup resources run.
+#
+# Set to true in erasimus-current.rb during Pass 3.7 iteration 3 only.
+# After iteration 3 converges successfully, the attribute AND the resources
+# it guards are REMOVED from the cookbook (iteration 3 is the last time
+# they're needed; keeping them as dead code in the cookbook is the very
+# thing the migration is cleaning up).
+default['overwatch']['remove_legacy_overwatch_service'] = false
