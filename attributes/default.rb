@@ -79,10 +79,14 @@ default['overwatch']['windows_hostname'] = '' # must override per host
 
 # GRUB kernel parameters (host-wide; required for any VFIO passthrough VM).
 #
-# Single-mode cookbook: the dGPU is bound to vfio-pci at boot via vfio-pci.ids,
-# the launcher does its in-uptime GPU rebind dance to swap between vfio and
-# amdgpu when the VM starts/stops. Reboot-based mode switching (Pass 4) is a
-# separate refactor not yet deployed.
+# Legacy single-mode path: the dGPU is bound to vfio-pci at boot via
+# vfio-pci.ids, the launcher does its in-uptime GPU rebind dance to swap
+# between vfio and amdgpu when the VM starts/stops. Used when
+# node['overwatch']['pass4_enabled'] is false.
+#
+# This monolithic attribute is kept for backwards compatibility during the
+# Pass 4 migration. It is REMOVED in Pass 4 iteration J after the reboot-
+# based mode switching has been validated end-to-end on erasimus.
 default['overwatch']['grub_cmdline_params'] = %w(
   amd_iommu=on
   iommu=pt
@@ -96,6 +100,59 @@ default['overwatch']['grub_cmdline_params'] = %w(
   kvm.ignore_msrs=1
   kvm.report_ignored_msrs=0
 )
+
+# =============================================================================
+# Pass 4: reboot-based host-mode / vm-mode switching (migration in progress)
+# =============================================================================
+#
+# Pass 4 splits the GRUB kernel cmdline into two distinct boot entries:
+#
+#   host-mode: dGPU on amdgpu, ollama can run inference, full host
+#              CPU/RAM available, no hugepages or core isolation.
+#   vm-mode:   dGPU on vfio-pci at boot, hugepages reserved, host
+#              CPUs 2-7 isolated, VM auto-started by overwatch-resume.
+#
+# Mode switching is reboot-based via `overwatch-mode require vm <name>` or
+# `overwatch-mode require host`, which writes a persistent saved_entry to
+# grubenv (via grub-set-default) and schedules a reboot. The 10-second
+# visible grub menu gives the user an escape hatch for troubleshooting.
+#
+# These three attributes are consumed by templates/40_overwatch_modes.erb
+# (rendered into /etc/grub.d/40_overwatch_modes) ONLY when
+# node['overwatch']['pass4_enabled'] is true. Otherwise the legacy
+# grub_cmdline_params attribute above is used via the old configure_grub_cmdline
+# ruby_block.
+default['overwatch']['grub_cmdline_common'] = %w(
+  amd_iommu=on
+  iommu=pt
+  kvm_amd.avic=1
+  kvm.ignore_msrs=1
+  kvm.report_ignored_msrs=0
+)
+default['overwatch']['grub_cmdline_host_mode'] = %w(
+  overwatch.mode=host
+)
+default['overwatch']['grub_cmdline_vm_mode'] = %w(
+  overwatch.mode=vm
+  hugepages=24576
+  isolcpus=domain,managed_irq,2-7
+  nohz_full=2-7
+  rcu_nocbs=2-7
+  vfio-pci.ids=1002:744c,1002:ab30
+  vfio-pci.disable_vga=1
+)
+
+# Pass 4 migration gate. When false, the cookbook renders the legacy
+# single-mode grub cmdline + in-uptime rebinding launcher path. When true,
+# the cookbook renders the two-mode grub entries, installs the overwatch-mode
+# helper + overwatch-resume.service + ollama drop-in, and the launcher's
+# runtime dispatch takes the Pass 4 simplified path.
+#
+# Set to true in the transitional current-state policyfile
+# (symmetra/policyfiles/overwatch/erasimus-current.rb) during Pass 4
+# migration iterations F onwards. REMOVED from the cookbook in iteration J
+# after Pass 4 is validated end-to-end.
+default['overwatch']['pass4_enabled'] = false
 
 # Per-host GPU topology (passthrough VMs reference this; non-passthrough VMs ignore)
 default['overwatch']['gpu']       = '0000:03:00.0'
