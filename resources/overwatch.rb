@@ -194,9 +194,9 @@ action :install do
     end
 
     # Install the mode-switching helper binary. Used by:
-    #   - overwatch@<vm>.service  ExecStartPre=overwatch-mode require vm %i
-    #   - ollama.service drop-in   ExecStartPre=overwatch-mode require host
-    #   - overwatch-resume.service ExecStart=overwatch-mode resume
+    #   - overwatch@<vm>.service   ExecStartPre=overwatch-mode require vm %i
+    #   - host-mode service drop-in ExecStartPre=overwatch-mode require host
+    #   - overwatch-resume.service  ExecStart=overwatch-mode resume
     cookbook_file '/usr/local/bin/overwatch-mode' do
       source 'overwatch-mode'
       cookbook 'overwatch'
@@ -205,27 +205,25 @@ action :install do
       mode '0755'
     end
 
-    # ollama.service drop-in: refuses to start in wrong mode, triggers
-    # reboot to host-mode via `overwatch-mode require host`.
-    directory '/etc/systemd/system/ollama.service.d' do
-      owner 'root'
-      group 'root'
-      mode '0755'
-    end
-
-    cookbook_file '/etc/systemd/system/ollama.service.d/overwatch-mode.conf' do
-      source 'ollama-overwatch-mode.conf'
+    # mode-services.conf: rendered list of host-mode services, sourced by
+    # /usr/local/bin/overwatch-mode's resume handler at boot. Decoupled
+    # from hardcoded workload names so adding/removing host-mode workloads
+    # (ollama, blender, stable-diffusion, etc.) is an attribute edit, not
+    # a cookbook code change.
+    template '/usr/local/share/overwatch/shared/mode-services.conf' do
+      source 'mode-services.conf.erb'
       cookbook 'overwatch'
       owner 'root'
       group 'root'
       mode '0644'
-      notifies :run, 'execute[systemctl-daemon-reload]', :immediately
+      variables(host_mode_services: node['overwatch']['host_mode_services'])
     end
 
     # Boot-time auto-start: reads /proc/cmdline + pending files, starts
-    # either overwatch@<vm>.service (vm-mode) or ollama.service (host-mode).
-    # Single owner of "what runs after boot" — both target services are
-    # disabled so resume is the only trigger.
+    # either overwatch@<vm>.service (vm-mode, from pending-vm file) or
+    # iterates host_mode_services (host-mode, from mode-services.conf).
+    # Single owner of "what runs after boot" — both vm and host target
+    # services are disabled so resume is the only boot-time trigger.
     template '/etc/systemd/system/overwatch-resume.service' do
       source 'overwatch-resume.service.erb'
       cookbook 'overwatch'
@@ -240,14 +238,64 @@ action :install do
       subscribes :restart, 'template[/etc/systemd/system/overwatch-resume.service]', :delayed
     end
 
-    # ollama.service must be disabled so it doesn't auto-start in the wrong
-    # mode — overwatch-resume.service starts it explicitly when (and only
-    # when) /proc/cmdline has overwatch.mode=host. This avoids a reboot loop
-    # where systemd-enabled ollama auto-starts in vm-mode, fails the mode
-    # check, and triggers a reboot back to host-mode.
-    service 'ollama' do
-      action :disable
-      only_if 'systemctl list-unit-files ollama.service 2>/dev/null | grep -q ollama.service'
+    # --- Host-mode services: drop-ins + disable ---
+    #
+    # Each unit in node['overwatch']['host_mode_services'] gets:
+    #
+    #   1. /etc/systemd/system/<unit>.d/overwatch-mode.conf — a generic
+    #      ExecStartPre=overwatch-mode require host drop-in. Starting the
+    #      unit in vm-mode triggers a reboot to host-mode instead.
+    #   2. `systemctl disable <unit>` so the unit does NOT auto-start via
+    #      multi-user.target. overwatch-resume.service explicitly starts
+    #      each host-mode service when booted into host-mode (and no other
+    #      start path). This is the single-owner-of-boot-time-start
+    #      principle — avoids reboot loops from wrong-mode auto-starts.
+    #
+    # Units listed here that aren't installed on the host are silently
+    # skipped (only_if guard on disable; drop-in is harmless if the parent
+    # unit doesn't exist, systemd ignores orphan .d dirs).
+    node['overwatch']['host_mode_services'].each do |unit|
+      unit_d_dir = "/etc/systemd/system/#{unit}.d"
+
+      directory unit_d_dir do
+        owner 'root'
+        group 'root'
+        mode '0755'
+      end
+
+      cookbook_file "#{unit_d_dir}/overwatch-mode.conf" do
+        source 'host-mode-require.conf'
+        cookbook 'overwatch'
+        owner 'root'
+        group 'root'
+        mode '0644'
+        notifies :run, 'execute[systemctl-daemon-reload]', :immediately
+      end
+
+      # Strip .service suffix for Chef's service resource name (it adds it
+      # back automatically; passing "ollama.service" would become "ollama.service.service").
+      svc_name = unit.sub(/\.service$/, '')
+      service svc_name do
+        action :disable
+        only_if "systemctl list-unit-files #{unit} 2>/dev/null | grep -q #{unit}"
+      end
+    end
+
+    # --- Per-VM template-unit instance disable ---
+    #
+    # overwatch@<vm>.service instances must also be disabled so systemd
+    # doesn't auto-start them via multi-user.target. overwatch-resume.service
+    # is the single boot-time owner; it reads /var/lib/overwatch/pending-vm
+    # to know which instance to start. Without this disable, a Pass 3.7
+    # -era enabled instance would auto-start on every boot regardless of
+    # mode or intent, causing races (USB enumeration, vfio readiness) and
+    # fighting resume for the mutex.
+    node['overwatch']['instances'].each_key do |vm_name|
+      svc = "overwatch@#{vm_name}"
+      service svc do
+        action :disable
+        only_if "systemctl is-enabled #{svc}.service 2>/dev/null | grep -q enabled"
+      end
     end
   end
 

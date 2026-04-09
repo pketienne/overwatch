@@ -1,0 +1,14 @@
+# /usr/local/share/overwatch/shared/mode-services.conf
+#
+# Host-mode service list — rendered by the overwatch cookbook from the
+# node['overwatch']['host_mode_services'] attribute. Sourced by
+# /usr/local/bin/overwatch-mode's resume handler to decide which systemd
+# units to auto-start when booted into host-mode.
+#
+# Format: a single bash-sourceable assignment with a space-separated list
+# of unit names. The overwatch-mode script reads HOST_MODE_SERVICES and
+# iterates it.
+#
+# Managed by Chef (overwatch cookbook). Do not edit directly.
+
+HOST_MODE_SERVICES="<%= @host_mode_services.join(' ') %>"

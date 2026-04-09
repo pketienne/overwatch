@@ -152,9 +152,25 @@ do_resume() {
             fi
             ;;
         host)
-            log "resume: starting ollama.service"
-            systemctl start ollama.service 2>/dev/null || \
-                log "resume: ollama.service start failed (already running, masked, or not installed)"
+            # Source the cookbook-rendered mode-services config, which sets
+            # HOST_MODE_SERVICES to a space-separated list of systemd units
+            # that need the dGPU on amdgpu. Iterate and start each. If a
+            # unit isn't installed or fails to start, log and continue —
+            # resume is best-effort observability, not a hard gate.
+            HOST_MODE_SERVICES=""
+            if [ -r /usr/local/share/overwatch/shared/mode-services.conf ]; then
+                # shellcheck disable=SC1091
+                . /usr/local/share/overwatch/shared/mode-services.conf
+            fi
+            if [ -z "$HOST_MODE_SERVICES" ]; then
+                log "resume: no host-mode services configured — nothing to start"
+            else
+                for unit in $HOST_MODE_SERVICES; do
+                    log "resume: starting $unit"
+                    systemctl start "$unit" 2>/dev/null || \
+                        log "resume: $unit start failed (already running, masked, or not installed)"
+                done
+            fi
             rm -f "$PENDING_HOST_FILE" 2>/dev/null || true
             ;;
         *)

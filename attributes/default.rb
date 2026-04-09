@@ -145,7 +145,7 @@ default['overwatch']['grub_cmdline_vm_mode'] = %w(
 # Pass 4 migration gate. When false, the cookbook renders the legacy
 # single-mode grub cmdline + in-uptime rebinding launcher path. When true,
 # the cookbook renders the two-mode grub entries, installs the overwatch-mode
-# helper + overwatch-resume.service + ollama drop-in, and the launcher's
+# helper + overwatch-resume.service + host-mode drop-ins, and the launcher's
 # runtime dispatch takes the Pass 4 simplified path.
 #
 # Set to true in the transitional current-state policyfile
@@ -153,6 +153,27 @@ default['overwatch']['grub_cmdline_vm_mode'] = %w(
 # migration iterations F onwards. REMOVED from the cookbook in iteration J
 # after Pass 4 is validated end-to-end.
 default['overwatch']['pass4_enabled'] = false
+
+# List of systemd units that are host-mode services — i.e., they require
+# the dGPU to be on amdgpu (not vfio-pci) and therefore cannot run while
+# the host is booted into vm-mode. Each unit in this list gets:
+#
+#   1. A drop-in at /etc/systemd/system/<unit>.d/overwatch-mode.conf with
+#      `ExecStartPre=/usr/local/bin/overwatch-mode require host` — invoking
+#      the unit while in vm-mode triggers a reboot to host-mode instead.
+#   2. An explicit `systemctl disable` so it does NOT auto-start via
+#      multi-user.target. overwatch-resume.service is the single owner of
+#      boot-time starts and explicitly starts each host-mode service when
+#      booted into host-mode.
+#
+# Default: ['ollama.service']. Override to extend (e.g., add a blender
+# daemon, stable-diffusion service, etc.) or set to [] to leave host-mode
+# with no auto-started workloads (pure desktop mode). Units listed here
+# that are NOT installed on the host are silently skipped (only_if guards
+# on disable + soft-fail on start).
+#
+# Only consumed when pass4_enabled is true.
+default['overwatch']['host_mode_services'] = ['ollama.service']
 
 # Per-host GPU topology (passthrough VMs reference this; non-passthrough VMs ignore)
 default['overwatch']['gpu']       = '0000:03:00.0'
