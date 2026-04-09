@@ -67,71 +67,26 @@ action :install do
     end
   end
 
-  # --- GRUB: two custom menuentries for host-mode / vm-mode reboot switching ---
-  #
-  # The legacy approach (merging vfio-pci.ids + isolcpus + hugepages into
-  # GRUB_CMDLINE_LINUX_DEFAULT) is gone — those params now live in a vm-mode-only
-  # menuentry emitted by /etc/grub.d/40_overwatch_modes. Host-mode is the default
-  # boot entry so any unintended reboot returns to a working ollama box; the
-  # desktop shortcut and `overwatch-mode require vm` use grub-reboot to one-shot
-  # the next boot into vm-mode.
-  cmdline_common    = node['overwatch']['grub_cmdline_common'].join(' ')
-  cmdline_host_mode = node['overwatch']['grub_cmdline_host_mode'].join(' ')
-  cmdline_vm_mode   = node['overwatch']['grub_cmdline_vm_mode'].join(' ')
+  # --- GRUB: kernel parameters for VFIO passthrough ---
+  grub_params = node['overwatch']['grub_cmdline_params']
 
-  template '/etc/grub.d/40_overwatch_modes' do
-    source '40_overwatch_modes.erb'
-    cookbook 'overwatch'
-    owner 'root'
-    group 'root'
-    mode '0755'
-    variables(
-      cmdline_common: cmdline_common,
-      cmdline_host_mode: cmdline_host_mode,
-      cmdline_vm_mode: cmdline_vm_mode
-    )
-    notifies :run, 'execute[update-grub]', :immediately
-  end
-
-  # Set GRUB_DEFAULT to the host-mode menuentry so unintended reboots land
-  # in host-mode (ollama works, desktop is full speed). vm-mode is reached
-  # one-shot via `grub-reboot overwatch-vm-mode`.
-  #
-  # Also lock down the menu so no user interaction is required at boot:
-  #   GRUB_TIMEOUT=0              boot the default immediately
-  #   GRUB_TIMEOUT_STYLE=hidden   never show the menu (unless SHIFT/ESC held)
-  #   GRUB_RECORDFAIL_TIMEOUT=0   even on a previously-failed boot (hard reset
-  #                               recovery), don't pause for the recordfail
-  #                               menu — go straight to the next-boot or default
-  #                               entry. Without this, a VM-hang hard-reset
-  #                               would force a 30s manual menu interaction
-  #                               on the next boot.
-  #
-  # grub-reboot's next_entry mechanism is independent of timeout/timeout_style,
-  # so a one-shot mode switch fires reliably with zero user input.
-  grub_settings = {
-    'GRUB_DEFAULT'            => '"overwatch-host-mode"',
-    'GRUB_TIMEOUT'            => '0',
-    'GRUB_TIMEOUT_STYLE'      => 'hidden',
-    'GRUB_RECORDFAIL_TIMEOUT' => '0',
-  }
-
-  ruby_block 'configure_grub_defaults' do
+  ruby_block 'configure_grub_cmdline' do
     block do
       grub_file = '/etc/default/grub'
       content = ::File.read(grub_file)
-      grub_settings.each do |key, value|
-        if content =~ /^#{Regexp.escape(key)}=/
-          content.sub!(/^#{Regexp.escape(key)}=.*$/, "#{key}=#{value}")
-        else
-          content << "\n#{key}=#{value}\n"
+      if content =~ /^GRUB_CMDLINE_LINUX_DEFAULT="([^"]*)"/
+        current = Regexp.last_match(1)
+        missing = grub_params.reject { |p| current.include?(p.split('=').first) }
+        unless missing.empty?
+          new_val = "#{current} #{missing.join(' ')}".strip
+          content.sub!(/^GRUB_CMDLINE_LINUX_DEFAULT="[^"]*"/, "GRUB_CMDLINE_LINUX_DEFAULT=\"#{new_val}\"")
+          ::File.write(grub_file, content)
         end
       end
-      ::File.write(grub_file, content)
     end
     not_if do
       content = ::File.read('/etc/default/grub')
-      grub_settings.all? { |key, value| content =~ /^#{Regexp.escape(key)}=#{Regexp.escape(value)}$/ }
+      grub_params.all? { |p| content.include?(p) }
     end
     notifies :run, 'execute[update-grub]', :immediately
   end
@@ -309,18 +264,6 @@ action :install do
     mode '0755'
   end
 
-  # Mode-switching wrapper (host-mode / vm-mode reboot helper). Used by:
-  #   overwatch@<vm>.service       ExecStartPre=overwatch-mode require vm %i
-  #   ollama.service drop-in       ExecStartPre=overwatch-mode require host
-  #   overwatch-resume.service     ExecStart=overwatch-mode resume
-  cookbook_file '/usr/local/bin/overwatch-mode' do
-    source 'overwatch-mode'
-    cookbook 'overwatch'
-    owner 'root'
-    group 'root'
-    mode '0755'
-  end
-
   # Monitors library (sourced by the launcher; shared across all instances)
   cookbook_file '/usr/local/share/overwatch/shared/overwatch-monitors.sh' do
     source 'overwatch-monitors.sh'
@@ -338,54 +281,6 @@ action :install do
     group 'root'
     mode '0644'
     notifies :run, 'execute[systemctl-daemon-reload]', :immediately
-  end
-
-  # overwatch-resume.service: boot-time oneshot that reads /proc/cmdline +
-  # /var/lib/overwatch/pending-* and explicitly starts the right service for
-  # the current mode. Required because both ollama.service and
-  # overwatch@<vm>.service are disabled at install time (to avoid wrong-mode
-  # auto-start loops); resume is the single owner of "what runs after boot".
-  template '/etc/systemd/system/overwatch-resume.service' do
-    source 'overwatch-resume.service.erb'
-    cookbook 'overwatch'
-    owner 'root'
-    group 'root'
-    mode '0644'
-    notifies :run, 'execute[systemctl-daemon-reload]', :immediately
-  end
-
-  service 'overwatch-resume' do
-    action :enable
-    subscribes :restart, 'template[/etc/systemd/system/overwatch-resume.service]', :delayed
-  end
-
-  # ollama drop-in: gate ollama starts on host-mode. The drop-in's
-  # ExecStartPre triggers a one-shot reboot into host-mode if invoked from
-  # vm-mode, then ollama auto-starts via overwatch-resume.service.
-  directory '/etc/systemd/system/ollama.service.d' do
-    owner 'root'
-    group 'root'
-    mode '0755'
-    action :create
-  end
-
-  cookbook_file '/etc/systemd/system/ollama.service.d/overwatch-mode.conf' do
-    source 'ollama-overwatch-mode.conf'
-    cookbook 'overwatch'
-    owner 'root'
-    group 'root'
-    mode '0644'
-    notifies :run, 'execute[systemctl-daemon-reload]', :immediately
-  end
-
-  # Disable ollama at install time so it doesn't auto-start at boot in either
-  # mode — overwatch-resume.service starts it explicitly when (and only when)
-  # /proc/cmdline says overwatch.mode=host. This avoids a reboot loop where
-  # systemd-enabled ollama auto-starts in vm-mode, fails the mode check, and
-  # triggers a reboot back to host-mode.
-  service 'ollama' do
-    action :disable
-    only_if 'systemctl list-unit-files ollama.service 2>/dev/null | grep -q ollama.service'
   end
 
   execute 'systemctl-daemon-reload' do

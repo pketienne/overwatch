@@ -4,35 +4,14 @@
 # Single shared launcher; per-VM behavior is loaded from
 #   /usr/local/share/overwatch/<vm>/instance.conf
 # at runtime. Capability flags (GPU_PASSTHROUGH, TARTARUS_ATTACH) determine
-# whether the launcher enforces vm-mode boot state or starts the VM as a
-# plain libvirt domain.
+# whether the heavy host-handoff dance runs or whether the VM is started
+# as a plain libvirt domain.
 #
-# Boot-mode model
-# ---------------
-# Mode switching is reboot-based, not in-uptime. The host boots into one
-# of two modes selected by custom GRUB menuentries:
-#
-#   host-mode (default): dGPU on amdgpu, ollama runs, full host CPU/RAM,
-#                        no hugepages, no core isolation. Mode marker:
-#                        overwatch.mode=host on the kernel cmdline.
-#   vm-mode:             dGPU on vfio-pci at boot (via vfio-pci.ids=...),
-#                        hugepages reserved, host CPUs 2-7 isolated, ready
-#                        for QEMU. Mode marker: overwatch.mode=vm.
-#
-# This launcher operates ONLY in vm-mode for passthrough instances. The
-# overwatch@<vm>.service unit's ExecStartPre calls `overwatch-mode require
-# vm %i`, which one-shot reboots the host into vm-mode if it isn't already
-# there. By the time `overwatch start` runs, the dGPU is already on vfio-pci
-# from boot — the launcher does not unbind/rebind the GPU, does not stop
-# host services (ollama isn't running in vm-mode), and does not try to
-# restore host-mode on shutdown. To return to ollama, the user reboots
-# (manually or via `systemctl start ollama`, which triggers the same
-# mode-check + grub-reboot dance via the ollama drop-in).
+# Manages the host through: host-mode ↔ vfio ↔ vm-running (when GPU_PASSTHROUGH=true)
 #
 # Subcommands:
-#   start <vm>           Verify vm-mode preconditions, start VM, run monitors,
-#                        wait for shutdown
-#   stop <vm>            Stop VM and restore host CPU defaults (idempotent)
+#   start <vm>           Full lifecycle: prepare host → start VM → wait for shutdown → restore host
+#   stop <vm>            Inspect current state, do minimum work to reach host-mode (idempotent)
 #   status <vm>          Print current system state across all dimensions
 #   acquire-mutex <vm>   Atomically claim /run/overwatch/active-vm (used by ExecStartPre)
 #   release-mutex <vm>   Release /run/overwatch/active-vm if owned by this VM (used by ExecStopPost)
@@ -170,17 +149,80 @@ gpu_driver() {
     fi
 }
 
-# Read /proc/cmdline for the boot-mode marker set by the GRUB menuentry.
-# Returns: "host", "vm", or "unknown".
-boot_mode() {
-    local tok
-    for tok in $(cat /proc/cmdline 2>/dev/null); do
-        case "$tok" in
-            overwatch.mode=host) echo host; return 0 ;;
-            overwatch.mode=vm)   echo vm;   return 0 ;;
-        esac
+# PCIe Secondary Bus Reset + readiness poll via setpci.
+# RX 7900 XTX only supports SBR (no FLR); resets both 03:00.0 and 03:00.1.
+# Logs: reset completion time and vendor ID readiness.
+gpu_bus_reset() {
+    local label="${1:-PCIe bus reset}"
+    log "Resetting GPU ($label)..."
+    echo 1 > "/sys/bus/pci/devices/$GPU/reset" 2>/dev/null || true
+    local i vendor
+    for i in $(seq 1 20); do
+        vendor=$(setpci -s "$GPU" VENDOR_ID 2>/dev/null) || true
+        if [ "$vendor" = "1002" ]; then
+            log "Bus reset complete (device ready after ${i}00ms)"
+            return 0
+        fi
+        sleep 0.1
     done
-    echo unknown
+    log "WARNING: GPU not responding after bus reset"
+    return 1
+}
+
+# PCI remove + rescan: gives amdgpu a completely fresh device, avoiding stale
+# SR-IOV VF mailbox state that causes probe() to block for ~4 minutes.
+# Drivers auto-bind via modalias since driver_override was already cleared.
+gpu_pci_remove_rescan() {
+    log "Removing GPU from PCI bus and rescanning..."
+    echo 1 > "/sys/bus/pci/devices/$GPU/remove" 2>/dev/null || true
+    echo 1 > "/sys/bus/pci/devices/$GPU_AUDIO/remove" 2>/dev/null || true
+    sleep 1
+    echo 1 > /sys/bus/pci/rescan
+    local i drv
+    for i in $(seq 1 15); do
+        drv=$(gpu_driver "$GPU")
+        if [ "$drv" = "amdgpu" ]; then
+            log "PCI rescan: amdgpu auto-bound after ${i}s"
+            return 0
+        fi
+        sleep 1
+    done
+    log "PCI rescan: amdgpu did not auto-bind within 15s (driver=$(gpu_driver "$GPU"))"
+    return 1
+}
+
+# Bind GPU to amdgpu with a timeout. The bind call can block in kernel space
+# (SR-IOV VF mailbox loop) for ~4 minutes; this wrapper kills it after $1 seconds.
+gpu_bind_with_timeout() {
+    local timeout=${1:-30}
+    log "Binding to amdgpu (timeout=${timeout}s)..."
+    ( echo "$GPU" > /sys/bus/pci/drivers/amdgpu/bind 2>/dev/null ) &
+    local bind_pid=$!
+    local i
+    for i in $(seq 1 "$timeout"); do
+        if ! kill -0 "$bind_pid" 2>/dev/null; then
+            wait "$bind_pid" 2>/dev/null
+            log "amdgpu bind completed in ${i}s"
+            return 0
+        fi
+        sleep 1
+    done
+    log "WARNING: amdgpu bind still blocked after ${timeout}s — killing"
+    kill "$bind_pid" 2>/dev/null || true
+    wait "$bind_pid" 2>/dev/null || true
+    return 1
+}
+
+# Find the iGPU framebuffer by PCI device path (not hardcoded fb number)
+igpu_fb() {
+    for fb in /sys/class/graphics/fb*/; do
+        if [ "$(readlink -f "$fb/device" 2>/dev/null)" = "/sys/devices/pci0000:00/$IGPU" ] || \
+           readlink -f "$fb/device" 2>/dev/null | grep -q "$IGPU"; then
+            echo "$fb"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # ============================================================
@@ -189,57 +231,58 @@ boot_mode() {
 
 do_status() {
     local gpu_drv audio_drv vm_state gpu_power
-    local mode
+    local fb blank_val igpu_state
+    local gdm_state ollama_state openrgb_state
     local gov irqbalance_state
     local state
 
-    mode=$(boot_mode)
     gpu_drv=$(gpu_driver "$GPU")
     audio_drv=$(gpu_driver "$GPU_AUDIO")
     gpu_power=$(cat "/sys/bus/pci/devices/$GPU/power_state" 2>/dev/null) || true
     gpu_power=${gpu_power:-unknown}
 
-    vm_state=$(virsh domstate "$VM_NAME" 2>/dev/null) || true
+    vm_state=$(virsh domstate overwatch 2>/dev/null) || true
     vm_state=$(echo "$vm_state" | xargs)
     vm_state=${vm_state:-unknown}
+
+    fb=$(igpu_fb 2>/dev/null) && blank_val=$(cat "${fb}blank" 2>/dev/null) || true
+    blank_val=${blank_val:-?}
+    if [ "$blank_val" = "0" ]; then
+        igpu_state="unblanked"
+    elif [ "$blank_val" = "4" ]; then
+        igpu_state="blanked"
+    else
+        igpu_state="unknown ($blank_val)"
+    fi
+
+    gdm_state=$(systemctl is-active gdm 2>/dev/null) || true
+    gdm_state=${gdm_state:-unknown}
+    ollama_state=$(systemctl is-active ollama 2>/dev/null) || true
+    ollama_state=${ollama_state:-unknown}
+    openrgb_state=$(systemctl is-active openrgb 2>/dev/null) || true
+    openrgb_state=${openrgb_state:-unknown}
 
     gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null) || true
     gov=${gov:-unknown}
     irqbalance_state=$(systemctl is-active irqbalance 2>/dev/null) || true
     irqbalance_state=${irqbalance_state:-unknown}
 
-    # Overall state. For passthrough instances, this is a function of boot mode
-    # AND VM state; non-passthrough instances care only about VM state.
-    if [ "$GPU_PASSTHROUGH" = "true" ]; then
-        if [ "$mode" = "host" ]; then
-            state="host-mode (cannot start VM — reboot to vm-mode required)"
-        elif [ "$mode" = "vm" ] && [ "$vm_state" = "running" ] && [ "$gpu_drv" = "vfio-pci" ]; then
-            state="vm-running"
-        elif [ "$mode" = "vm" ] && [ "$vm_state" = "shut off" ]; then
-            state="vm-mode idle (VM stopped, dGPU on vfio-pci)"
-        elif [ "$mode" = "vm" ]; then
-            state="vm-mode transitioning"
-        else
-            state="unknown boot mode"
-        fi
+    # Determine overall state
+    if [ "$vm_state" = "running" ] && [ "$gpu_drv" = "vfio-pci" ]; then
+        state="vm-running"
+    elif [ "$vm_state" = "shut off" ] && [ "$gpu_drv" = "amdgpu" ] && [ "$gdm_state" = "active" ]; then
+        state="host-ready"
+    elif [ "$vm_state" = "shut off" ] && [ "$gpu_drv" = "amdgpu" ]; then
+        state="host-ready (services pending)"
     else
-        case "$vm_state" in
-            running)  state="vm-running (no passthrough)" ;;
-            "shut off") state="vm-stopped" ;;
-            *)        state="$vm_state" ;;
-        esac
+        state="transitioning"
     fi
 
-    local active_owner
-    active_owner=$(cat "$ACTIVE_VM_FILE" 2>/dev/null) || true
-    active_owner=${active_owner:-<none>}
-
-    echo "Instance:  $VM_NAME (gpu_passthrough=$GPU_PASSTHROUGH)"
-    echo "Boot mode: $mode"
-    echo "Active:    $active_owner"
     echo "GPU:       $gpu_drv ($gpu_power)"
     echo "Audio:     $audio_drv"
     echo "VM:        $vm_state"
+    echo "iGPU:      $igpu_state"
+    echo "Services:  GDM=$gdm_state ollama=$ollama_state openrgb=$openrgb_state"
     echo "CPU:       $gov, irqbalance=$irqbalance_state"
     echo "State:     $state"
 }
@@ -252,7 +295,11 @@ fi
 # --- Usage ---
 
 if [ "$CMD" != "start" ] && [ "$CMD" != "stop" ]; then
-    usage
+    echo "Usage: overwatch [--verbose] start|stop|status"
+    echo ""
+    echo "  start   Prepare host, start VM, wait for shutdown, restore host"
+    echo "  stop    Inspect state and restore host-mode (idempotent, safe to re-run)"
+    echo "  status  Print current system state"
     exit 1
 fi
 
@@ -284,17 +331,16 @@ log_state() {
     local gpu_drv gpu_audio_drv vm_state
     gpu_drv=$(gpu_driver "$GPU")
     gpu_audio_drv=$(gpu_driver "$GPU_AUDIO")
-    vm_state=$(virsh domstate "$VM_NAME" 2>/dev/null || echo "unknown")
+    vm_state=$(virsh domstate overwatch 2>/dev/null || echo "unknown")
     log "STATE [$checkpoint] gpu=$gpu_drv audio=$gpu_audio_drv vm=$vm_state"
 }
 
 # --- Lock ---
 
 acquire_lock() {
-    mkdir -p /run/overwatch 2>/dev/null || true
     exec 9>"$LOCK_FILE"
     if ! flock -n 9; then
-        log "ERROR: Another overwatch[$VM_NAME] instance is already running (lock: $LOCK_FILE)"
+        log "ERROR: Another overwatch instance is already running (lock: $LOCK_FILE)"
         exit 1
     fi
     trap 'on_error $LINENO "$BASH_COMMAND" $?; flock -u 9; rm -f "$LOCK_FILE"' ERR
@@ -307,50 +353,139 @@ acquire_lock() {
 # ============================================================
 
 # --- Host preparation (used by start) ---
-#
-# vm-mode boots arrive with the dGPU already on vfio-pci (via vfio-pci.ids
-# in the kernel cmdline), no ollama running, hugepages reserved, and host
-# CPUs 2-7 isolated. The launcher's "preparation" is therefore reduced to
-# verifying those preconditions and starting the VM. There is no GPU driver
-# unbind/rebind, no GDM cycling, no VT console manipulation, no framebuffer
-# blanking, no PCI bus reset.
 
-# Verify vm-mode preconditions for a passthrough VM start. Returns non-zero
-# if the host isn't ready (caller should fail loudly — the user should be
-# rebooting via overwatch-mode require vm, not running this directly).
-ensure_vm_mode_ready() {
-    local mode gpu_drv audio_drv
-    mode=$(boot_mode)
-    if [ "$mode" != "vm" ]; then
-        log "ERROR: host boot mode is '${mode}', not 'vm'"
-        log "       use 'systemctl start overwatch@${VM_NAME}.service' (which triggers"
-        log "       'overwatch-mode require vm') or run 'overwatch-mode require vm ${VM_NAME}'"
-        log "       to one-shot reboot into vm-mode."
-        return 1
+ensure_services_stopped() {
+    local svc changed=false
+    for svc in ollama openrgb; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            log "Stopping $svc..."
+            systemctl stop "$svc" 2>/dev/null || true
+            changed=true
+        else
+            log "$svc already stopped"
+        fi
+    done
+    [ "$changed" = true ] && sleep 1
+
+    if systemctl is-active --quiet gdm 2>/dev/null; then
+        log "Stopping GDM..."
+        systemctl stop gdm 2>/dev/null || true
+        sleep 3
+    else
+        log "GDM already stopped"
     fi
+}
+
+ensure_device_fds_released() {
+    log "Releasing device holders..."
+    fuser -k /dev/dri/card1 /dev/dri/renderD128 2>/dev/null || true
+    fuser -k /dev/i2c-4 /dev/i2c-5 /dev/i2c-6 /dev/i2c-7 /dev/i2c-8 /dev/i2c-9 /dev/i2c-10 2>/dev/null || true
+    sleep 2
+}
+
+ensure_vt_unbound() {
+    log "Unbinding VT consoles..."
+    for vtcon in /sys/class/vtconsole/vtcon*/bind; do
+        echo 0 > "$vtcon" 2>/dev/null || true
+    done
+    sleep 1
+}
+
+ensure_gpu_unbound_from_host() {
+    local gpu_drv audio_drv
     gpu_drv=$(gpu_driver "$GPU")
     audio_drv=$(gpu_driver "$GPU_AUDIO")
-    if [ "$gpu_drv" != "vfio-pci" ] || [ "$audio_drv" != "vfio-pci" ]; then
-        log "ERROR: vm-mode boot but GPU not on vfio-pci (gpu=$gpu_drv, audio=$audio_drv)"
-        log "       this should not happen — vfio-pci.ids in the cmdline should claim"
-        log "       both devices at boot. Check dmesg for vfio-pci probe failures."
+
+    if [ "$gpu_drv" != "amdgpu" ] && [ "$audio_drv" != "snd_hda_intel" ]; then
+        log "GPU not bound to host drivers (gpu=$gpu_drv, audio=$audio_drv) — skipping unbind"
+        return 0
+    fi
+
+    if [ "$audio_drv" = "snd_hda_intel" ]; then
+        log "Unbinding GPU audio..."
+        echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/unbind 2>/dev/null || true
+        sleep 1
+    fi
+
+    if [ "$gpu_drv" = "amdgpu" ]; then
+        # Suspend the dGPU framebuffer before unbinding. drm_fb_helper has a
+        # damage_work worker that blits shadow→VRAM; if it's in-flight during
+        # teardown, cancel_work_sync in drm_fb_helper_fini deadlocks because
+        # the GPU hardware is being removed. Setting state=1 (FBINFO_STATE_SUSPENDED)
+        # causes damage_work to bail out immediately. ~1.5% hit rate without this.
+        for fb in /sys/class/graphics/fb*/; do
+            if readlink -f "${fb}device" 2>/dev/null | grep -q "$GPU"; then
+                echo 1 > "${fb}state" 2>/dev/null || true
+                log "Suspended framebuffer $(basename "$fb")"
+                break
+            fi
+        done
+        log "Unbinding GPU from amdgpu..."
+        echo "$GPU" > /sys/bus/pci/drivers/amdgpu/unbind
+        sleep 2
+        log "Unbind completed. GPU driver: $(gpu_driver "$GPU")"
+    fi
+
+    log_state "post_unbind"
+}
+
+ensure_gpu_on_vfio() {
+    modprobe vfio-pci 2>/dev/null || true
+
+    if [ "$(gpu_driver "$GPU")" = "vfio-pci" ] && [ "$(gpu_driver "$GPU_AUDIO")" = "vfio-pci" ]; then
+        log "GPU already on vfio-pci — skipping bind"
+        # HypE 2026-04-08: bus reset DISABLED to test if unconditional reset is the TDR cause
+        # # Bus reset even when already on vfio-pci
+        # gpu_bus_reset "clean guest handoff" || true
+        return 0
+    fi
+
+    log "Binding GPU to vfio-pci..."
+    if [ "$(gpu_driver "$GPU")" != "vfio-pci" ]; then
+        echo "vfio-pci" > /sys/bus/pci/devices/$GPU/driver_override
+        echo "$GPU" > /sys/bus/pci/drivers/vfio-pci/bind
+    fi
+    if [ "$(gpu_driver "$GPU_AUDIO")" != "vfio-pci" ]; then
+        echo "vfio-pci" > /sys/bus/pci/devices/$GPU_AUDIO/driver_override
+        echo "$GPU_AUDIO" > /sys/bus/pci/drivers/vfio-pci/bind
+    fi
+    sleep 1
+
+    log "GPU driver: $(gpu_driver "$GPU")"
+    if [ "$(gpu_driver "$GPU")" != "vfio-pci" ]; then
+        log "ERROR: GPU not on vfio-pci after bind attempt"
+        log_state "vfio_bind_failed"
         return 1
     fi
-    log "vm-mode preconditions OK (gpu=$gpu_drv, audio=$audio_drv)"
-    return 0
+
+    # HypE 2026-04-08: bus reset DISABLED to test if unconditional reset is the TDR cause
+    # # Bus reset after vfio-pci bind — gives the Windows AMD driver a clean
+    # # GPU state (closer to power-on) which may reduce boot-time TDR timeouts.
+    # gpu_bus_reset "clean guest handoff" || true
 }
 
 ensure_vm_running() {
-    if virsh domstate "$VM_NAME" 2>/dev/null | grep -q "running"; then
+    if virsh domstate overwatch 2>/dev/null | grep -q "running"; then
         log "ERROR: VM already running"
         return 1
     fi
     log "Starting VM..."
-    if ! virsh start "$VM_NAME"; then
+    if ! virsh start overwatch; then
         log "ERROR: virsh start failed"
         return 1
     fi
     log "VM started successfully."
+}
+
+set_igpu_blank() {
+    local target=$1 label=$2
+    local fb blank_val
+    fb=$(igpu_fb) || { log "WARNING: iGPU framebuffer not found — cannot $label"; return 1; }
+    blank_val=$(cat "${fb}blank" 2>/dev/null || echo "?")
+    # Always write — kernel may report stale blank state after reboot
+    log "${label^}ing iGPU output (${fb}blank: $blank_val → $target)..."
+    echo "$target" > "${fb}blank" 2>/dev/null || { log "WARNING: Failed to $label iGPU"; return 1; }
+    log "iGPU ${label}ed"
 }
 
 ensure_performance_tuning() {
@@ -390,7 +525,7 @@ ensure_performance_tuning() {
 apply_cpu_isolation() {
     local deadline=$(($(date +%s) + 120))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        if virsh qemu-agent-command "$VM_NAME" '{"execute":"guest-ping"}' &>/dev/null; then
+        if virsh qemu-agent-command overwatch '{"execute":"guest-ping"}' &>/dev/null; then
             log "Guest agent up — applying CPU isolation (AllowedCPUs=$HOST_CPUS)"
             systemctl set-property --runtime -- system.slice AllowedCPUs=$HOST_CPUS 2>/dev/null || true
             systemctl set-property --runtime -- user.slice AllowedCPUs=$HOST_CPUS 2>/dev/null || true
@@ -407,7 +542,7 @@ apply_cpu_isolation() {
 
 apply_sched_fifo() {
     local qemu_pid count=0
-    qemu_pid=$(pgrep -f "qemu-system.*guest=$VM_NAME" 2>/dev/null | head -1) || true
+    qemu_pid=$(pgrep -f "qemu-system.*overwatch" 2>/dev/null | head -1) || true
     if [ -z "$qemu_pid" ]; then
         log "SCHED_FIFO: QEMU PID not found, skipping"
         return
@@ -418,8 +553,9 @@ apply_sched_fifo() {
     log "SCHED_FIFO: applied to $count QEMU threads (PID $qemu_pid)"
 }
 
+# Source background monitors and deferred boot tasks
 # Source background monitors and deferred boot tasks (shared across all VMs)
-source /usr/local/share/overwatch/shared/overwatch-monitors.sh
+source "${SHARED_DIR}/overwatch-monitors.sh"
 
 
 # --- Guest agent helpers ---
@@ -443,12 +579,12 @@ print(json.dumps({
     }
 }))" "$cmd" 2>/dev/null) || return 1
 
-    ps_out=$(virsh qemu-agent-command "$VM_NAME" "$req" 2>/dev/null) || return 1
+    ps_out=$(virsh qemu-agent-command overwatch "$req" 2>/dev/null) || return 1
     pid=$(echo "$ps_out" | python3 -c "import sys,json; print(json.load(sys.stdin)['return']['pid'])" 2>/dev/null) || return 1
     [ -z "$pid" ] && return 1
 
     for i in $(seq 1 "$max_wait"); do
-        status_out=$(virsh qemu-agent-command "$VM_NAME" \
+        status_out=$(virsh qemu-agent-command overwatch \
             "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}" 2>/dev/null) || return 1
         exited=$(echo "$status_out" | python3 -c \
             "import sys,json; print(json.load(sys.stdin)['return'].get('exited',False))" 2>/dev/null) || break
@@ -470,17 +606,17 @@ if r.get('out-data'):
 
 ensure_vm_stopped() {
     local vm_check
-    vm_check=$(virsh domstate "$VM_NAME" 2>/dev/null) || true
+    vm_check=$(virsh domstate overwatch 2>/dev/null) || true
     if [ -z "$vm_check" ] || ! echo "$vm_check" | grep -q "running"; then
         log "VM not running"
         return 0
     fi
     log "Shutting down VM (graceful)..."
-    virsh shutdown "$VM_NAME" 2>/dev/null || true
+    virsh shutdown overwatch 2>/dev/null || true
     local waited=0
     while true; do
         local vm_poll
-        vm_poll=$(virsh domstate "$VM_NAME" 2>/dev/null) || true
+        vm_poll=$(virsh domstate overwatch 2>/dev/null) || true
         if [ -n "$vm_poll" ] && ! echo "$vm_poll" | grep -q "running"; then
             break
         fi
@@ -488,7 +624,7 @@ ensure_vm_stopped() {
         waited=$((waited + 5))
         if [ $waited -ge 60 ]; then
             log "WARNING: VM still running after ${waited}s — forcing destroy"
-            virsh destroy "$VM_NAME" 2>/dev/null || true
+            virsh destroy overwatch 2>/dev/null || true
             sleep 2
             break
         fi
@@ -517,62 +653,170 @@ ensure_cpu_defaults() {
     echo 1 > /proc/sys/kernel/sched_autogroup_enabled 2>/dev/null || true
 }
 
-# --- Host restoration on VM shutdown ---
-#
-# Returning to host-mode (ollama, full host CPU/RAM, dGPU on amdgpu) is now
-# a reboot, not a runtime operation. After the VM stops in vm-mode, the
-# launcher only restores per-runtime CPU tunables (governor, IRQ affinity,
-# autogroup, AllowedCPUs) so that whatever the user does in the leftover
-# vm-mode session uses normal host scheduling. The dGPU stays on vfio-pci
-# until the next reboot.
+ensure_gpu_unbound_from_vfio() {
+    local gpu_drv audio_drv
+    gpu_drv=$(gpu_driver "$GPU")
+    audio_drv=$(gpu_driver "$GPU_AUDIO")
+
+    if [ "$gpu_drv" != "vfio-pci" ] && [ "$audio_drv" != "vfio-pci" ]; then
+        log "GPU not on vfio-pci (gpu=$gpu_drv, audio=$audio_drv) — skipping unbind"
+        # Clear driver_override even if not on vfio (may be stale)
+        echo "" > /sys/bus/pci/devices/$GPU/driver_override 2>/dev/null || true
+        echo "" > /sys/bus/pci/devices/$GPU_AUDIO/driver_override 2>/dev/null || true
+        return 0
+    fi
+
+    log "Unbinding vfio-pci..."
+    echo "$GPU" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
+    echo "$GPU_AUDIO" > /sys/bus/pci/drivers/vfio-pci/unbind 2>/dev/null || true
+    echo "" > /sys/bus/pci/devices/$GPU/driver_override 2>/dev/null || true
+    echo "" > /sys/bus/pci/devices/$GPU_AUDIO/driver_override 2>/dev/null || true
+    sleep 1
+    log_state "post_vfio_unbind"
+}
+
+# Disable runtime PM on GPU and audio, bind audio to snd_hda_intel if needed.
+# Called after any successful GPU bind method.
+disable_gpu_runtime_pm() {
+    # Disable runtime PM on GPU — amdgpu sets power/control to "auto" during
+    # probe, and the GPU crashes on D3 resume.
+    echo on > "/sys/bus/pci/devices/$GPU/power/control" 2>/dev/null || true
+
+    # GPU audio: bind to snd_hda_intel if not already bound
+    if [ -e "/sys/bus/pci/devices/$GPU_AUDIO" ]; then
+        echo on > "/sys/bus/pci/devices/$GPU_AUDIO/power/control" 2>/dev/null || true
+        if [ "$(gpu_driver "$GPU_AUDIO")" = "snd_hda_intel" ]; then
+            log "GPU audio already bound to snd_hda_intel"
+        else
+            log "Binding GPU audio to snd_hda_intel..."
+            echo "$GPU_AUDIO" > /sys/bus/pci/drivers/snd_hda_intel/bind 2>/dev/null || \
+                log "WARNING: snd_hda_intel bind failed — HDMI/DP audio unavailable"
+            echo on > "/sys/bus/pci/devices/$GPU_AUDIO/power/control" 2>/dev/null || true
+        fi
+    else
+        log "WARNING: GPU audio device not found after rescan"
+    fi
+
+    log "Runtime PM disabled for GPU and audio"
+}
+
+ensure_gpu_on_host() {
+    # Always rebind VT consoles (safe even if already bound)
+    log "Rebinding VT consoles..."
+    for vtcon in /sys/class/vtconsole/vtcon*/bind; do
+        echo 1 > "$vtcon" 2>/dev/null || true
+    done
+
+    local gpu_drv
+    gpu_drv=$(gpu_driver "$GPU")
+
+    if [ "$gpu_drv" = "amdgpu" ]; then
+        log "GPU already on amdgpu — skipping bind"
+        disable_gpu_runtime_pm
+        return 0
+    fi
+
+    # Primary: PCI remove+rescan gives amdgpu a completely fresh device,
+    # avoiding the stale SR-IOV VF mailbox state that blocks probe() for ~4min.
+    log "Attempting PCI remove+rescan (primary)..."
+    if gpu_pci_remove_rescan && [ "$(gpu_driver "$GPU")" = "amdgpu" ]; then
+        disable_gpu_runtime_pm
+        return 0
+    fi
+
+    # Fallback: bus reset + direct bind with timeout
+    log "PCI rescan did not bind — falling back to bus reset + timed bind..."
+    gpu_bus_reset "post-VFIO host rebind" || true
+    if gpu_bind_with_timeout 30 && [ "$(gpu_driver "$GPU")" = "amdgpu" ]; then
+        disable_gpu_runtime_pm
+        return 0
+    fi
+
+    log "WARNING: All GPU bind methods failed (driver=$(gpu_driver "$GPU"))"
+    return 1
+}
+
+ensure_services_running() {
+    local svc
+    for svc in openrgb ollama; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            log "$svc already running"
+        else
+            log "Starting $svc..."
+            systemctl start "$svc" 2>/dev/null || true
+        fi
+    done
+
+    if systemctl is-active --quiet gdm 2>/dev/null; then
+        log "GDM already running"
+    else
+        log "Starting GDM..."
+        systemctl start gdm
+        sleep 2
+    fi
+
+    # Ensure GDM monitors.xml is correct
+    if [ -f "/home/${TARGET_USER}/.config/monitors.xml" ]; then
+        cp "/home/${TARGET_USER}/.config/monitors.xml" /var/lib/gdm3/.config/monitors.xml
+        chown gdm:gdm /var/lib/gdm3/.config/monitors.xml
+    fi
+}
 
 # ============================================================
 # Top-level operations
 # ============================================================
 
 _do_stop() {
-    log "=== Stopping overwatch[$VM_NAME] ==="
+    log "=== Restoring host state ==="
 
     ensure_vm_stopped
+    ensure_cpu_defaults
+    ensure_gpu_unbound_from_vfio
+    set_igpu_blank 0 unblank || true
+    ensure_services_running
+    # GPU rebind last — user already has desktop on iGPU via GDM.
+    # If this hangs or fails, the session is still usable.
+    ensure_gpu_on_host || log "WARNING: Could not restore GPU to host — iGPU only"
 
-    if [ "$GPU_PASSTHROUGH" = "true" ]; then
-        # Restore per-runtime CPU tunables (governor, AllowedCPUs, autogroup,
-        # C-states, IRQ affinity) so post-VM host work uses normal scheduling.
-        # The dGPU stays on vfio-pci — returning to host-mode (amdgpu, ollama)
-        # is a reboot, not a runtime op. See header.
-        ensure_cpu_defaults
-    else
-        log "Non-passthrough VM — no host CPU tunables to restore"
-    fi
-
-    log "=== Stop complete ($VM_NAME) ==="
+    log "=== Host restored ==="
 }
 
 _do_start() {
-    log "=== Starting overwatch[$VM_NAME] ==="
+    log "=== Starting Overwatch VM ==="
+
+    # --- SIGTERM deferral during GPU handoff ---
+    # The GPU handoff (host → vfio → VM) puts the system in a transitional state.
+    # If SIGTERM (from systemctl stop) arrives mid-handoff and we immediately try
+    # to reverse the GPU operations, the half-unbound GPU causes a kernel panic.
+    # Solution: defer SIGTERM during the critical section, then handle it once
+    # the system is in a stable state (VM running, or fully rolled back).
+    local SIGTERM_DEFERRED=false
+    trap 'SIGTERM_DEFERRED=true; log "SIGTERM deferred — GPU handoff in progress"' TERM
 
     # Refuse if VM already running
-    if virsh domstate "$VM_NAME" 2>/dev/null | grep -q "running"; then
-        log "ERROR: VM is already running. Use 'systemctl stop overwatch@${VM_NAME}.service' to stop it."
+    if virsh domstate overwatch 2>/dev/null | grep -q "running"; then
+        log "ERROR: VM is already running. Use 'systemctl stop overwatch' to stop it."
         exit 1
     fi
 
-    if [ "$GPU_PASSTHROUGH" = "true" ]; then
-        # vm-mode boot precondition check. The host should already be in
-        # vm-mode (verified by `overwatch-mode require vm` in ExecStartPre)
-        # with the dGPU on vfio-pci from boot. This is a defense-in-depth
-        # check: if it fails, something rebound the GPU since boot, or the
-        # cmdline marker is missing — refuse to start.
-        ensure_vm_mode_ready || { log "ERROR: vm-mode preconditions not met"; exit 1; }
-        ensure_vm_running   || { log "ERROR: VM start failed"; _do_stop; exit 1; }
-    else
-        # Non-passthrough path — no mode check, no host disruption.
-        log "Non-passthrough VM — starting without mode gating"
-        ensure_vm_running || { log "ERROR: VM start failed"; _do_stop; exit 1; }
+    # === CRITICAL SECTION: GPU handoff (SIGTERM deferred) ===
+    ensure_services_stopped
+    ensure_device_fds_released
+    ensure_vt_unbound
+    ensure_gpu_unbound_from_host
+    ensure_gpu_on_vfio || { log "ERROR: VFIO bind failed"; _do_stop; exit 1; }
+    ensure_vm_running || { log "ERROR: VM start failed"; _do_stop; exit 1; }
+    # === END CRITICAL SECTION ===
+
+    # Stable state reached: VM running, GPU on vfio-pci.
+    # If SIGTERM arrived during handoff, do a clean shutdown now.
+    if [ "$SIGTERM_DEFERRED" = true ]; then
+        log "Processing deferred SIGTERM — stopping VM..."
+        _do_stop
+        exit 0
     fi
 
-    # Install SIGTERM handler for the wait loop. There is no critical-section
-    # GPU handoff anymore, so SIGTERM is always safe to act on immediately.
+    # Install interruptible SIGTERM handler for the wait loop
     _on_sigterm() {
         log "Received SIGTERM (systemctl stop) — shutting down..."
         _do_stop
@@ -580,33 +824,24 @@ _do_start() {
     }
     trap '_on_sigterm' TERM
 
-    if [ "$GPU_PASSTHROUGH" = "true" ]; then
-        # Post-VM-start performance tuning (non-critical, continue on failure)
-        ensure_performance_tuning
-        apply_sched_fifo
-    fi
+    # Post-VM-start setup (non-critical, continue on failure)
+    set_igpu_blank 4 blank || true
+    ensure_performance_tuning
+    apply_sched_fifo
 
     log_state "vm_running"
     log "VM running. Waiting for shutdown..."
 
-    local cpu_iso_pid=""
-    if [ "$GPU_PASSTHROUGH" = "true" ]; then
-        # CPU isolation — deferred until guest agent responds (Windows finished booting).
-        # See apply_cpu_isolation() for rationale on why this is not applied immediately.
-        apply_cpu_isolation &
-        cpu_iso_pid=$!
-    fi
+    # CPU isolation — deferred until guest agent responds (Windows finished booting).
+    # See apply_cpu_isolation() for rationale on why this is not applied immediately.
+    apply_cpu_isolation &
+    local cpu_iso_pid=$!
 
-    # Tartarus attach + reboot watcher — initial deferred attach + persistent
-    # loop that re-fires the attach after every guest reboot (not just at
-    # overwatch start). The loop runs for the lifetime of the VM and is
-    # killed by the existing cleanup section on real shutdown.
-    local VM_START_EPOCH tartarus_pid=""
+    # Deferred Tartarus attach — waits for Synapse then hot-plugs
+    local VM_START_EPOCH
     VM_START_EPOCH=$(date +%s)
-    if [ "$TARTARUS_ATTACH" = "true" ]; then
-        tartarus_attach_loop "$VM_START_EPOCH" &
-        tartarus_pid=$!
-    fi
+    attach_tartarus_deferred "$VM_START_EPOCH" &
+    local tartarus_pid=$!
 
     # Network monitor — polls vnet interface for drop events
     monitor_network &
@@ -636,28 +871,21 @@ _do_start() {
     monitor_guest_network &
     local guest_netmon_pid=$!
 
-    # Transition throttle event listener -- receives TRANSITION messages from guest script.
-    # Only meaningful for passthrough VMs (the throttle script is OW2-specific).
-    local transition_pid=""
-    if [ "$GPU_PASSTHROUGH" = "true" ]; then
-        monitor_transition_events &
-        transition_pid=$!
-    fi
+    # Transition throttle event listener -- receives TRANSITION messages from guest script
+    monitor_transition_events &
+    local transition_pid=$!
 
-    # Listen for shutdown signal from guest; record timestamp on receipt.
-    # Per-VM ts file so multiple instances don't collide on /tmp.
-    local SHUTDOWN_TS_FILE="/tmp/.overwatch-${VM_NAME}-shutdown-ts"
-    rm -f "$SHUTDOWN_TS_FILE"
+    # Listen for shutdown signal from guest; record timestamp on receipt
+    rm -f /tmp/.overwatch-shutdown-ts
     {
-        SHUTDOWN_TS_FILE="$SHUTDOWN_TS_FILE" SHUTDOWN_SIGNAL_PORT="$SHUTDOWN_SIGNAL_PORT" \
         python3 -c "
-import os, socket, time
+import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('', int(os.environ['SHUTDOWN_SIGNAL_PORT'])))
+s.bind(('', ${SHUTDOWN_SIGNAL_PORT}))
 s.recvfrom(64)
 s.close()
-open(os.environ['SHUTDOWN_TS_FILE'],'w').write(str(int(time.time())))" \
+open('/tmp/.overwatch-shutdown-ts','w').write(str(int(time.time())))" \
         && log "Shutdown signal received from guest"
     } &
     local listener_pid=$!
@@ -666,7 +894,7 @@ open(os.environ['SHUTDOWN_TS_FILE'],'w').write(str(int(time.time())))" \
     # Accept definitive non-running state OR domain-not-found (libvirtd lost track).
     # Transient empty output (libvirtd hiccup) is treated as "keep waiting".
     local qemu_pid prev_qemu_state=""
-    qemu_pid=$(pgrep -f "guest=$VM_NAME" 2>/dev/null) || true
+    qemu_pid=$(pgrep -f "guest=overwatch" 2>/dev/null) || true
     local domain_missing=0
     while true; do
         # Track QEMU process state transitions (S=sleeping, D=uninterruptible, exited)
@@ -680,14 +908,14 @@ open(os.environ['SHUTDOWN_TS_FILE'],'w').write(str(int(time.time())))" \
         fi
 
         local vm_poll
-        vm_poll=$(virsh domstate "$VM_NAME" 2>&1) || true
+        vm_poll=$(virsh domstate overwatch 2>&1) || true
 
         if echo "$vm_poll" | grep -q "failed to get domain"; then
             domain_missing=$((domain_missing + 1))
             if [ $domain_missing -ge 3 ]; then
                 log "WARNING: Domain not found in libvirt — treating as shutdown"
                 local orphan_pid
-                orphan_pid=$(pgrep -f "guest=$VM_NAME" 2>/dev/null) || true
+                orphan_pid=$(pgrep -f "guest=overwatch" 2>/dev/null) || true
                 if [ -n "$orphan_pid" ]; then
                     log "Killing orphaned QEMU (pid $orphan_pid)"
                     kill "$orphan_pid" 2>/dev/null || true
@@ -704,9 +932,9 @@ open(os.environ['SHUTDOWN_TS_FILE'],'w').write(str(int(time.time())))" \
     done
 
     # Shutdown duration: signal-to-domain-stop delta
-    if [ -f "$SHUTDOWN_TS_FILE" ]; then
+    if [ -f /tmp/.overwatch-shutdown-ts ]; then
         local sig_ts dur
-        sig_ts=$(cat "$SHUTDOWN_TS_FILE" 2>/dev/null) || true
+        sig_ts=$(cat /tmp/.overwatch-shutdown-ts 2>/dev/null) || true
         if [ -n "$sig_ts" ]; then
             dur=$(( $(date +%s) - sig_ts ))
             if [ "$dur" -le 300 ]; then
@@ -715,23 +943,32 @@ open(os.environ['SHUTDOWN_TS_FILE'],'w').write(str(int(time.time())))" \
                 log "WARNING: Shutdown duration ${dur}s exceeds 300s limit"
             fi
         fi
-        rm -f "$SHUTDOWN_TS_FILE"
+        rm -f /tmp/.overwatch-shutdown-ts
     fi
 
-    # Clean up background jobs (cpu_iso/tartarus/transition may be empty for
-    # non-passthrough VMs; _kw skips empty pids cleanly).
-    _kw() { [ -n "$1" ] && { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }; }
-    _kw "$cpu_iso_pid"
-    _kw "$tartarus_pid"
-    _kw "$listener_pid"
-    _kw "$netmon_pid"
-    _kw "$perf_host_pid"
-    _kw "$diag_pid"
-    _kw "$guest_perf_pid"
-    _kw "$pcap_pid"
-    _kw "$latency_host_pid"
-    _kw "$guest_netmon_pid"
-    _kw "$transition_pid"
+    # Clean up background jobs
+    kill "$cpu_iso_pid" 2>/dev/null || true
+    kill "$tartarus_pid" 2>/dev/null || true
+    kill "$listener_pid" 2>/dev/null || true
+    kill "$netmon_pid" 2>/dev/null || true
+    kill "$perf_host_pid" 2>/dev/null || true
+    kill "$diag_pid" 2>/dev/null || true
+    kill "$guest_perf_pid" 2>/dev/null || true
+    kill "$pcap_pid" 2>/dev/null || true
+    kill "$latency_host_pid" 2>/dev/null || true
+    kill "$guest_netmon_pid" 2>/dev/null || true
+    kill "$transition_pid" 2>/dev/null || true
+    wait "$cpu_iso_pid" 2>/dev/null || true
+    wait "$tartarus_pid" 2>/dev/null || true
+    wait "$listener_pid" 2>/dev/null || true
+    wait "$netmon_pid" 2>/dev/null || true
+    wait "$perf_host_pid" 2>/dev/null || true
+    wait "$diag_pid" 2>/dev/null || true
+    wait "$guest_perf_pid" 2>/dev/null || true
+    wait "$pcap_pid" 2>/dev/null || true
+    wait "$latency_host_pid" 2>/dev/null || true
+    wait "$guest_netmon_pid" 2>/dev/null || true
+    wait "$transition_pid" 2>/dev/null || true
 
     log "VM shut down detected."
     log_state "vm_shutdown"

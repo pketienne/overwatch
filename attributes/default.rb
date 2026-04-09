@@ -77,43 +77,24 @@ default['overwatch']['vm_ip']  = '' # must override per host
 # planning re-registration.
 default['overwatch']['windows_hostname'] = '' # must override per host
 
-# GRUB kernel parameters (host-wide).
+# GRUB kernel parameters (host-wide; required for any VFIO passthrough VM).
 #
-# Two boot-time modes selected via custom GRUB menuentries (see
-# templates/40_overwatch_modes.erb). The mode marker (overwatch.mode=host|vm)
-# is read by /usr/local/bin/overwatch-mode at runtime to gate service starts.
-#
-#   host-mode (default): dGPU on amdgpu, ollama can use it for inference,
-#                        full host CPU/RAM available, no hugepages reserved.
-#                        Browser can use the dGPU per-app via DRI_PRIME=1.
-#   vm-mode:             dGPU on vfio-pci at boot, hugepages reserved,
-#                        host CPUs 2-7 isolated for vCPU pinning, VM auto-
-#                        started by overwatch-resume.service after boot.
-#
-# Mode switching is reboot-based: `systemctl start overwatch@<vm>` (or the
-# desktop shortcut) calls `overwatch-mode require vm` which sets a one-shot
-# next-boot entry via grub-reboot, then triggers a reboot. Same for ollama
-# via the systemd drop-in installed by this cookbook.
-default['overwatch']['grub_cmdline_common'] = %w(
+# Single-mode cookbook: the dGPU is bound to vfio-pci at boot via vfio-pci.ids,
+# the launcher does its in-uptime GPU rebind dance to swap between vfio and
+# amdgpu when the VM starts/stops. Reboot-based mode switching (Pass 4) is a
+# separate refactor not yet deployed.
+default['overwatch']['grub_cmdline_params'] = %w(
   amd_iommu=on
   iommu=pt
-  kvm_amd.avic=1
-  kvm.ignore_msrs=1
-  kvm.report_ignored_msrs=0
-)
-
-default['overwatch']['grub_cmdline_host_mode'] = %w(
-  overwatch.mode=host
-)
-
-default['overwatch']['grub_cmdline_vm_mode'] = %w(
-  overwatch.mode=vm
   hugepages=24576
   isolcpus=domain,managed_irq,2-7
   nohz_full=2-7
   rcu_nocbs=2-7
   vfio-pci.ids=1002:744c,1002:ab30
   vfio-pci.disable_vga=1
+  kvm_amd.avic=1
+  kvm.ignore_msrs=1
+  kvm.report_ignored_msrs=0
 )
 
 # Per-host GPU topology (passthrough VMs reference this; non-passthrough VMs ignore)
