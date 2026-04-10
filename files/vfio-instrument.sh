@@ -1,18 +1,20 @@
 #!/bin/bash
-# VFIO passthrough instrumentation — logs interrupt rate + KVM exit stats
-# every second to correlate with Mode 2 loading-screen stalls.
+# VFIO passthrough instrumentation — logs GPU interrupt rate, KVM exit stats,
+# and NIC packet flow every second to correlate with Mode 2 stalls.
 #
 # Usage: sudo /usr/local/bin/vfio-instrument <vm-name>
 # Stop: Ctrl+C
 # Output: /var/log/overwatch/<vm>/vfio-instrument.csv
 #
-# The CSV has columns:
-#   timestamp, irq_total, irq_delta, kvm_exits, kvm_mmio, kvm_pio,
-#   kvm_irq_injections, kvm_halt, qemu_cpu_pct
+# Columns:
+#   timestamp, irq_total, irq_delta,
+#   kvm_exits, kvm_mmio, kvm_pio, kvm_irq_injections, kvm_halt,
+#   qemu_cpu_pct,
+#   nic_rx_pkts, nic_tx_pkts, nic_rx_delta, nic_tx_delta, nic_rx_drops
 #
-# During steady-state gameplay, expect: low irq_delta, steady exits/sec.
-# During a loading-screen stall, look for spikes in mmio, irq_injections,
-# or drops in halt (indicating the vCPUs can't halt because they're busy).
+# During steady-state gameplay: low irq_delta, steady exits/sec, steady rx/tx.
+# During a loading-screen stall: look for IRQ/exit spikes WITH rx/tx drops
+# (NIC starvation) or rx/tx flat (network timeout).
 
 set -euo pipefail
 
@@ -35,10 +37,19 @@ if [ -z "$IRQ_LINE" ]; then
     IRQ_LINE="NONE"
 fi
 
-echo "$(date -Iseconds) vfio-instrument started: VM=${VM_NAME} PID=${QEMU_PID} IRQ=${IRQ_LINE} log=${LOG}" >&2
-echo "timestamp,irq_total,irq_delta,kvm_exits,kvm_mmio,kvm_pio,kvm_irq_injections,kvm_halt,qemu_cpu_pct" > "$LOG"
+# Find the VM's vnet interface (tap device on the bridge)
+VNET=$(virsh domiflist "$VM_NAME" 2>/dev/null | awk '/bridge/ {print $1}' | head -1)
+if [ -z "$VNET" ]; then
+    echo "WARNING: No vnet interface found for ${VM_NAME}, NIC tracking disabled" >&2
+    VNET="NONE"
+fi
+
+echo "$(date -Iseconds) vfio-instrument started: VM=${VM_NAME} PID=${QEMU_PID} IRQ=${IRQ_LINE} NIC=${VNET} log=${LOG}" >&2
+echo "timestamp,irq_total,irq_delta,kvm_exits,kvm_mmio,kvm_pio,kvm_irq_injections,kvm_halt,qemu_cpu_pct,nic_rx_pkts,nic_tx_pkts,nic_rx_delta,nic_tx_delta,nic_rx_drops" > "$LOG"
 
 PREV_IRQ=0
+PREV_RX=0
+PREV_TX=0
 
 while kill -0 "$QEMU_PID" 2>/dev/null; do
     TS=$(date '+%H:%M:%S.%N' | cut -c1-12)
@@ -62,7 +73,20 @@ while kill -0 "$QEMU_PID" 2>/dev/null; do
     # QEMU CPU usage
     CPU_PCT=$(ps -p "$QEMU_PID" -o %cpu= 2>/dev/null | tr -d ' ')
 
-    echo "$TS,$IRQ_NOW,$IRQ_DELTA,$EXITS,$MMIO,$PIO,$IRQ_INJ,$HALT,${CPU_PCT:-0}" >> "$LOG"
+    # NIC packet stats
+    if [ "$VNET" != "NONE" ]; then
+        NIC_RX=$(cat /sys/class/net/${VNET}/statistics/rx_packets 2>/dev/null || echo 0)
+        NIC_TX=$(cat /sys/class/net/${VNET}/statistics/tx_packets 2>/dev/null || echo 0)
+        NIC_RX_DROP=$(cat /sys/class/net/${VNET}/statistics/rx_dropped 2>/dev/null || echo 0)
+    else
+        NIC_RX=0; NIC_TX=0; NIC_RX_DROP=0
+    fi
+    NIC_RX_DELTA=$((NIC_RX - PREV_RX))
+    NIC_TX_DELTA=$((NIC_TX - PREV_TX))
+    PREV_RX=$NIC_RX
+    PREV_TX=$NIC_TX
+
+    echo "$TS,$IRQ_NOW,$IRQ_DELTA,$EXITS,$MMIO,$PIO,$IRQ_INJ,$HALT,${CPU_PCT:-0},$NIC_RX,$NIC_TX,$NIC_RX_DELTA,$NIC_TX_DELTA,$NIC_RX_DROP" >> "$LOG"
 
     sleep 1
 done
