@@ -455,6 +455,14 @@ action :install do
     mode '0755'
   end
 
+  cookbook_file '/usr/local/bin/vfio-instrument' do
+    source 'vfio-instrument.sh'
+    cookbook 'overwatch'
+    owner 'root'
+    group 'root'
+    mode '0755'
+  end
+
   # systemd template unit
   template '/etc/systemd/system/overwatch@.service' do
     source 'overwatch@.service.erb'
