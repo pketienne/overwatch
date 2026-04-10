@@ -364,6 +364,40 @@ action :install do
     action :nothing
   end
 
+  # --- split_lock_mitigate sysctl ---
+  # Kernel 6.12+ defaults split_lock_mitigate=1 on AMD, which penalizes
+  # the QEMU process with 10ms sleeps per split-lock instruction. Disable
+  # for GPU passthrough VMs to avoid accumulated penalties during burst
+  # workloads (shader compilation, asset loading).
+  file '/etc/sysctl.d/99-split-lock.conf' do
+    content "kernel.split_lock_mitigate = 0\n"
+    owner 'root'
+    group 'root'
+    mode '0644'
+    notifies :run, 'execute[sysctl-reload]', :immediately
+  end
+
+  execute 'sysctl-reload' do
+    command 'sysctl --system'
+    action :nothing
+  end
+
+  # --- AppArmor local override for source-built QEMU ---
+  # libvirt's AppArmor profile only allows /usr/bin/qemu-system-*.
+  # The source-built QEMU at /usr/local/bin needs an explicit allow.
+  file '/etc/apparmor.d/local/usr.sbin.libvirtd' do
+    content "/usr/local/bin/qemu-system-x86_64 PUx,\n"
+    owner 'root'
+    group 'root'
+    mode '0644'
+    notifies :run, 'execute[apparmor-reload-libvirtd]', :immediately
+  end
+
+  execute 'apparmor-reload-libvirtd' do
+    command 'apparmor_parser -r /etc/apparmor.d/usr.sbin.libvirtd'
+    action :nothing
+  end
+
   # --- amdgpu modprobe + vfio-pci modules-load ---
   file '/etc/modprobe.d/amdgpu.conf' do
     content "options amdgpu runpm=0\n"
