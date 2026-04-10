@@ -330,16 +330,21 @@ ensure_performance_tuning() {
         done
     done
     # Pin non-vfio IRQs to host CPUs; let vfio (GPU) IRQs float across
-    # all cores so burst interrupt loads are distributed. managed_irq was
-    # removed from isolcpus to allow this — the kernel can deliver GPU
-    # interrupts on any core including vCPU cores, reducing injection
-    # latency during burst workloads (loading screens).
+    # all cores so AVIC can post them directly to the guest vAPIC.
+    # managed_irq was removed from isolcpus to allow this — the kernel
+    # and IOMMU can deliver GPU interrupts via hardware posted-interrupt
+    # path on any core including vCPU cores, with zero VM-exit overhead.
     systemctl stop irqbalance 2>/dev/null || true
+    local vfio_irqs
+    vfio_irqs=$(awk '/vfio-msi/ {gsub(/:/, "", $1); print $1}' /proc/interrupts)
     for irq_dir in /proc/irq/*/; do
-        if ! grep -q 'vfio' "${irq_dir}actions" 2>/dev/null && \
-           ! grep -q "$(basename "$irq_dir"):" /proc/interrupts 2>/dev/null | grep -q 'vfio-msi' 2>/dev/null; then
-            echo $HOST_CPUS > "${irq_dir}smp_affinity_list" 2>/dev/null || true
+        local irq_num
+        irq_num=$(basename "$irq_dir")
+        # Skip vfio IRQs — let them float for AVIC posted delivery
+        if echo "$vfio_irqs" | grep -qw "$irq_num" 2>/dev/null; then
+            continue
         fi
+        echo $HOST_CPUS > "${irq_dir}smp_affinity_list" 2>/dev/null || true
     done
     # Move RCU callbacks and writeback to host CPUs
     echo 3 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
