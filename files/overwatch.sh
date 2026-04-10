@@ -329,10 +329,17 @@ ensure_performance_tuning() {
             [ -f "${state}disable" ] && echo 1 > "${state}disable" 2>/dev/null || true
         done
     done
-    # Pin all IRQs to host CPUs so VM cores get no interrupt overhead
+    # Pin non-vfio IRQs to host CPUs; let vfio (GPU) IRQs float across
+    # all cores so burst interrupt loads are distributed. managed_irq was
+    # removed from isolcpus to allow this — the kernel can deliver GPU
+    # interrupts on any core including vCPU cores, reducing injection
+    # latency during burst workloads (loading screens).
     systemctl stop irqbalance 2>/dev/null || true
     for irq_dir in /proc/irq/*/; do
-        echo $HOST_CPUS > "${irq_dir}smp_affinity_list" 2>/dev/null || true
+        if ! grep -q 'vfio' "${irq_dir}actions" 2>/dev/null && \
+           ! grep -q "$(basename "$irq_dir"):" /proc/interrupts 2>/dev/null | grep -q 'vfio-msi' 2>/dev/null; then
+            echo $HOST_CPUS > "${irq_dir}smp_affinity_list" 2>/dev/null || true
+        fi
     done
     # Move RCU callbacks and writeback to host CPUs
     echo 3 > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
@@ -527,20 +534,6 @@ _do_start() {
     # Post-VM-start performance tuning (non-critical, continue on failure)
     ensure_performance_tuning
     apply_sched_fifo
-
-    # Re-pin vfio MSI-X IRQs to host CPUs. The initial IRQ pinning in
-    # ensure_performance_tuning runs immediately after VM start, but
-    # vfio-pci MSI-X vectors may be allocated slightly later during
-    # guest driver init. This second pass catches any vfio IRQs that
-    # were created after the initial pinning loop. Detection uses
-    # /proc/interrupts (the actions file is empty for vfio-msi).
-    sleep 2
-    local vfio_irqs
-    vfio_irqs=$(awk '/vfio-msi/ {print $1}' /proc/interrupts | tr -d ':')
-    for irq in $vfio_irqs; do
-        echo $HOST_CPUS > "/proc/irq/${irq}/smp_affinity_list" 2>/dev/null || true
-    done
-    log "VFIO IRQ re-pin: vfio MSI-X vectors [${vfio_irqs:-none}] pinned to CPUs $HOST_CPUS"
 
     # Increase halt_poll_ns to reduce KVM interrupt injection latency
     # during GPU burst workloads (loading screens). Default 200µs is
