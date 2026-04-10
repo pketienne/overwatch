@@ -623,6 +623,7 @@ action :install do
         tartarus_attach: inst['tartarus_attach'],
         gpu: node['overwatch']['gpu'],
         gpu_audio: node['overwatch']['gpu_audio'],
+        qemu_binary: node['overwatch']['qemu_binary'],
         gpu_rom: node['overwatch']['gpu_rom'],
         vcpu_pins: inst['vcpu_pins'],
         emulator_cpuset: node['overwatch']['emulator_cpuset'],

@@ -154,6 +154,7 @@
   <on_reboot>restart</on_reboot>
   <on_crash>destroy</on_crash>
   <devices>
+    <emulator><%= @qemu_binary %></emulator>
     <!-- VirtIO SCSI controller (looks like real SCSI, avoids "Red Hat virtio" fingerprint) -->
     <controller type='scsi' model='virtio-scsi'>
       <driver iothread='1'/>

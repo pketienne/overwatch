@@ -146,6 +146,7 @@ default['overwatch']['gpu_audio'] = '0000:03:00.1'
 # boot. Replacing this file changes how the dGPU appears to the guest
 # and may affect Ricochet's hardware-fingerprint hash. Don't swap it
 # unless you've also planned for re-registration.
+default['overwatch']['qemu_binary'] = '/usr/local/bin/qemu-system-x86_64'
 default['overwatch']['gpu_rom'] = '/usr/share/qemu/gpu-rom.bin'
 
 # Reserved host CPU set (used by passthrough launcher to confine host work)
