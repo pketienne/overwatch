@@ -528,6 +528,29 @@ _do_start() {
     ensure_performance_tuning
     apply_sched_fifo
 
+    # Re-pin vfio MSI-X IRQs to host CPUs. The initial IRQ pinning in
+    # ensure_performance_tuning runs immediately after VM start, but
+    # vfio-pci MSI-X vectors may be allocated slightly later during
+    # guest driver init. This second pass catches any vfio IRQs that
+    # were created after the initial pinning loop. Detection uses
+    # /proc/interrupts (the actions file is empty for vfio-msi).
+    sleep 2
+    local vfio_irqs
+    vfio_irqs=$(awk '/vfio-msi/ {print $1}' /proc/interrupts | tr -d ':')
+    for irq in $vfio_irqs; do
+        echo $HOST_CPUS > "/proc/irq/${irq}/smp_affinity_list" 2>/dev/null || true
+    done
+    log "VFIO IRQ re-pin: vfio MSI-X vectors [${vfio_irqs:-none}] pinned to CPUs $HOST_CPUS"
+
+    # Increase halt_poll_ns to reduce KVM interrupt injection latency
+    # during GPU burst workloads (loading screens). Default 200µs is
+    # too short — GPU interrupt bursts arrive at ~280µs intervals
+    # (3600 IRQs/sec), causing KVM to sleep the vCPU just before
+    # each interrupt, adding wake-up latency. 800µs covers the burst
+    # interval with margin.
+    echo 800000 > /sys/module/kvm/parameters/halt_poll_ns 2>/dev/null || true
+    log "KVM halt_poll_ns set to 800000"
+
     log_state "vm_running"
     log "VM running. Waiting for shutdown..."
 
