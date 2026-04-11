@@ -30,10 +30,13 @@ if [ -z "$QEMU_PID" ]; then
     exit 1
 fi
 
-# Find the vfio MSI vector for the GPU (03:00.0)
-IRQ_LINE=$(grep 'vfio-msi\[0\].*0000:03:00.0' /proc/interrupts | awk '{print $1}' | tr -d ':')
+# Find the vfio vector for the GPU (03:00.0). The guest may be using
+# INTx early in boot and switch to MSI once the Radeon driver loads,
+# so match either handler. `|| true` keeps pipefail from killing the
+# script when no line matches.
+IRQ_LINE=$(grep -E ' vfio-(msi\[0\]|intx).*0000:03:00.0' /proc/interrupts | awk '{print $1}' | tr -d ':' | head -1 || true)
 if [ -z "$IRQ_LINE" ]; then
-    echo "WARNING: No vfio-msi IRQ found for 0000:03:00.0, interrupt tracking disabled" >&2
+    echo "WARNING: No vfio IRQ found for 0000:03:00.0, interrupt tracking disabled" >&2
     IRQ_LINE="NONE"
 fi
 
