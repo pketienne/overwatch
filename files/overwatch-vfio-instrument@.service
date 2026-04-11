@@ -1,0 +1,19 @@
+[Unit]
+Description=VFIO instrumentation for overwatch VM %i
+Documentation=file:///usr/local/bin/vfio-instrument
+After=overwatch@%i.service
+BindsTo=overwatch@%i.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vfio-instrument %i
+Restart=on-failure
+RestartSec=5s
+
+# Logs stdout/stderr to journal; CSV data goes to /var/log/overwatch/%i/vfio-instrument.csv
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vfio-instrument-%i
+
+[Install]
+WantedBy=multi-user.target

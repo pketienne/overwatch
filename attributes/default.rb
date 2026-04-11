@@ -227,6 +227,15 @@ default['overwatch']['instance_defaults'] = {
   #                           in the static USB hostdev list
   'tartarus_attach' => false,
 
+  # vfio_instrument = true  → start vfio-instrument daemon bound to the VM
+  #                           lifecycle (BindsTo). Logs GPU IRQ rate, KVM
+  #                           exit counts, and NIC packet flow to
+  #                           /var/log/overwatch/<vm>/vfio-instrument.csv.
+  # vfio_instrument = false → instrumentation disabled.
+  # Enable only for investigation sessions; per-second polling has negligible
+  # CPU cost but the log grows ~1MB/hour.
+  'vfio_instrument' => false,
+
   # --- vCPU pinning (only used when gpu_passthrough = true) ---
   'vcpu_pins' => [
     { 'vcpu' => 0, 'cpuset' => '2' },

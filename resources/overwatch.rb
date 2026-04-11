@@ -507,6 +507,16 @@ action :install do
     notifies :run, 'execute[systemctl-daemon-reload]', :immediately
   end
 
+  # Instrumentation template unit (enabled per-instance via vfio_instrument attribute)
+  cookbook_file '/etc/systemd/system/overwatch-vfio-instrument@.service' do
+    source 'overwatch-vfio-instrument@.service'
+    cookbook 'overwatch'
+    owner 'root'
+    group 'root'
+    mode '0644'
+    notifies :run, 'execute[systemctl-daemon-reload]', :immediately
+  end
+
   execute 'systemctl-daemon-reload' do
     command 'systemctl daemon-reload'
     action :nothing
@@ -748,6 +758,13 @@ action :install do
       variables(vm_name: vm_name)
       only_if { ::File.directory?(desktop_dir) }
     end
+
+    # Per-VM vfio-instrument systemd service (toggled via inst['vfio_instrument'])
+    vfio_inst_enabled = inst['vfio_instrument']
+    service "overwatch-vfio-instrument@#{vm_name}.service" do
+      action(vfio_inst_enabled ? %i(enable start) : %i(stop disable))
+      only_if 'systemctl list-unit-files overwatch-vfio-instrument@.service | grep -q overwatch-vfio-instrument'
+    end
   end
 end
 
@@ -760,6 +777,10 @@ action :uninstall do
 
   # Stop and disable each instance
   instances.each_key do |vm_name|
+    service "overwatch-vfio-instrument@#{vm_name}.service" do
+      action %i(stop disable)
+      only_if "systemctl list-unit-files 'overwatch-vfio-instrument@.service' | grep -q overwatch-vfio-instrument"
+    end
     service "overwatch@#{vm_name}.service" do
       action %i(stop disable)
       only_if "systemctl list-unit-files 'overwatch@.service' | grep -q overwatch"
@@ -780,7 +801,9 @@ action :uninstall do
   # Shared support files
   %w(
     /usr/local/bin/overwatch
+    /usr/local/bin/vfio-instrument
     /etc/systemd/system/overwatch@.service
+    /etc/systemd/system/overwatch-vfio-instrument@.service
     /etc/udev/rules.d/99-gpu-passthrough.rules
     /etc/modprobe.d/amdgpu.conf
     /etc/modules-load.d/vfio-pci.conf
