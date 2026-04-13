@@ -329,6 +329,16 @@ ensure_performance_tuning() {
             [ -f "${state}disable" ] && echo 1 > "${state}disable" 2>/dev/null || true
         done
     done
+    # Pin vCPU core frequency to max — amd-pstate-epp lets the firmware
+    # downclock halted cores even with governor=performance and C2+ disabled;
+    # C1 halt alone is enough to drop to 603MHz. Without this floor, gameplay
+    # frames that land on a ramping core take ~16ms instead of ~4ms (verified
+    # via PresentMon: p99 CPU busy drops from 20ms to 5ms with pin applied).
+    for cpu in $(seq 2 7); do
+        local max_freq
+        max_freq=$(cat /sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_max_freq 2>/dev/null) || true
+        [ -n "$max_freq" ] && echo "$max_freq" > /sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_min_freq 2>/dev/null || true
+    done
     # Pin non-vfio IRQs to host CPUs; let vfio (GPU) IRQs float across
     # all cores so AVIC can post them directly to the guest vAPIC.
     # managed_irq was removed from isolcpus to allow this — the kernel
@@ -483,6 +493,12 @@ ensure_cpu_defaults() {
         for state in /sys/devices/system/cpu/cpu${cpu}/cpuidle/state[2-9]/; do
             [ -f "${state}disable" ] && echo 0 > "${state}disable" 2>/dev/null || true
         done
+    done
+    # Release vCPU core frequency floor
+    for cpu in $(seq 2 7); do
+        local min_freq
+        min_freq=$(cat /sys/devices/system/cpu/cpu${cpu}/cpufreq/cpuinfo_min_freq 2>/dev/null) || true
+        [ -n "$min_freq" ] && echo "$min_freq" > /sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_min_freq 2>/dev/null || true
     done
     # Governor back to powersave
     for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
