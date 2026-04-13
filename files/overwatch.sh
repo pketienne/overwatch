@@ -557,11 +557,16 @@ _do_start() {
     apply_cpu_isolation &
     local cpu_iso_pid=$!
 
-    # Deferred Tartarus attach — waits for Synapse then hot-plugs
-    local VM_START_EPOCH
-    VM_START_EPOCH=$(date +%s)
-    attach_tartarus_deferred "$VM_START_EPOCH" &
-    local tartarus_pid=$!
+    # Deferred Tartarus attach — waits for Synapse then hot-plugs.
+    # Only runs when TARTARUS_ATTACH=true (device is NOT in the static XML;
+    # Synapse requires a USB hot-plug arrival event to apply profiles).
+    local tartarus_pid=
+    if [ "$TARTARUS_ATTACH" = "true" ]; then
+        local VM_START_EPOCH
+        VM_START_EPOCH=$(date +%s)
+        attach_tartarus_deferred "$VM_START_EPOCH" &
+        tartarus_pid=$!
+    fi
 
     # Network monitor — polls vnet interface for drop events
     monitor_network &
