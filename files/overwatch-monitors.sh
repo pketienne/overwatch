@@ -552,20 +552,16 @@ if r.get('out-data'):
 # wait loop doesn't fire — this loop catches it via the guest-agent
 # disconnect/reconnect signal instead.
 #
-# OPEN QUESTION: this entire pattern (attach_tartarus_deferred +
-# tartarus_attach_loop) may be technical debt from the April 2026
-# recovery session and removable once Pass 3.5 (ensure_razer_drivers)
-# is in place. Hypothesis, validation procedure, and consequences are
-# tracked in the nerv epistemic store:
+# CONFIRMED REQUIRED: Synapse only applies keybind/lighting profiles when
+# it sees a USB hot-plug arrival event for the Tartarus. A Tartarus
+# present in the static VM XML (attached at boot) is detected by
+# Windows but Synapse does not apply profiles to it — the device works
+# as a generic HID keypad with no remapping. This was validated with
+# properly registered Razer drivers (not the broken-driver state from
+# the April 2026 recovery session), confirming the behavior is
+# intrinsic to Synapse's device-detection model, not a driver artifact.
 #
-#   urn:sem:entry:01KNKM7J91M68R9XAK9WMWPQPQ
-#
-# Query for the latest state with:
-#   sem graph entry show urn:sem:entry:01KNKM7J91M68R9XAK9WMWPQPQ \
-#       --store http://127.0.0.1:17800 \
-#       --graph https://sem.paradox.limited/o/nerv
-#
-# Until validation closes that entry, this loop stays.
+# See: urn:sem:entry:01KNKM7J91M68R9XAK9WMWPQPQ (hypothesis + validation)
 
 tartarus_attach_loop() {
     local vm_start_epoch=$1
