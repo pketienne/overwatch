@@ -283,12 +283,17 @@ log_guest_diagnostics() {
     out=$(guest_run_ps 'Get-WinEvent -FilterHashtable @{LogName="Microsoft-Windows-Diagnostics-Performance/Operational";Id=100} -MaxEvents 1 -EA SilentlyContinue | Select-Object -ExpandProperty Message' 15) || true
     log "BOOT_DIAG: ${out:-none}"
 
-    # Battle.net BNPresence errors (disconnect indicator)
-    out=$(guest_run_ps '$d="C:\Users\${WINDOWS_USER}\AppData\Local\Battle.net\Logs"; $l=Get-ChildItem $d -Filter "battle.net-*.log" -EA SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if($l){$c=(Select-String -Path $l.FullName -Pattern "BNPresence.*err=1|ERROR_INTERNAL" -EA SilentlyContinue | Measure-Object).Count; "$($l.Name): $c errors"} else {"no logs"}' 15) || true
+    # Battle.net BNPresence errors (disconnect indicator).
+    # WINDOWS_USER is interpolated by bash (closing then reopening the single-quoted
+    # PS body); inside the single quotes ${WINDOWS_USER} would be evaluated as a
+    # PowerShell variable (undefined) and yield C:\Users\\AppData\... — silently broken.
+    out=$(guest_run_ps '$d="C:\Users\'"$WINDOWS_USER"'\AppData\Local\Battle.net\Logs"; $l=Get-ChildItem $d -Filter "battle.net-*.log" -EA SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if($l){$c=(Select-String -Path $l.FullName -Pattern "BNPresence.*err=1|ERROR_INTERNAL" -EA SilentlyContinue | Measure-Object).Count; "$($l.Name): $c errors"} else {"no logs"}' 15) || true
     log "BNET_GUEST: ${out:-none}"
 
-    # OW2 in-game settings (detect silent resets after updates)
-    out=$(guest_run_ps '$f="C:\Users\${WINDOWS_USER}\Documents\Overwatch\Settings\Settings_v0.ini"; if(Test-Path $f){$c=Get-Content $f; $rs=($c|Select-String "RenderScale").ToString().Split("=")[1].Trim(); $fc=($c|Select-String "FrameRateCap").ToString().Split("=")[1].Trim(); $wm=($c|Select-String "WindowMode").ToString().Split("=")[1].Trim(); "RenderScale=$rs FrameRateCap=$fc WindowMode=$wm"} else {"settings file not found"}' 15) || true
+    # OW2 in-game settings (detect silent resets after updates).
+    # Same interpolation pattern as BNET_GUEST above — keep WINDOWS_USER outside the
+    # single-quoted PS body so bash expands it before the command reaches the guest.
+    out=$(guest_run_ps '$f="C:\Users\'"$WINDOWS_USER"'\Documents\Overwatch\Settings\Settings_v0.ini"; if(Test-Path $f){$c=Get-Content $f; $rs=($c|Select-String "RenderScale").ToString().Split("=")[1].Trim(); $fc=($c|Select-String "FrameRateCap").ToString().Split("=")[1].Trim(); $wm=($c|Select-String "WindowMode").ToString().Split("=")[1].Trim(); "RenderScale=$rs FrameRateCap=$fc WindowMode=$wm"} else {"settings file not found"}' 15) || true
     log "OW2_SETTINGS: ${out:-none}"
 }
 
