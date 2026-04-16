@@ -573,14 +573,16 @@ _do_start() {
     apply_cpu_isolation &
     local cpu_iso_pid=$!
 
-    # Deferred Tartarus attach — waits for Synapse then hot-plugs.
-    # Only runs when TARTARUS_ATTACH=true (device is NOT in the static XML;
-    # Synapse requires a USB hot-plug arrival event to apply profiles).
+    # Deferred Tartarus attach — waits for Synapse then hot-plugs, and
+    # re-fires the hot-plug on every guest reboot (Synapse only applies
+    # profiles on USB arrival events). Only runs when TARTARUS_ATTACH=true
+    # (device is NOT in the static XML). See
+    # urn:sem:entry:01KNKM7J91M68R9XAK9WMWPQPQ for why this is required.
     local tartarus_pid=
     if [ "$TARTARUS_ATTACH" = "true" ]; then
         local VM_START_EPOCH
         VM_START_EPOCH=$(date +%s)
-        attach_tartarus_deferred "$VM_START_EPOCH" &
+        tartarus_attach_loop "$VM_START_EPOCH" &
         tartarus_pid=$!
     fi
 
@@ -615,6 +617,10 @@ _do_start() {
     # Transition throttle event listener -- receives TRANSITION messages from guest script
     monitor_transition_events &
     local transition_pid=$!
+
+    # Synapse health monitor -- warns when RazerAppEngine zombies accumulate
+    monitor_synapse_health &
+    local synapse_health_pid=$!
 
     # Listen for shutdown signal from guest; record timestamp on receipt
     rm -f /tmp/.overwatch-shutdown-ts
@@ -699,6 +705,7 @@ open('/tmp/.overwatch-shutdown-ts','w').write(str(int(time.time())))" \
     kill "$latency_host_pid" 2>/dev/null || true
     kill "$guest_netmon_pid" 2>/dev/null || true
     kill "$transition_pid" 2>/dev/null || true
+    kill "$synapse_health_pid" 2>/dev/null || true
     wait "$cpu_iso_pid" 2>/dev/null || true
     wait "$tartarus_pid" 2>/dev/null || true
     wait "$listener_pid" 2>/dev/null || true
@@ -710,6 +717,7 @@ open('/tmp/.overwatch-shutdown-ts','w').write(str(int(time.time())))" \
     wait "$latency_host_pid" 2>/dev/null || true
     wait "$guest_netmon_pid" 2>/dev/null || true
     wait "$transition_pid" 2>/dev/null || true
+    wait "$synapse_health_pid" 2>/dev/null || true
 
     log "VM shut down detected."
     log_state "vm_shutdown"

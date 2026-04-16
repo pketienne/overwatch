@@ -597,3 +597,31 @@ tartarus_attach_loop() {
         fi
     done
 }
+
+# --- Synapse health monitor (background, lifetime of VM) ---
+# Tag: SYNAPSE_HEALTH
+#
+# RazerAppEngine accumulates zombie instances when its Electron cache is
+# corrupt. A healthy state has 1–2 processes (helper + main); >3 is the
+# documented corruption signature (see reference.md "Razer Synapse
+# missing from system tray", and urn:sem:entry:01KNKM7J91M68R9XAK9WMWPQPQ).
+# When >3, profile binding to the Tartarus race-loses non-deterministically.
+#
+# This monitor logs only — recovery is manual via
+# `setup-guest.sh synapse-recovery` (kills zombies + wipes the Electron
+# cache; Razer's Run-key autostart re-launches Synapse on next user logon).
+# Auto-killing live processes during gameplay risks tearing down a
+# working Synapse instance, so we surface the signal and let the
+# operator decide.
+
+monitor_synapse_health() {
+    sleep 180
+    while true; do
+        local count
+        count=$(guest_run_ps '(Get-Process RazerAppEngine -EA SilentlyContinue | Measure-Object).Count' 10 2>/dev/null | tr -d '[:space:]') || true
+        if [ -n "$count" ] && [ "$count" -gt 3 ] 2>/dev/null; then
+            log "SYNAPSE_HEALTH WARNING: $count RazerAppEngine processes (healthy is 1–2). Electron cache likely corrupt; run 'setup-guest.sh synapse-recovery' to kill + wipe."
+        fi
+        sleep 60
+    done
+}
