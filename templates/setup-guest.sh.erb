@@ -16,7 +16,7 @@
 #   suggestions  Disable Windows suggestion toasts (ContentDeliveryManager)
 #   shutdown     Install shutdown signal script and scheduled task
 #   transition   Deploy transition-throttle.ps1 and scheduled task
-#   synapse      Synapse delayed start (prevents windows on boot)
+#   synapse-recovery   RECOVERY: kill zombie RazerAppEngine processes + wipe Electron cache
 #   synapse4-profiles  Stage Razer Synapse 4 profile bundle to D:\synapse4-profiles\
 #   lhm-drivers  Remove LHM kernel drivers that cause reboot hangs
 #   cnext-tasks  RECOVERY: disable broken AMD CNext scheduled tasks (escape hatch)
@@ -85,7 +85,7 @@ if [ -z "$CMD" ]; then
     echo "  display      Auto HDR off, Game Bar off, GameBarPresenceWriter off, MPO off, HAGS off"
     echo "  shutdown     Shutdown signal script and scheduled task"
     echo "  transition   Transition throttle scripts, tray icon, and scheduled tasks"
-    echo "  synapse      Synapse delayed start (prevents windows on boot)"
+    echo "  synapse-recovery   RECOVERY: kill zombie RazerAppEngine + wipe Electron cache"
     echo "  synapse4-profiles  Stage Razer Synapse 4 profile bundle to D:\\synapse4-profiles\\"
     echo "  lhm-drivers  Remove LHM kernel drivers that cause reboot hangs"
     echo "  cnext-tasks  RECOVERY: disable broken AMD CNext scheduled tasks"
@@ -1018,162 +1018,40 @@ PYEOF
 }
 
 # ============================================================
-# Synapse: Delayed start (prevents windows on boot)
-# Tartarus profile detection is handled by host-side deferred
-# USB attach in overwatch.sh (attach_tartarus_deferred).
+# Synapse: recovery cleanup (manual subcommand, not in do_all)
 # ============================================================
+# Synapse autostart is owned by Razer's own Run-key entry, which
+# already ships with --launch-force-hidden=synapse,chroma-app on
+# this Synapse version — the cookbook does not manage Synapse
+# launch. The Tartarus deferred-attach loop in overwatch.sh
+# handles profile-binding sequencing by polling for razerwdl.
+#
+# This function is the recovery path for the zombie-RazerAppEngine
+# pattern (reference.md "Razer Synapse missing from system tray",
+# urn:sem:entry:01KNKM7J91M68R9XAK9WMWPQPQ). When
+# `monitor_synapse_health` logs SYNAPSE_HEALTH WARNING (>3
+# RazerAppEngine processes), run this to kill all instances and
+# wipe the corrupted Electron cache. Synapse re-launches on next
+# user logon via Razer's Run-key autostart.
 
-ensure_synapse_delayed() {
-    log "=== Synapse: Delayed start ==="
+ensure_synapse_recovery() {
+    log "=== Synapse: recovery cleanup ==="
     guest_python << 'PYEOF'
 if not USER_SID:
-    log("WARNING: No loaded user profile — skipping per-user Synapse configuration")
+    log("WARNING: No loaded user profile — cannot locate Razer cache; skipping")
 else:
-    sid = USER_SID
-    log(f"User SID: {sid}")
-
-    # --- 1. Disable RazerAppEngine Run key via StartupApproved ---
-    # This is the same mechanism Task Manager's Startup tab uses.
-    # Synapse recreates the Run key on launch, but StartupApproved keeps it disabled.
-    approved_path = f"HKU\\{sid}\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run"
-
-    # Check current state: 03 prefix = disabled, 02 prefix = enabled
-    approved_out = run_ps(
-        'reg query "' + approved_path + '" /v RazerAppEngine 2>&1'
-    )
-
-    approved_ok = False
-    if approved_out and "RazerAppEngine" in approved_out:
-        # Value exists — check if it starts with 03 (disabled)
-        if "0300000000000000" in approved_out.replace(" ", ""):
-            approved_ok = True
-            log("StartupApproved\\Run\\RazerAppEngine: already disabled")
-        else:
-            log(f"StartupApproved\\Run\\RazerAppEngine: exists but not disabled")
-    else:
-        log("StartupApproved\\Run\\RazerAppEngine: not set")
-
-    if not approved_ok:
-        if DRY_RUN:
-            log("[dry-run] Would disable RazerAppEngine in StartupApproved\\Run")
-        else:
-            run_ps(
-                'reg add "' + approved_path + '" '
-                '/v RazerAppEngine /t REG_BINARY '
-                '/d 030000000000000000000000 /f'
-            )
-            # Verify
-            check = run_ps(
-                'reg query "' + approved_path + '" /v RazerAppEngine 2>&1'
-            )
-            if check and "0300000000000000" in check.replace(" ", ""):
-                log("StartupApproved\\Run\\RazerAppEngine: disabled (verified)")
-            else:
-                log(f"WARNING: StartupApproved write may have failed — read back: {check}")
-
-    # --- 2. Write start-synapse.ps1 launch script ---
-    # Tartarus profile detection is handled by host-side deferred USB attach
-    # (attach_tartarus_deferred in overwatch.sh), so no kill/restart needed.
-    synapse_script = (
-        '# start-synapse.ps1 - Launch Synapse after desktop is ready\r\n'
-        '# Tartarus is attached by the host after Synapse is running,\r\n'
-        '# so Synapse applies profiles on hot-plug (no restart needed).\r\n'
-        '\r\n'
-        '# --- Timing helper ---\r\n'
-        'function Write-Timing($phase) {\r\n'
-        '    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"\r\n'
-        '    $dir = "C:\\ProgramData\\overwatch"\r\n'
-        '    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }\r\n'
-        '    Add-Content -Path "$dir\\boot-timing.log" -Value "$ts SYNAPSE $phase"\r\n'
-        '}\r\n'
-        '\r\n'
-        '$synapse = "C:\\Program Files\\Razer\\RazerAppEngine\\RazerAppEngine.exe"\r\n'
-        '$argList = "--url-params=apps=synapse,chroma-app '
-        '--launch-force-hidden=synapse,chroma-app --autoStart=1"\r\n'
-        '\r\n'
-        'Write-Timing "script-start"\r\n'
-        '\r\n'
-        '# Wait for explorer shell (interactive desktop ready)\r\n'
-        'for ($i = 0; $i -lt 30; $i++) {\r\n'
-        '    $shell = Get-Process explorer -ErrorAction SilentlyContinue '
-        '| Where-Object { $_.MainWindowHandle -ne 0 }\r\n'
-        '    if ($shell) { break }\r\n'
-        '    Start-Sleep -Seconds 1\r\n'
-        '}\r\n'
-        'Write-Timing "shell-ready"\r\n'
-        '\r\n'
-        '# Launch Synapse\r\n'
-        'Start-Process -FilePath $synapse -ArgumentList $argList -WindowStyle Minimized\r\n'
-        'Write-Timing "complete"\r\n'
-    )
-
-    run_ps(r"New-Item -ItemType Directory -Path 'C:\ProgramData\overwatch' -Force | Out-Null")
-
     if DRY_RUN:
-        log("[dry-run] Would write C:\\ProgramData\\overwatch\\start-synapse.ps1")
+        log("[dry-run] Would kill RazerAppEngine processes and wipe Electron cache")
     else:
-        if guest_file_write(r"C:\ProgramData\overwatch\start-synapse.ps1", synapse_script):
-            log("Wrote start-synapse.ps1")
-        else:
-            log("ERROR: Failed to write start-synapse.ps1")
-            sys.exit(1)
-
-    # --- 3. Create RazerSynapseDelayed scheduled task ---
-    # 15s logon delay gives USB devices time to enumerate before the restart script runs.
-    task_out = run_ps(
-        "$t = Get-ScheduledTask -TaskName RazerSynapseDelayed -EA SilentlyContinue; "
-        "if($t){ $t.State } else { 'MISSING' }"
-    )
-
-    if "MISSING" not in (task_out or "MISSING"):
-        log(f"RazerSynapseDelayed task: already exists (state={task_out})")
-    else:
-        log("RazerSynapseDelayed task: not found — creating")
-        if DRY_RUN:
-            log("[dry-run] Would create RazerSynapseDelayed scheduled task (15s logon delay)")
-        else:
-            # Task runs the restart script in the user's logon session
-            task_xml = (
-                '<?xml version="1.0"?>\r\n'
-                '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\r\n'
-                '  <Triggers>\r\n'
-                '    <LogonTrigger>\r\n'
-                '      <Delay>PT15S</Delay>\r\n'
-                '      <Enabled>true</Enabled>\r\n'
-                '    </LogonTrigger>\r\n'
-                '  </Triggers>\r\n'
-                '  <Actions>\r\n'
-                '    <Exec>\r\n'
-                '      <Command>powershell.exe</Command>\r\n'
-                '      <Arguments>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden '
-                '-File C:\\ProgramData\\overwatch\\start-synapse.ps1</Arguments>\r\n'
-                '    </Exec>\r\n'
-                '  </Actions>\r\n'
-                '  <Principals>\r\n'
-                '    <Principal>\r\n'
-                '      <GroupId>S-1-5-32-545</GroupId>\r\n'
-                '      <RunLevel>LeastPrivilege</RunLevel>\r\n'
-                '    </Principal>\r\n'
-                '  </Principals>\r\n'
-                '  <Settings>\r\n'
-                '    <Enabled>true</Enabled>\r\n'
-                '    <AllowStartIfOnBatteries>true</AllowStartIfOnBatteries>\r\n'
-                '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n'
-                '  </Settings>\r\n'
-                '</Task>\r\n'
+        run_ps("Get-Process RazerAppEngine -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue")
+        run_ps("Start-Sleep -Milliseconds 500")
+        for sub in ("Cache", "Code Cache", "GPUCache"):
+            run_ps(
+                'Remove-Item "$env:LOCALAPPDATA\\Razer\\RazerAppEngine\\User Data\\Default\\'
+                + sub + '" -Recurse -Force -EA SilentlyContinue'
             )
-            guest_file_write(r"C:\ProgramData\overwatch\synapse-task.xml", task_xml)
-            out = run_ps(
-                r"schtasks /Create /TN 'RazerSynapseDelayed' /XML 'C:\ProgramData\overwatch\synapse-task.xml' /F 2>&1"
-            )
-            run_ps(r"Remove-Item 'C:\ProgramData\overwatch\synapse-task.xml' -EA SilentlyContinue")
-
-            if out and "SUCCESS" in out.upper():
-                log("Created RazerSynapseDelayed scheduled task (15s logon delay)")
-            elif out and "ERROR" in out.upper():
-                log(f"WARNING: schtasks returned: {out}")
-            else:
-                log("Created RazerSynapseDelayed scheduled task")
+        log("Killed RazerAppEngine processes and wiped Electron cache (Cache, Code Cache, GPUCache)")
+        log("Synapse will re-launch on next user logon via Razer's Run-key autostart")
 PYEOF
 }
 
@@ -1429,14 +1307,13 @@ do_all() {
     ensure_suggestions_disabled
     ensure_shutdown_signal
     ensure_transition_throttle
-    ensure_synapse_delayed
     ensure_synapse4_profiles
     ensure_lhm_drivers_removed
     log "=== Guest configuration complete ==="
 }
 
 case "$CMD" in
-    all|power|hda-audio|defender|telemetry|display|onedrive|suggestions|shutdown|transition|synapse|synapse4-profiles|lhm-drivers|cnext-tasks|onedrive-run-keys|boot-timing)
+    all|power|hda-audio|defender|telemetry|display|onedrive|suggestions|shutdown|transition|synapse-recovery|synapse4-profiles|lhm-drivers|cnext-tasks|onedrive-run-keys|boot-timing)
         ensure_guest_agent
         ;;&
     all)          do_all ;;
@@ -1449,7 +1326,7 @@ case "$CMD" in
     suggestions)  ensure_suggestions_disabled ;;
     shutdown)     ensure_shutdown_signal ;;
     transition)   ensure_transition_throttle ;;
-    synapse)      ensure_synapse_delayed ;;
+    synapse-recovery)  ensure_synapse_recovery ;;
     synapse4-profiles)  ensure_synapse4_profiles ;;
     lhm-drivers)  ensure_lhm_drivers_removed ;;
     cnext-tasks)  ensure_cnext_tasks_disabled ;;
