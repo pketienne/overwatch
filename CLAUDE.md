@@ -15,14 +15,10 @@ overwatch/master/
   reference.md     — Detailed operational reference
 ```
 
-## Architecture
+## Canonical project metadata
 
-Single cookbook managing the full lifecycle of a QEMU/KVM Windows VM
-with GPU passthrough (VFIO). Handles host setup (IOMMU, VFIO drivers,
-systemd services, network bridge) and guest provisioning (unattended
-install, driver injection, Overwatch 2 automation scripts).
-
-## Dependencies
-
-- Symmetra (parent cookbook collection, provides base resources)
-- Semantha (OW2 UI ontology queries for settings automation)
+Architecture (`skos:scopeNote`), description, utility deps, project
+deps, and resources all live on `projects:01KKZGYKW5AJ9073RS8Y7VWWTS`
+(label `Overwatch`) in the `projects#` graph — not in this file.
+`SELECT ?p ?o WHERE { ?proj rdfs:label 'Overwatch' ; ?p ?o }` returns
+the full picture; see also `projects:Resource` for `hasResource` usage.
