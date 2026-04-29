@@ -1,3 +1,6 @@
 # Chef / Cinc
 local-mode-cache/
 Berksfile.lock
+
+# Claude Code runtime
+.claude/
